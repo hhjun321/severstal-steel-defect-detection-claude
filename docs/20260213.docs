@@ -196,6 +196,8 @@ Colab에서 직접 실행하는 것이 효율적이다.
     - resolve_path() 함수에 Colab 경로 호환성 강화
     - 하위 디렉토리(hints/, images/, masks/) 자동 탐색 추가
     - 경로의 suffix 부분 매칭 로직 추가
+    - load_pipeline() fp16 모델 자동 감지 로드 + pipeline_reference.json 참조
+    - docstring에 --model_path 방식 권장 안내 추가
     
   - scripts/run_validation_phases.py (신규 작성)
     - Phase 1~4 통합 검증 배치 실행 스크립트
@@ -207,3 +209,132 @@ Colab에서 직접 실행하는 것이 효율적이다.
     - Phase 4: training_log.json 기반 Loss 추이/이동평균/분포 시각화,
                Epoch별 평균 Loss 차트, Phase 1~3 종합 리포트 자동 생성
     - --phases 옵션으로 특정 Phase만 선택 실행 가능
+    - --model_path를 기본 모델 소스로 사용 (pipeline_path는 fallback)
+    - _model_source_args() 헬퍼 함수로 모델 소스 인자 통일
+
+  - scripts/train_controlnet.py (수정)
+    - 저장 최적화 4개 CLI 플래그 추가
+    - _save_controlnet_fp16() 헬퍼 함수 추가 (safetensors fp16 저장)
+    - save_checkpoint() 함수 리팩토링
+    - save_full_pipeline() 함수에 skip 로직 + pipeline_reference.json 생성 추가
+    - 학습 완료 summary에 저장 최적화 정보 출력 추가
+
+8. 모델 저장 크기 최적화
+--------------------------------------------------------------------------------
+
+8-1. 문제 분석
+
+  현재 학습 출력(controlnet_training/)의 디스크 사용: ~16.8GB
+
+  | 디렉토리        | 내용                           | 크기       |
+  |----------------|-------------------------------|-----------|
+  | best_model/    | ControlNet 가중치 (fp32)        | ~1.4GB    |
+  | final_model/   | ControlNet 가중치 (fp32, 중복)   | ~1.4GB    |
+  | pipeline/      | SD 1.5 전체 + ControlNet 복사   | ~5.6GB    |
+  | checkpoints/   | step별 스냅샷 + optimizer        | ~8.4GB    |
+
+  근본 원인:
+  - pipeline/ 에 학습 중 변경되지 않은 SD 1.5 base model(UNet, VAE,
+    TextEncoder ~4.2GB)이 통째로 복사됨
+  - best_model/과 final_model/에 동일 가중치가 2번 저장됨
+  - 모든 가중치가 fp32(4 bytes)로 저장되나, 학습은 fp16으로 진행되었으므로
+    fp16(2 bytes)으로 충분함
+  - checkpoint마다 optimizer.pt (~1.4GB)가 함께 저장됨
+
+8-2. 최적화 방향 (저장 구조만 변경, 모델 변환 없음)
+
+  | 플래그                    | 효과                             | 절감량     |
+  |--------------------------|----------------------------------|-----------|
+  | --skip_save_pipeline     | SD 1.5 전체 복사 방지             | ~4.2GB    |
+  | --save_fp16              | 가중치를 fp16으로 저장             | ~50%      |
+  | --skip_save_final        | best_model 있으면 final_model 스킵 | ~1.4GB    |
+  | --save_optimizer_state   | optimizer 저장을 선택적으로        | checkpoint당 ~1.4GB |
+
+8-3. 최적화 후 예상 크기
+
+  최적 설정: --save_fp16 --skip_save_pipeline --skip_save_final
+
+  | 디렉토리                  | 크기       |
+  |--------------------------|-----------|
+  | best_model/ (fp16)       | ~0.7GB    |
+  | pipeline_reference.json  | ~0.5KB    |
+  | training_log.json        | ~15KB     |
+  | training_config.json     | ~1KB      |
+
+  총 예상: ~0.7GB (기존 ~16.8GB → 약 96% 절감)
+
+8-4. 구현 상세
+
+  [train_controlnet.py 변경 사항]
+
+  1. CLI 플래그 4개 추가 (argparse):
+     - --save_fp16 (action="store_true")
+     - --skip_save_pipeline (action="store_true")
+     - --skip_save_final (action="store_true")
+     - --save_optimizer_state (action="store_true")
+
+  2. _save_controlnet_fp16(controlnet, save_dir) 함수 신규:
+     - state_dict를 fp16으로 변환 후 safetensors로 저장
+     - config.json 복사
+     - diffusion_pytorch_model.fp16.safetensors 파일명 사용
+
+  3. save_checkpoint() 리팩토링:
+     - args.save_fp16 시 _save_controlnet_fp16() 호출
+     - args.save_optimizer_state 미설정 시 optimizer.pt 저장 스킵
+     - checkpoint 저장 로그에 fp16/optimizer 정보 출력
+
+  4. save_full_pipeline() 리팩토링:
+     - args.skip_save_pipeline 시 pipeline 저장 스킵
+     - 대신 pipeline_reference.json 생성:
+       {
+         "base_model": "runwayml/stable-diffusion-v1-5",
+         "controlnet_path": "best_model/",
+         "note": "pipeline not saved to save disk space..."
+       }
+     - args.skip_save_final 시 final_model 저장 스킵
+
+  5. 학습 완료 summary에 저장 최적화 정보 출력
+
+  [test_controlnet.py 변경 사항]
+
+  1. load_pipeline() 에 pipeline_reference.json 참조 로직:
+     - model_path의 상위 디렉토리에서 pipeline_reference.json 탐색
+     - base_model 정보를 자동으로 읽어와 ControlNetModel + StableDiffusionPipeline 조합
+  2. fp16 safetensors 자동 감지:
+     - diffusion_pytorch_model.fp16.safetensors → safetensors → bin 순서 시도
+  3. docstring에 --model_path 방식 권장 안내
+
+  [run_validation_phases.py 변경 사항]
+
+  1. 모든 Phase에서 model_path를 pipeline_path보다 우선 사용
+  2. _model_source_args() 헬퍼로 모델 소스 인자 일원화
+  3. docstring/usage 예시를 --model_path 기반으로 업데이트
+  4. 양쪽 동시 지정 시 model_path 우선 + 경고 출력
+
+8-5. 재학습 시 권장 명령
+
+  python scripts/train_controlnet.py \
+      --save_fp16 \
+      --skip_save_pipeline \
+      --skip_save_final \
+      ... (기존 학습 인자)
+
+8-6. 검증 시 권장 명령 (최적화 모델 사용)
+
+  python scripts/run_validation_phases.py \
+      --model_path /content/drive/MyDrive/data/Severstal/controlnet_training/best_model \
+      --jsonl_path /content/drive/MyDrive/data/Severstal/controlnet_dataset/train.jsonl \
+      --roi_metadata_path /content/drive/MyDrive/data/Severstal/roi_patches/roi_metadata.csv \
+      --training_log_path /content/drive/MyDrive/data/Severstal/controlnet_training/training_log.json \
+      --output_base /content/drive/MyDrive/data/Severstal/test_results
+
+9. 주의 사항
+--------------------------------------------------------------------------------
+
+  - 현재 저장된 모델(controlnet_training/)은 최적화 이전이므로 pipeline/,
+    final_model/ 모두 존재함. 검증 시에는 기존 --pipeline_path도 사용 가능.
+  - 저장 최적화 플래그는 다음 재학습부터 적용됨.
+  - LSP 에러(numpy, torch, PIL, diffusers 미설치)는 로컬 환경 한정.
+    Colab에서 실행하므로 무시.
+  - test_controlnet.py의 fp16 자동 감지는 safetensors 형식만 지원.
+    bin 형식 fp16은 파일명 규칙이 없어 자동 감지 불가.

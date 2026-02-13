@@ -984,7 +984,10 @@ def train(args):
         if not math.isnan(avg_epoch_loss) and avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
             save_path = Path(args.output_dir) / "best_model"
-            controlnet.save_pretrained(save_path)
+            if args.save_fp16:
+                _save_controlnet_fp16(controlnet, save_path)
+            else:
+                controlnet.save_pretrained(save_path)
             logger.info(f"New best model (loss={best_loss:.6f}) -> {save_path}")
 
     # =========================================================================
@@ -992,9 +995,21 @@ def train(args):
     # =========================================================================
     logger.info("Training complete!")
 
+    # final_model 저장 (best_model과 중복 시 스킵 가능)
+    best_model_path = Path(args.output_dir) / "best_model"
     final_path = Path(args.output_dir) / "final_model"
-    controlnet.save_pretrained(final_path)
-    logger.info(f"Final model saved to {final_path}")
+
+    if args.skip_save_final and best_model_path.exists():
+        logger.info(
+            f"Skipping final_model save (--skip_save_final). "
+            f"best_model already exists at {best_model_path}"
+        )
+    else:
+        if args.save_fp16:
+            _save_controlnet_fp16(controlnet, final_path)
+        else:
+            controlnet.save_pretrained(final_path)
+        logger.info(f"Final model saved to {final_path}")
 
     log_path = Path(args.output_dir) / "training_log.json"
     with open(log_path, "w") as f:
@@ -1008,17 +1023,38 @@ def train(args):
     logger.info(f"  Best loss: {best_loss:.6f}")
     logger.info(f"  Total steps: {global_step}")
     logger.info(f"  Output: {args.output_dir}")
+    logger.info(f"  Save precision: {'fp16' if args.save_fp16 else 'fp32'}")
+    logger.info(f"  Pipeline saved: {'No' if args.skip_save_pipeline else 'Yes'}")
+    logger.info(f"  Final model saved: {'No' if args.skip_save_final and best_model_path.exists() else 'Yes'}")
+    logger.info(f"  Optimizer in checkpoints: {'Yes' if args.save_optimizer_state else 'No'}")
     logger.info("=" * 80)
 
 
 def save_checkpoint(controlnet, optimizer, lr_scheduler, global_step, args, loss_log):
-    """체크포인트를 저장합니다."""
+    """체크포인트를 저장합니다.
+
+    --save_fp16: ControlNet 가중치를 fp16으로 저장 (크기 50% 감소)
+    --save_optimizer_state: optimizer/lr_scheduler 상태 저장 (학습 재개에 필요)
+    """
     ckpt_dir = Path(args.output_dir) / f"checkpoint-{global_step}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    controlnet.save_pretrained(ckpt_dir / "controlnet")
-    torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
-    torch.save(lr_scheduler.state_dict(), ckpt_dir / "lr_scheduler.pt")
+    # ControlNet 가중치 저장 (fp16 또는 fp32)
+    if args.save_fp16:
+        _save_controlnet_fp16(controlnet, ckpt_dir / "controlnet")
+    else:
+        controlnet.save_pretrained(ckpt_dir / "controlnet")
+
+    # Optimizer/LR Scheduler 상태 저장 (선택적)
+    if args.save_optimizer_state:
+        torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
+        torch.save(lr_scheduler.state_dict(), ckpt_dir / "lr_scheduler.pt")
+    else:
+        logger.info(
+            f"  Skipping optimizer state save (--save_optimizer_state not set). "
+            f"Checkpoint is not resumable."
+        )
+
     (ckpt_dir / "global_step.txt").write_text(str(global_step))
 
     with open(ckpt_dir / "training_log.json", "w") as f:
@@ -1041,7 +1077,31 @@ def save_checkpoint(controlnet, optimizer, lr_scheduler, global_step, args, loss
 
 
 def save_full_pipeline(controlnet, args, device):
-    """추론용 전체 파이프라인을 저장합니다."""
+    """추론용 전체 파이프라인을 저장합니다.
+
+    --skip_save_pipeline 설정 시 base model 참조 정보만 기록하고
+    전체 파이프라인 복사를 건너뜁니다 (~4.2GB 절감).
+    """
+    if args.skip_save_pipeline:
+        # Base model 참조 정보만 기록
+        ref_path = Path(args.output_dir) / "pipeline_reference.json"
+        ref_info = {
+            "note": "Full pipeline was not saved (--skip_save_pipeline).",
+            "base_model": args.pretrained_model_name_or_path,
+            "controlnet_path": str(Path(args.output_dir) / "best_model"),
+            "usage": (
+                "Load with: ControlNetModel.from_pretrained(controlnet_path) + "
+                "StableDiffusionControlNetPipeline.from_pretrained(base_model, controlnet=...)"
+            ),
+        }
+        with open(ref_path, "w") as f:
+            json.dump(ref_info, f, indent=2)
+        logger.info(
+            f"Pipeline save skipped (--skip_save_pipeline). "
+            f"Reference saved: {ref_path}"
+        )
+        return
+
     try:
         pipeline = StableDiffusionControlNetPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
@@ -1054,6 +1114,33 @@ def save_full_pipeline(controlnet, args, device):
         logger.info(f"Full pipeline saved to {pipeline_path}")
     except Exception as e:
         logger.warning(f"Could not save full pipeline: {e}")
+
+
+def _save_controlnet_fp16(controlnet, save_path):
+    """ControlNet 가중치를 fp16으로 저장합니다.
+
+    학습은 fp32로 수행하지만 저장 시 fp16으로 변환하여
+    디스크 사용량을 ~50% 절감합니다.
+    inference 품질에는 실질적 차이가 없습니다.
+    """
+    save_path = Path(save_path)
+    save_path.mkdir(parents=True, exist_ok=True)
+
+    # 현재 가중치를 fp16으로 변환하여 저장
+    state_dict = controlnet.state_dict()
+    fp16_state_dict = {k: v.half() for k, v in state_dict.items()}
+
+    # config 저장
+    controlnet.save_config(save_path)
+
+    # safetensors로 fp16 가중치 저장
+    try:
+        from safetensors.torch import save_file
+        save_file(fp16_state_dict, save_path / "diffusion_pytorch_model.safetensors")
+        logger.info(f"ControlNet saved in fp16 (safetensors): {save_path}")
+    except ImportError:
+        torch.save(fp16_state_dict, save_path / "diffusion_pytorch_model.bin")
+        logger.info(f"ControlNet saved in fp16 (pytorch): {save_path}")
 
 
 # =============================================================================
@@ -1114,6 +1201,28 @@ def parse_args():
     parser.add_argument(
         "--validation_steps", type=int, default=0,
         help="Run validation every N steps (0=disabled)",
+    )
+
+    # Model Save Optimization
+    parser.add_argument(
+        "--save_fp16", action="store_true",
+        help="Save model weights in fp16 (half precision). "
+             "Reduces model size by ~50%% with negligible quality loss.",
+    )
+    parser.add_argument(
+        "--skip_save_pipeline", action="store_true",
+        help="Skip saving the full SD pipeline (UNet+VAE+TextEncoder+ControlNet). "
+             "Saves only ControlNet weights. Reduces disk usage by ~4.2GB.",
+    )
+    parser.add_argument(
+        "--save_optimizer_state", action="store_true",
+        help="Save optimizer state in checkpoints. "
+             "Required for training resume but adds ~1.4GB per checkpoint.",
+    )
+    parser.add_argument(
+        "--skip_save_final", action="store_true",
+        help="Skip saving final_model if best_model already exists. "
+             "Avoids duplicate ControlNet weights (~1.4GB).",
     )
 
     # Resume

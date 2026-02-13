@@ -113,7 +113,16 @@ def resolve_path(path_str: str, search_dirs: list) -> Path:
 # =============================================================================
 
 def load_pipeline(args, device):
-    """ControlNet 파이프라인을 로드합니다."""
+    """ControlNet 파이프라인을 로드합니다.
+
+    로드 우선순위:
+    1. --pipeline_path: 전체 파이프라인 디렉토리에서 직접 로드
+    2. --model_path: ControlNet 가중치만 로드 + base SD model 조합 (권장)
+       - fp16 저장된 모델도 자동 감지하여 로드
+
+    --model_path 방식이 디스크 절약에 유리합니다.
+    SD base model은 HuggingFace 캐시에서 로드됩니다.
+    """
 
     if args.pipeline_path and Path(args.pipeline_path).exists():
         # 저장된 전체 파이프라인에서 로드
@@ -124,20 +133,41 @@ def load_pipeline(args, device):
             safety_checker=None,
         )
     else:
-        # ControlNet 가중치 + SD base model 조합
+        # ControlNet 가중치 + SD base model 조합 (권장 방식)
         model_path = args.model_path
         if not model_path:
             raise ValueError("--model_path or --pipeline_path must be specified")
 
         logger.info(f"Loading ControlNet from: {model_path}")
-        controlnet = ControlNetModel.from_pretrained(
-            model_path,
-            torch_dtype=torch.float32,
-        )
 
-        logger.info(f"Loading base SD model: {args.pretrained_model_name_or_path}")
+        # pipeline_reference.json이 있으면 base model 정보 자동 참조
+        ref_path = Path(model_path).parent / "pipeline_reference.json"
+        base_model = args.pretrained_model_name_or_path
+        if ref_path.exists():
+            import json as _json
+            with open(ref_path) as f:
+                ref = _json.load(f)
+            if "base_model" in ref:
+                base_model = ref["base_model"]
+                logger.info(f"Using base model from pipeline_reference: {base_model}")
+
+        # fp16/fp32 모델 자동 감지 로드
+        try:
+            controlnet = ControlNetModel.from_pretrained(
+                model_path,
+                torch_dtype=torch.float32,
+            )
+        except Exception as e:
+            logger.warning(f"Standard load failed ({e}), trying with safetensors...")
+            controlnet = ControlNetModel.from_pretrained(
+                model_path,
+                torch_dtype=torch.float32,
+                use_safetensors=True,
+            )
+
+        logger.info(f"Loading base SD model: {base_model}")
         pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
+            base_model,
             controlnet=controlnet,
             torch_dtype=torch.float32,
             safety_checker=None,

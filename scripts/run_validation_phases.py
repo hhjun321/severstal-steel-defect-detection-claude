@@ -10,9 +10,9 @@ Phase 3: 미학습 데이터 일반화 검증
 Phase 4: 결과 종합 시각화 및 리포트
 
 Usage (Colab):
-    # 전체 Phase 실행
+    # 전체 Phase 실행 (권장: --model_path로 best_model 사용)
     python scripts/run_validation_phases.py \
-        --pipeline_path /content/drive/MyDrive/data/Severstal/controlnet_training/pipeline \
+        --model_path /content/drive/MyDrive/data/Severstal/controlnet_training/best_model \
         --jsonl_path /content/drive/MyDrive/data/Severstal/controlnet_dataset/train.jsonl \
         --roi_metadata_path /content/drive/MyDrive/data/Severstal/roi_patches/roi_metadata.csv \
         --training_log_path /content/drive/MyDrive/data/Severstal/controlnet_training/training_log.json \
@@ -20,13 +20,19 @@ Usage (Colab):
 
     # 특정 Phase만 실행
     python scripts/run_validation_phases.py \
-        --pipeline_path ... \
+        --model_path .../best_model \
         --phases 1 2
 
-    # best_model 사용
+    # pipeline 사용 (저장 최적화 이전 모델)
     python scripts/run_validation_phases.py \
-        --model_path /content/drive/MyDrive/data/Severstal/controlnet_training/best_model \
+        --pipeline_path /content/drive/MyDrive/data/Severstal/controlnet_training/pipeline \
         --phases 1
+
+Note:
+    저장 최적화(--skip_save_pipeline, --save_fp16) 적용 후에는 pipeline/
+    디렉토리가 생성되지 않으므로 --model_path를 사용해야 합니다.
+    --model_path는 test_controlnet.py에서 pipeline_reference.json을 참조하여
+    base SD model을 자동으로 로드합니다.
 """
 
 import argparse
@@ -65,11 +71,8 @@ def run_phase1(args):
         sys.executable, str(args.script_dir / "test_controlnet.py"),
     ]
 
-    # model source
-    if args.pipeline_path:
-        cmd += ["--pipeline_path", args.pipeline_path]
-    elif args.model_path:
-        cmd += ["--model_path", args.model_path]
+    # model source (model_path 우선, pipeline_path는 fallback)
+    cmd += _model_source_args(args)
 
     cmd += [
         "--jsonl_path", args.jsonl_path,
@@ -136,10 +139,7 @@ def run_phase2(args):
         cmd = [
             sys.executable, str(args.script_dir / "test_controlnet.py"),
         ]
-        if args.pipeline_path:
-            cmd += ["--pipeline_path", args.pipeline_path]
-        elif args.model_path:
-            cmd += ["--model_path", args.model_path]
+        cmd += _model_source_args(args)
 
         cmd += [
             "--hint_image", representative_hint["hint_path"],
@@ -172,10 +172,7 @@ def run_phase2(args):
         cmd = [
             sys.executable, str(args.script_dir / "test_controlnet.py"),
         ]
-        if args.pipeline_path:
-            cmd += ["--pipeline_path", args.pipeline_path]
-        elif args.model_path:
-            cmd += ["--model_path", args.model_path]
+        cmd += _model_source_args(args)
 
         cmd += [
             "--hint_image", representative_hint["hint_path"],
@@ -208,10 +205,7 @@ def run_phase2(args):
         cmd = [
             sys.executable, str(args.script_dir / "test_controlnet.py"),
         ]
-        if args.pipeline_path:
-            cmd += ["--pipeline_path", args.pipeline_path]
-        elif args.model_path:
-            cmd += ["--model_path", args.model_path]
+        cmd += _model_source_args(args)
 
         cmd += [
             "--hint_image", representative_hint["hint_path"],
@@ -306,10 +300,7 @@ def run_phase3(args):
     cmd = [
         sys.executable, str(args.script_dir / "test_controlnet.py"),
     ]
-    if args.pipeline_path:
-        cmd += ["--pipeline_path", args.pipeline_path]
-    elif args.model_path:
-        cmd += ["--model_path", args.model_path]
+    cmd += _model_source_args(args)
 
     cmd += [
         "--jsonl_path", str(unseen_jsonl_path),
@@ -883,6 +874,21 @@ def _create_phase2_comparison_grid(output_base: str, report_dir: Path):
 # Utility
 # =============================================================================
 
+def _model_source_args(args) -> List[str]:
+    """model_path 또는 pipeline_path를 test_controlnet.py CLI 인자로 변환합니다.
+
+    우선순위: model_path > pipeline_path
+    저장 최적화(--skip_save_pipeline) 적용 후에는 pipeline이 없으므로
+    model_path가 기본이 됩니다.
+    """
+    if args.model_path:
+        return ["--model_path", args.model_path]
+    elif args.pipeline_path:
+        return ["--pipeline_path", args.pipeline_path]
+    else:
+        raise ValueError("Either --model_path or --pipeline_path must be specified")
+
+
 def _get_first_hint(jsonl_path: str) -> Optional[Dict]:
     """JSONL에서 첫 번째 샘플의 hint 경로와 프롬프트를 반환합니다."""
     jsonl = Path(jsonl_path)
@@ -944,11 +950,12 @@ def parse_args():
     # Model
     parser.add_argument(
         "--model_path", type=str, default=None,
-        help="Path to trained ControlNet model (final_model/ or best_model/)",
+        help="Path to trained ControlNet model directory (best_model/ or final_model/). "
+             "Recommended: 저장 최적화 후에는 이 옵션을 사용합니다.",
     )
     parser.add_argument(
         "--pipeline_path", type=str, default=None,
-        help="Path to saved full pipeline directory",
+        help="Path to saved full pipeline directory (저장 최적화 이전 모델용)",
     )
 
     # Data
@@ -983,9 +990,17 @@ def parse_args():
 
     args = parser.parse_args()
 
-    # Validation
+    # Validation: model_path 또는 pipeline_path 중 하나는 필수
     if not args.model_path and not args.pipeline_path:
-        parser.error("Either --model_path or --pipeline_path must be specified")
+        parser.error("Either --model_path or --pipeline_path must be specified. "
+                     "--model_path is recommended for optimized models.")
+
+    # model_path와 pipeline_path 동시 지정 시 model_path 우선 (경고 출력)
+    if args.model_path and args.pipeline_path:
+        logger.warning(
+            "Both --model_path and --pipeline_path specified. "
+            "Using --model_path (recommended)."
+        )
 
     # Script directory
     args.script_dir = Path(__file__).parent
@@ -996,12 +1011,15 @@ def parse_args():
 def main():
     args = parse_args()
 
+    model_display = args.model_path or args.pipeline_path
+    model_type = "model_path" if args.model_path else "pipeline_path"
+
     logger.info("=" * 70)
     logger.info("  ControlNet Model Validation - Multi-Phase Runner")
     logger.info("=" * 70)
     logger.info(f"  Phases to run: {args.phases}")
     logger.info(f"  Output base: {args.output_base}")
-    logger.info(f"  Pipeline: {args.pipeline_path or args.model_path}")
+    logger.info(f"  Model ({model_type}): {model_display}")
     logger.info("")
 
     Path(args.output_base).mkdir(parents=True, exist_ok=True)
