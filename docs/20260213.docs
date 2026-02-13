@@ -191,6 +191,19 @@ Colab에서 직접 실행하는 것이 효율적이다.
 --------------------------------------------------------------------------------
   - docs/20260213.docs (본 문서, 신규 작성)
 
-  [예정 작업]
-  - scripts/test_controlnet.py (Colab 경로 호환성 수정, 필요 시)
-  - scripts/run_validation_phases.py (검증 배치 실행 스크립트, 필요 시)
+  [완료된 작업]
+  - scripts/test_controlnet.py (수정)
+    - resolve_path() 함수에 Colab 경로 호환성 강화
+    - 하위 디렉토리(hints/, images/, masks/) 자동 탐색 추가
+    - 경로의 suffix 부분 매칭 로직 추가
+    
+  - scripts/run_validation_phases.py (신규 작성)
+    - Phase 1~4 통합 검증 배치 실행 스크립트
+    - Phase 1: test_controlnet.py 호출로 학습 데이터 기본 생성 검증
+    - Phase 2: guidance_scale(3.0/5.0/7.5/10.0), inference_steps(20/30/50),
+               seed(42/123/456/789) 파라미터 조합 자동 반복 실행
+    - Phase 3: roi_metadata.csv에서 미학습 ROI 클래스별 상위 suitability_score
+               3개 자동 선별 → HintImageGenerator로 hint 생성 → inference 실행
+    - Phase 4: training_log.json 기반 Loss 추이/이동평균/분포 시각화,
+               Epoch별 평균 Loss 차트, Phase 1~3 종합 리포트 자동 생성
+    - --phases 옵션으로 특정 Phase만 선택 실행 가능
