@@ -1,0 +1,368 @@
+20260218 작업 일지 #2 - train_controlnet.py 이후 다음 단계 및 프로젝트 전체 실행 정리
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+(a) train_controlnet.py 구현 완료 후 다음 단계(Next Steps)를 구체적으로 정리한다.
+(b) 프로젝트 전체 파이프라인(Stage 1~5)의 실행 내역과 현재 상태를 종합 정리한다.
+
+2. train_controlnet.py 진행 후 다음 단계
+================================================================================
+
+  20260218.docs에서 train_controlnet.py에 적용된 3가지 개선 사항:
+    - controlnet_conditioning_scale (기본 1.0, 권장 0.7)
+    - snr_gamma (Min-SNR weighting, 권장 5.0)
+    - early_stopping_patience (권장 5~10)
+    - lr_scheduler 기본값 cosine으로 변경
+
+  이 개선이 완료된 상태에서, v3 재학습까지의 실행 순서는 아래와 같다.
+
+2-1. [다음 단계 1] v3 데이터셋 패키징 (500개 고품질 샘플 선별)
+--------------------------------------------------------------------------------
+
+  [목적]
+  v2에서 50개 샘플로 과적합+모드 붕괴가 발생했으므로,
+  16,011개 ROI 중 500개 고품질 샘플을 선별하여 v3 데이터셋을 생성한다.
+
+  [사전 조건]
+  - roi_metadata.csv가 존재해야 함 (Stage 1 완료 상태)
+  - controlnet_packager.py에 _quality_filter() 구현 완료 (20260218.docs Task 3)
+
+  [실행 방법]
+  현재 prepare_controlnet_data.py는 --max_samples 옵션만 지원하고
+  quality_filter 옵션을 CLI로 전달하는 기능이 없다.
+  따라서 아래 두 가지 방법 중 하나를 선택해야 한다:
+
+  방법 A: prepare_controlnet_data.py에 --quality_filter 인자 추가 (권장)
+    → packager.package_dataset() 호출 시 quality_filter=True 전달
+    → --max_samples 500 --quality_filter 조합 사용
+
+    실행 명령 (Colab):
+      python scripts/prepare_controlnet_data.py \
+          --roi_metadata /content/drive/MyDrive/data/Severstal/roi_patches/roi_metadata.csv \
+          --train_images /content/drive/MyDrive/data/Severstal/train_images \
+          --train_csv /content/drive/MyDrive/data/Severstal/train.csv \
+          --output_dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v3 \
+          --max_samples 500 \
+          --quality_filter \
+          --skip_validation
+
+  방법 B: Python 스크립트로 직접 호출
+    → Colab 노트북에서 packager 인스턴스를 생성하고
+      package_dataset(quality_filter=True, max_samples=500) 호출
+
+  [필요 구현]
+  prepare_controlnet_data.py에 --quality_filter 인자를 추가해야 한다.
+  현재 이 인자는 controlnet_packager.py에만 존재하고
+  CLI 스크립트에는 아직 연결되지 않은 상태이다.
+
+  [예상 결과]
+  - controlnet_dataset_v3/train.jsonl (500개 엔트리)
+  - controlnet_dataset_v3/hints/ (500개 힌트 이미지)
+  - 클래스별 분포: Class1~4 각 125개 (균등 할당)
+  - 각 클래스 내 defect_subtype, background_type 다양성 확보
+
+2-2. [다음 단계 2] v3 모델 학습 (Colab 실행)
+--------------------------------------------------------------------------------
+
+  [사전 조건]
+  - controlnet_dataset_v3 생성 완료 (단계 1)
+  - Colab GPU 런타임 (T4 이상)
+
+  [실행 명령]
+    python scripts/train_controlnet.py \
+        --data_dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v3 \
+        --learning_rate 5e-6 \
+        --num_train_epochs 30 \
+        --lr_scheduler cosine \
+        --lr_warmup_steps 100 \
+        --controlnet_conditioning_scale 0.7 \
+        --snr_gamma 5.0 \
+        --max_grad_norm 0.5 \
+        --early_stopping_patience 5 \
+        --gradient_checkpointing \
+        --mixed_precision fp16 \
+        --save_fp16 \
+        --skip_save_pipeline \
+        --output_dir /content/drive/MyDrive/data/Severstal/controlnet_training_v3
+
+  [핵심 변경 사항 (v2 → v3)]
+    - 데이터: 50개 → 500개 (10배 증가)
+    - LR: 1e-5 → 5e-6 (절반)
+    - Epochs: 100 → 30 (과적합 방지)
+    - Scheduler: constant_with_warmup → cosine
+    - Conditioning Scale: 1.0 → 0.7 (SD base 능력 보존)
+    - SNR Gamma: 없음 → 5.0 (Loss 안정화)
+    - Max Grad Norm: 1.0 → 0.5 (gradient 폭발 방지 강화)
+    - Early Stopping: 없음 → patience=5
+
+  [예상 소요 시간]
+  - Total Steps: 500 samples × 30 epochs / (1 batch × 4 grad_accum) ≈ 3,750 steps
+  - Colab T4 기준: 약 3~5시간
+
+  [성공 기준]
+  - NaN 발생 0건
+  - Loss가 수렴 추세를 보임 (epoch별 평균이 감소)
+  - training_log.json에서 loss의 이동 평균이 step 후반부에 안정화
+
+2-3. [다음 단계 3] v3 모델 4-Phase 검증 (Colab 실행)
+--------------------------------------------------------------------------------
+
+  [사전 조건]
+  - controlnet_training_v3/best_model 생성 완료 (단계 2)
+
+  [실행 명령]
+    python scripts/run_validation_phases.py \
+        --model_path /content/drive/MyDrive/data/Severstal/controlnet_training_v3/best_model \
+        --jsonl_path /content/drive/MyDrive/data/Severstal/controlnet_dataset_v3/train.jsonl \
+        --roi_metadata_path /content/drive/MyDrive/data/Severstal/roi_patches/roi_metadata.csv \
+        --training_log_path /content/drive/MyDrive/data/Severstal/controlnet_training_v3/training_log.json \
+        --output_base /content/drive/MyDrive/data/Severstal/test_results_v3 \
+        --quality_threshold 0.5 \
+        --controlnet_conditioning_scale 0.7
+
+  [검증 내용]
+  Phase 1 (기본 생성): 학습 데이터 500개 중 일부로 생성 + 품질 게이트 적용
+    → PASS 기준: generated > 0 AND avg_quality_score >= 0.5
+    → v2에서 neon 패턴이 출력되어 시각적으로 실패했지만 PASS로 판정된
+      문제가 이번에는 quality gate에 의해 정확히 감지됨
+
+  Phase 2 (파라미터 탐색): guidance_scale, inference_steps 조합
+    → conditioning_scale=0.7 기준으로 최적 조합 탐색
+    → guidance_scale: [3.0, 5.0, 7.5, 10.0]
+    → inference_steps: [20, 30, 50]
+
+  Phase 3 (미학습 일반화): 학습에 사용하지 않은 ROI로 생성 + 품질 게이트
+    → PASS 기준: Phase 1과 동일
+
+  Phase 4 (통계 리포트): Loss 곡선, 품질 점수, 클래스별 분포 시각화
+
+  [성공 기준]
+  - Phase 1: avg_quality_score >= 0.5, 생성 이미지가 금속 표면으로 보임
+  - Phase 2: 최적 파라미터 조합 도출
+  - Phase 3: 미학습 데이터에서도 유사한 품질 달성
+  - Phase 4: 안정적 Loss 곡선
+
+  [실패 시 대응]
+  - quality_score < 0.5: conditioning_scale을 0.5~0.6으로 낮추고 재학습
+  - 특정 클래스만 실패: 해당 클래스의 학습 데이터 품질 재검토
+  - Loss 발산: LR을 1e-6으로 추가 감소
+
+2-4. [다음 단계 4] 대량 증강 이미지 생성 (Stage 3 본실행)
+--------------------------------------------------------------------------------
+
+  [사전 조건]
+  - v3 검증 통과 (단계 3에서 Phase 1/3 모두 PASS)
+
+  [실행 내용]
+  test_controlnet.py를 사용하여 다양한 hint/prompt 조합으로
+  대량의 합성 결함 이미지를 생성한다.
+
+  Phase 2에서 도출된 최적 파라미터(guidance_scale, inference_steps)를
+  사용하여 생성 품질을 최대화한다.
+
+    python scripts/test_controlnet.py \
+        --model_path /content/drive/MyDrive/data/Severstal/controlnet_training_v3/best_model \
+        --jsonl_path /content/drive/MyDrive/data/Severstal/controlnet_dataset_v3/train.jsonl \
+        --output_dir /content/drive/MyDrive/data/Severstal/augmented_images_v3 \
+        --controlnet_conditioning_scale 0.7 \
+        --guidance_scale <Phase2 최적값> \
+        --num_inference_steps <Phase2 최적값> \
+        --num_images_per_prompt 3
+
+  [예상 결과]
+  - 500 × 3 = 1,500개 합성 결함 이미지
+
+2-5. [다음 단계 5] 품질 검증 (Stage 4)
+--------------------------------------------------------------------------------
+
+  [실행 내용]
+  생성된 1,500개 이미지에 대해 QualityValidator를 적용하여
+  품질 기준 미달 이미지를 필터링한다.
+
+    python scripts/validate_augmented_quality.py \
+        --augmented_dir /content/drive/MyDrive/data/Severstal/augmented_images_v3 \
+        --output_dir /content/drive/MyDrive/data/Severstal/validation_results_v3
+
+  [성공 기준]
+  - 전체 합격률 >= 83% (1,245개 이상)
+  - 클래스별 합격률 >= 75%
+
+2-6. [다음 단계 6] 데이터셋 병합 (Stage 5)
+--------------------------------------------------------------------------------
+
+  [실행 내용]
+  품질 검증을 통과한 합성 이미지를 원본 Severstal 데이터셋에 병합한다.
+
+    python scripts/merge_datasets.py \
+        --original_csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --augmented_dir /content/drive/MyDrive/data/Severstal/augmented_images_v3 \
+        --output_csv /content/drive/MyDrive/data/Severstal/train_augmented.csv
+
+  [예상 결과]
+  - train_augmented.csv: 원본 12,568개 + 합성 ~1,200개 = ~13,800개
+  - 클래스 불균형 완화 (특히 Class 4)
+
+3. 프로젝트 전체 과정 실행 내역 종합
+================================================================================
+
+3-1. Stage 1: ROI 추출 및 분석 (완료)
+--------------------------------------------------------------------------------
+
+  [실행 일자] 2026-02-12 이전 (기반 작업)
+  [실행 스크립트] scripts/extract_rois.py
+  [핵심 모듈]
+  - src/analysis/defect_characterization.py: 결함 4대 지표 분석
+    (Linearity, Solidity, Extent, Aspect Ratio)
+  - src/analysis/background_characterization.py: 배경 3단계 분석
+    (Grid Variance → Sobel Edge → FFT Frequency)
+  - src/analysis/roi_suitability.py: 적합도 점수 산출
+    (matching_score + continuity_score + stability_score → suitability_score)
+  - src/preprocessing/roi_extraction.py: ROI 패치 추출
+
+  [결과물]
+  - data/processed/roi_patches/roi_metadata.csv (16,011개 ROI)
+  - 각 ROI에 대한 메타정보:
+    class_id, defect_subtype (linear_scratch, compact_blob, elongated 등),
+    background_type (smooth, vertical_stripe 등),
+    suitability_score, matching_score, stability_score,
+    recommendation (suitable/marginal/unsuitable), area, bbox 등
+
+  [상태] 완료 - 전체 파이프라인의 기반 데이터
+
+3-2. Stage 2: ControlNet 학습 데이터 준비 (완료, v3 재패키징 필요)
+--------------------------------------------------------------------------------
+
+  [실행 일자] 2026-02-12
+  [실행 스크립트] scripts/prepare_controlnet_data.py
+  [핵심 모듈]
+  - src/preprocessing/hint_generator.py (HintImageGenerator)
+    → 3채널 힌트 이미지 생성: R=결함 마스크, G=배경 구조, B=배경 텍스처
+  - src/preprocessing/prompt_generator.py (PromptGenerator)
+    → 하이브리드 텍스트 프롬프트: "a {subtype} on {background} metal surface, ..."
+  - src/preprocessing/controlnet_packager.py (ControlNetDatasetPackager)
+    → train.jsonl 생성: {target, hint, prompt, negative_prompt}
+  - src/utils/dataset_validator.py: 데이터셋 정합성 검증
+
+  [v1 실행] 10개 샘플 → 학습 완전 실패 (NaN)
+  [v2 실행] 50개 샘플 → 학습은 성공했으나 생성 품질 실패 (네온 패턴)
+
+  [v3 계획]
+  - _quality_filter() 적용: recommendation=suitable, stability>0.3,
+    matching>=0.5, area>100
+  - _stratified_sample() 개선: suitability_score 기반 상위 선택,
+    subtype/background 다양성 보장
+  - 최종 500개 샘플 선별
+
+  [상태] 코드 구현 완료. CLI 연동(prepare_controlnet_data.py --quality_filter) 필요.
+
+3-3. Stage 3: ControlNet 학습 (v1~v2 실행 완료, v3 대기)
+--------------------------------------------------------------------------------
+
+  [실행 스크립트] scripts/train_controlnet.py
+  [실행 환경] Google Colab (T4 GPU)
+
+  [v1 학습 - 2026-02-12]
+  - 데이터: 10개 샘플
+  - 결과: 전체 200 step NaN loss → 완전 실패
+  - 원인: warmup(500) > total steps(200), dtype 충돌, NaN 처리 버그
+  - 대응: 4개 코드 수정 적용 (20260212_3.docs)
+
+  [v2 학습 - 2026-02-13]
+  - 데이터: 50개 샘플
+  - 설정: LR=1e-5, 100 epoch, 1,200 steps, constant_with_warmup
+  - 결과: NaN 0건, Loss 평균 0.070 (but 수렴 안됨, 진동)
+  - 검증: 4-Phase 모두 스크립트 PASS, but 시각적 완전 실패
+    → 생성 이미지가 금속이 아닌 무지개색/네온 추상 패턴
+
+  [v3 계획 - 미실행]
+  - 데이터: 500개 (10배 증가)
+  - 설정: LR=5e-6, 30 epoch, cosine, conditioning_scale=0.7,
+    snr_gamma=5.0, max_grad_norm=0.5, early_stopping_patience=5
+  - 예상: ~3,750 steps, 3~5시간 (T4)
+
+  [상태] v3 코드 개선 완료. 데이터 패키징 후 Colab 실행 대기.
+
+3-4. Stage 3.5: 모델 검증 (v2 실행 완료, v3 대기)
+--------------------------------------------------------------------------------
+
+  [실행 스크립트]
+  - scripts/test_controlnet.py: 개별 이미지 생성/추론
+  - scripts/run_validation_phases.py: 4-Phase 자동 검증
+
+  [v2 검증 결과 - 2026-02-17~18]
+  - Phase 1 (기본 생성): 스크립트 PASS, 시각적 FAIL
+  - Phase 2 (파라미터 탐색): 스크립트 PASS, 시각적 FAIL
+  - Phase 3 (미학습 일반화): 스크립트 PASS, 시각적 FAIL
+  - Phase 4 (통계 리포트): PASS
+  - 핵심 문제: PASS 기준이 "이미지 생성 여부"만 확인, 품질 미검증
+
+  [v3 개선 - 20260218.docs Task 2]
+  - _compute_generation_quality() 함수 추가
+    → color_consistency, artifact, sharpness 3개 메트릭
+  - Phase 1/3 PASS 기준 강화:
+    generated > 0 AND avg_quality_score >= quality_threshold (0.5)
+  - --quality_threshold, --controlnet_conditioning_scale CLI 인자 추가
+
+  [상태] 검증 스크립트 개선 완료. v3 학습 후 재검증 대기.
+
+3-5. Stage 4: 증강 이미지 품질 검증 (미실행)
+--------------------------------------------------------------------------------
+
+  [실행 스크립트] scripts/validate_augmented_quality.py
+  [핵심 모듈] QualityValidator
+  - 5개 메트릭: blur(20%), artifacts(20%), color_consistency(15%),
+    metric_consistency(25%), defect_presence(20%)
+  - 합격 기준: quality_score >= 0.7
+
+  [상태] 코드 완성 상태. v3 대량 생성 후 실행 예정.
+
+3-6. Stage 5: 데이터셋 병합 (미실행)
+--------------------------------------------------------------------------------
+
+  [실행 스크립트] scripts/merge_datasets.py
+  - 합성 결함 마스크를 RLE 인코딩
+  - 원본 train.csv와 병합
+  - 통계 출력
+
+  [상태] 코드 완성 상태. Stage 4 통과 후 실행 예정.
+
+4. 현재 프로젝트 상태 요약
+================================================================================
+
+  | 항목                        | 상태          | 비고                          |
+  |----------------------------|-------------|-------------------------------|
+  | Stage 1: ROI 추출           | 완료          | 16,011개 ROI                  |
+  | Stage 2: 데이터 준비 코드     | 완료          | v3 CLI 연동 필요               |
+  | Stage 2: v3 데이터 패키징     | 미실행        | 다음 즉시 실행 대상             |
+  | Stage 3: train_controlnet.py| 코드 완료     | v3 설정 적용 완료               |
+  | Stage 3: v3 학습 실행        | 미실행        | Colab에서 실행 필요             |
+  | Stage 3.5: 검증 코드         | 완료          | 품질 게이트 추가 완료            |
+  | Stage 3.5: v3 검증 실행      | 미실행        | v3 학습 완료 후 실행            |
+  | Stage 4: 품질 검증           | 코드 완료     | v3 대량 생성 후 실행            |
+  | Stage 5: 데이터셋 병합       | 코드 완료     | Stage 4 완료 후 실행            |
+
+5. 즉시 필요한 구현 작업 (prepare_controlnet_data.py 수정)
+================================================================================
+
+  [문제]
+  controlnet_packager.py의 package_dataset()에 quality_filter 파라미터가
+  추가되었지만, CLI 스크립트인 prepare_controlnet_data.py에는 해당 인자가
+  전달되지 않는다.
+
+  [필요 변경]
+  prepare_controlnet_data.py의 argparse에 다음 인자 추가:
+    --quality_filter (store_true): 다단계 품질 필터링 적용
+    --min_area (int, default=100)
+    --min_stability (float, default=0.3)
+    --min_matching (float, default=0.5)
+
+  packager.package_dataset() 호출 시 이 인자들을 전달.
+
+  [우선순위] 높음 - v3 데이터 패키징의 전제 조건
+
+6. 변경/생성 파일
+--------------------------------------------------------------------------------
+
+  [본 작업에서 생성]
+  - docs/20260218_2.docs (본 문서, 신규 작성)
