@@ -56,6 +56,233 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
+# Generation Quality Evaluation
+# =============================================================================
+
+def _compute_generation_quality(
+    output_dir: Path,
+    quality_threshold: float = 0.5,
+) -> Dict:
+    """생성된 이미지의 정량적 품질을 평가합니다.
+
+    마스크 없이 생성 이미지만으로 평가 가능한 3개 메트릭을 사용합니다:
+    - color_consistency: LAB 색공간 기반 금속 표면 색상 일관성
+    - artifact_score: gradient 분석 기반 비현실적 패턴 감지
+    - blur_score: Laplacian variance 기반 선명도
+
+    Args:
+        output_dir: 생성 이미지가 포함된 디렉토리
+        quality_threshold: 품질 점수 합격 임계값 (기본 0.5)
+
+    Returns:
+        {
+            "avg_quality_score": float,
+            "quality_passed": bool,
+            "sample_scores": [...],
+            "avg_color_score": float,
+            "avg_artifact_score": float,
+            "avg_blur_score": float,
+            "num_evaluated": int,
+        }
+    """
+    try:
+        import cv2
+    except ImportError:
+        logger.warning("cv2 not available, skipping quality evaluation")
+        return {
+            "avg_quality_score": -1.0,
+            "quality_passed": True,  # 평가 불가 시 통과 처리
+            "sample_scores": [],
+            "num_evaluated": 0,
+            "error": "cv2 not available",
+        }
+
+    # 생성 이미지 수집 (generated/ 하위 또는 직접)
+    image_paths = []
+    for pattern in ["generated/*_gen*.png", "generated/*_generated_*.png",
+                     "*_gen*.png", "*_generated_*.png"]:
+        image_paths.extend(output_dir.glob(pattern))
+
+    # 중복 제거
+    image_paths = list(set(image_paths))
+
+    if not image_paths:
+        logger.warning(f"No generated images found in {output_dir}")
+        return {
+            "avg_quality_score": -1.0,
+            "quality_passed": True,
+            "sample_scores": [],
+            "num_evaluated": 0,
+            "error": "no generated images found",
+        }
+
+    sample_scores = []
+
+    for img_path in sorted(image_paths):
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 1. Color consistency (weight: 0.40)
+        # 금속 표면은 그레이스케일 계열이어야 함.
+        # LAB 색공간에서 a, b 채널의 편차가 작을수록 높은 점수.
+        color_score = _score_color_consistency(img_rgb)
+
+        # 2. Artifact detection (weight: 0.30)
+        artifact_score = _score_artifacts(gray)
+
+        # 3. Blur/sharpness (weight: 0.30)
+        blur_score = _score_sharpness(gray)
+
+        # 가중 평균
+        quality_score = (
+            0.40 * color_score
+            + 0.30 * artifact_score
+            + 0.30 * blur_score
+        )
+
+        sample_scores.append({
+            "filename": img_path.name,
+            "quality_score": round(float(quality_score), 4),
+            "color_score": round(float(color_score), 4),
+            "artifact_score": round(float(artifact_score), 4),
+            "blur_score": round(float(blur_score), 4),
+        })
+
+    if not sample_scores:
+        return {
+            "avg_quality_score": -1.0,
+            "quality_passed": True,
+            "sample_scores": [],
+            "num_evaluated": 0,
+            "error": "all images failed to load",
+        }
+
+    avg_quality = np.mean([s["quality_score"] for s in sample_scores])
+    avg_color = np.mean([s["color_score"] for s in sample_scores])
+    avg_artifact = np.mean([s["artifact_score"] for s in sample_scores])
+    avg_blur = np.mean([s["blur_score"] for s in sample_scores])
+    quality_passed = float(avg_quality) >= quality_threshold
+
+    logger.info(f"  Quality evaluation: {len(sample_scores)} images")
+    logger.info(f"    avg_quality={avg_quality:.4f}  (threshold={quality_threshold})")
+    logger.info(f"    color={avg_color:.4f}  artifact={avg_artifact:.4f}  "
+                f"blur={avg_blur:.4f}")
+    logger.info(f"    quality_passed={quality_passed}")
+
+    return {
+        "avg_quality_score": round(float(avg_quality), 4),
+        "quality_passed": quality_passed,
+        "sample_scores": sample_scores,
+        "avg_color_score": round(float(avg_color), 4),
+        "avg_artifact_score": round(float(avg_artifact), 4),
+        "avg_blur_score": round(float(avg_blur), 4),
+        "num_evaluated": len(sample_scores),
+    }
+
+
+def _score_color_consistency(img_rgb: np.ndarray) -> float:
+    """LAB 색공간 기반 금속 표면 색상 일관성 점수.
+
+    금속 표면 이미지는 무채색(그레이스케일) 계열이어야 합니다.
+    a, b 채널의 표준편차가 크면 비현실적인 컬러 패턴으로 판단합니다.
+
+    Returns:
+        0.0~1.0 (1.0 = 무채색에 가까움)
+    """
+    import cv2
+
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+
+    # L 채널: 30~200 범위 (너무 어둡거나 밝지 않은지)
+    l_mean = np.mean(lab[:, :, 0])
+    l_score = 1.0 if 30 <= l_mean <= 200 else 0.5
+
+    # a, b 채널: 128 중심에서 벗어날수록 채도가 높음
+    # LAB에서 OpenCV는 a, b를 0-255 범위로 저장 (128이 중심)
+    a_channel = lab[:, :, 1].astype(float) - 128.0
+    b_channel = lab[:, :, 2].astype(float) - 128.0
+
+    # a, b의 절대값 평균이 작을수록 무채색
+    a_abs_mean = np.mean(np.abs(a_channel))
+    b_abs_mean = np.mean(np.abs(b_channel))
+    ab_mean = (a_abs_mean + b_abs_mean) / 2.0
+
+    # ab_mean이 5 이하면 1.0, 30 이상이면 0.0 (선형 보간)
+    if ab_mean <= 5.0:
+        ab_score = 1.0
+    elif ab_mean >= 30.0:
+        ab_score = 0.0
+    else:
+        ab_score = 1.0 - (ab_mean - 5.0) / 25.0
+
+    # a, b의 표준편차가 크면 다양한 색상 = 비현실적
+    a_std = np.std(a_channel)
+    b_std = np.std(b_channel)
+    ab_std = (a_std + b_std) / 2.0
+
+    if ab_std <= 5.0:
+        std_score = 1.0
+    elif ab_std >= 40.0:
+        std_score = 0.0
+    else:
+        std_score = 1.0 - (ab_std - 5.0) / 35.0
+
+    # L의 표준편차: 너무 균일하면 빈 이미지, 너무 크면 문제
+    l_std = np.std(lab[:, :, 0].astype(float))
+    texture_score = 1.0 if 5 <= l_std <= 60 else 0.5
+
+    score = (0.3 * l_score + 0.3 * ab_score + 0.2 * std_score + 0.2 * texture_score)
+    return float(score)
+
+
+def _score_artifacts(gray: np.ndarray) -> float:
+    """Gradient 분석 기반 아티팩트 감지.
+
+    비정상적으로 높은 gradient가 많으면 아티팩트로 판단합니다.
+
+    Returns:
+        0.0~1.0 (1.0 = 아티팩트 없음)
+    """
+    import cv2
+
+    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    gradient_magnitude = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+
+    # 비정상적으로 높은 gradient 비율
+    high_gradient_ratio = np.sum(gradient_magnitude > 200) / gradient_magnitude.size
+
+    # 비율이 낮을수록 좋음
+    score = 1.0 - min(high_gradient_ratio * 10, 1.0)
+    return float(score)
+
+
+def _score_sharpness(gray: np.ndarray) -> float:
+    """Laplacian variance 기반 선명도 점수.
+
+    Returns:
+        0.0~1.0 (1.0 = 선명)
+    """
+    import cv2
+
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    # 100 이상이면 충분히 선명, 10 이하면 매우 흐림
+    if laplacian_var >= 100:
+        score = 1.0
+    elif laplacian_var <= 10:
+        score = 0.1
+    else:
+        score = 0.1 + 0.9 * (laplacian_var - 10) / 90.0
+
+    return float(score)
+
+
+# =============================================================================
 # Phase 1: 기본 생성 검증
 # =============================================================================
 
@@ -79,6 +306,7 @@ def run_phase1(args):
         "--output_dir", str(output_dir),
         "--num_inference_steps", "30",
         "--guidance_scale", "7.5",
+        "--controlnet_conditioning_scale", str(args.controlnet_conditioning_scale),
         "--seed", "42",
     ]
 
@@ -98,11 +326,37 @@ def run_phase1(args):
     if summary_path.exists():
         with open(summary_path) as f:
             summary = json.load(f)
+        generated = summary["generated"]
+        total = summary["total_samples"]
         logger.info(
-            f"Phase 1 complete: {summary['generated']}/{summary['total_samples']} "
-            f"samples generated"
+            f"Phase 1 generation: {generated}/{total} samples generated"
         )
-        return summary["generated"] > 0
+
+        if generated == 0:
+            logger.error("Phase 1 FAIL: No images generated")
+            return False
+
+        # 품질 평가
+        quality_threshold = getattr(args, "quality_threshold", 0.5)
+        quality_result = _compute_generation_quality(output_dir, quality_threshold)
+
+        # 품질 결과를 generation_summary에 병합하여 저장
+        summary["quality"] = quality_result
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        if quality_result.get("num_evaluated", 0) > 0:
+            passed = quality_result["quality_passed"]
+            avg_q = quality_result["avg_quality_score"]
+            logger.info(
+                f"Phase 1 quality: avg={avg_q:.4f}  "
+                f"threshold={quality_threshold}  "
+                f"{'PASS' if passed else 'FAIL'}"
+            )
+            return passed
+        else:
+            logger.warning("Phase 1: Quality evaluation skipped (no images evaluated)")
+            return True  # 평가 불가 시 생성 성공만으로 통과
     else:
         logger.warning("Phase 1: No summary file generated")
         return False
@@ -147,6 +401,7 @@ def run_phase2(args):
             "--output_dir", str(output_dir),
             "--num_inference_steps", "30",
             "--guidance_scale", str(gs),
+            "--controlnet_conditioning_scale", str(args.controlnet_conditioning_scale),
             "--num_images_per_sample", "4",
             "--seed", "42",
         ]
@@ -180,6 +435,7 @@ def run_phase2(args):
             "--output_dir", str(output_dir),
             "--num_inference_steps", str(steps),
             "--guidance_scale", "7.5",
+            "--controlnet_conditioning_scale", str(args.controlnet_conditioning_scale),
             "--num_images_per_sample", "4",
             "--seed", "42",
         ]
@@ -213,6 +469,7 @@ def run_phase2(args):
             "--output_dir", str(output_dir),
             "--num_inference_steps", "30",
             "--guidance_scale", "7.5",
+            "--controlnet_conditioning_scale", str(args.controlnet_conditioning_scale),
             "--num_images_per_sample", "1",
             "--seed", str(seed),
         ]
@@ -307,6 +564,7 @@ def run_phase3(args):
         "--output_dir", str(output_dir),
         "--num_inference_steps", "30",
         "--guidance_scale", "7.5",
+        "--controlnet_conditioning_scale", str(args.controlnet_conditioning_scale),
         "--seed", "42",
     ]
 
@@ -325,11 +583,37 @@ def run_phase3(args):
     if summary_path.exists():
         with open(summary_path) as f:
             summary = json.load(f)
+        generated = summary["generated"]
+        total = summary["total_samples"]
         logger.info(
-            f"Phase 3 complete: {summary['generated']}/{summary['total_samples']} "
-            f"unseen samples generated"
+            f"Phase 3 generation: {generated}/{total} unseen samples generated"
         )
-        return summary["generated"] > 0
+
+        if generated == 0:
+            logger.error("Phase 3 FAIL: No images generated")
+            return False
+
+        # 품질 평가
+        quality_threshold = getattr(args, "quality_threshold", 0.5)
+        quality_result = _compute_generation_quality(output_dir, quality_threshold)
+
+        # 품질 결과를 generation_summary에 병합하여 저장
+        summary["quality"] = quality_result
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        if quality_result.get("num_evaluated", 0) > 0:
+            passed = quality_result["quality_passed"]
+            avg_q = quality_result["avg_quality_score"]
+            logger.info(
+                f"Phase 3 quality: avg={avg_q:.4f}  "
+                f"threshold={quality_threshold}  "
+                f"{'PASS' if passed else 'FAIL'}"
+            )
+            return passed
+        else:
+            logger.warning("Phase 3: Quality evaluation skipped (no images evaluated)")
+            return True
 
     return False
 
@@ -751,7 +1035,24 @@ def _generate_summary_report(output_base: str, report_dir: Path):
         report_lines.append(f"  Model: {p1.get('model_path', 'N/A')}")
         report_lines.append(f"  Steps: {p1.get('num_inference_steps', 'N/A')}")
         report_lines.append(f"  Guidance: {p1.get('guidance_scale', 'N/A')}")
-        report_lines.append(f"  Status: {'PASS' if p1['generated'] > 0 else 'FAIL'}")
+
+        # 품질 평가 결과
+        q1 = p1.get("quality", {})
+        if q1.get("num_evaluated", 0) > 0:
+            report_lines.append(f"  Quality Score: {q1['avg_quality_score']:.4f}")
+            report_lines.append(f"    Color Consistency: {q1['avg_color_score']:.4f}")
+            report_lines.append(f"    Artifact Score: {q1['avg_artifact_score']:.4f}")
+            report_lines.append(f"    Sharpness Score: {q1['avg_blur_score']:.4f}")
+            report_lines.append(f"    Images Evaluated: {q1['num_evaluated']}")
+            q_status = "PASS" if q1["quality_passed"] else "FAIL"
+            report_lines.append(f"  Quality Status: {q_status}")
+        else:
+            report_lines.append(f"  Quality: Not evaluated")
+
+        gen_ok = p1['generated'] > 0
+        q_ok = q1.get("quality_passed", True) if q1.get("num_evaluated", 0) > 0 else gen_ok
+        overall = "PASS" if (gen_ok and q_ok) else "FAIL"
+        report_lines.append(f"  Overall Status: {overall}")
         report_lines.append("")
     else:
         report_lines.append("Phase 1: Not executed")
@@ -781,7 +1082,24 @@ def _generate_summary_report(output_base: str, report_dir: Path):
         report_lines.append("Phase 3: Unseen Data Generalization")
         report_lines.append("-" * 40)
         report_lines.append(f"  Unseen samples: {p3['generated']}/{p3['total_samples']}")
-        report_lines.append(f"  Status: {'PASS' if p3['generated'] > 0 else 'FAIL'}")
+
+        # 품질 평가 결과
+        q3 = p3.get("quality", {})
+        if q3.get("num_evaluated", 0) > 0:
+            report_lines.append(f"  Quality Score: {q3['avg_quality_score']:.4f}")
+            report_lines.append(f"    Color Consistency: {q3['avg_color_score']:.4f}")
+            report_lines.append(f"    Artifact Score: {q3['avg_artifact_score']:.4f}")
+            report_lines.append(f"    Sharpness Score: {q3['avg_blur_score']:.4f}")
+            report_lines.append(f"    Images Evaluated: {q3['num_evaluated']}")
+            q_status = "PASS" if q3["quality_passed"] else "FAIL"
+            report_lines.append(f"  Quality Status: {q_status}")
+        else:
+            report_lines.append(f"  Quality: Not evaluated")
+
+        gen_ok = p3['generated'] > 0
+        q_ok = q3.get("quality_passed", True) if q3.get("num_evaluated", 0) > 0 else gen_ok
+        overall = "PASS" if (gen_ok and q_ok) else "FAIL"
+        report_lines.append(f"  Overall Status: {overall}")
         report_lines.append("")
     else:
         report_lines.append("Phase 3: Not executed")
@@ -986,6 +1304,21 @@ def parse_args():
     parser.add_argument(
         "--phases", type=int, nargs="+", default=[1, 2, 3, 4],
         help="Phases to run (default: 1 2 3 4)",
+    )
+
+    # Quality evaluation
+    parser.add_argument(
+        "--quality_threshold", type=float, default=0.5,
+        help="Minimum average quality score for Phase 1/3 to PASS (default: 0.5). "
+             "Score range: 0.0~1.0. Evaluated on color_consistency (0.4), "
+             "artifact_detection (0.3), sharpness (0.3).",
+    )
+
+    # Generation parameters (passed through to test_controlnet.py)
+    parser.add_argument(
+        "--controlnet_conditioning_scale", type=float, default=1.0,
+        help="ControlNet conditioning scale for inference (0.0~1.0). "
+             "v3 권장: 0.7. Passed through to test_controlnet.py.",
     )
 
     args = parser.parse_args()

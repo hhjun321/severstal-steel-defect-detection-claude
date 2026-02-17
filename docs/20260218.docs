@@ -1,0 +1,343 @@
+20260218 작업 일지 - v2 모델 검증 결과 분석 및 개선 계획 수립
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+20260217 Colab에서 실행한 v2 모델(controlnet_training_v2/best_model) 4-Phase 검증
+결과를 분석하고, 확인된 문제점에 대한 구체적 개선 계획을 수립한다.
+
+2. v2 모델 검증 결과 분석
+--------------------------------------------------------------------------------
+
+2-1. 검증 환경
+
+  - 모델: controlnet_training_v2/best_model
+  - 학습 데이터: 50개 (Class1: 13, Class2: 13, Class3: 12, Class4: 12)
+  - 학습 설정: LR=1e-5, 100 epoch, 1,200 steps, constant_with_warmup
+  - 검증 스크립트: scripts/run_validation_phases.py
+
+2-2. Phase별 판정 결과
+
+  | Phase                     | 스크립트 판정 | 실제 시각적 품질    | 괴리 원인                |
+  |--------------------------|-------------|-------------------|------------------------|
+  | Phase 1 (기본 생성)        | PASS        | 실패               | generated > 0 기준만 확인 |
+  | Phase 2 (파라미터 탐색)     | PASS        | 실패               | 조합 수만 확인            |
+  | Phase 3 (미학습 일반화)     | PASS        | 실패               | generated > 0 기준만 확인 |
+  | Phase 4 (통계 리포트)      | PASS        | Loss 통계 자체는 정확 | N/A                    |
+
+  validation_results.json: 4개 Phase 모두 true
+  → 그러나 실제 생성 이미지 품질은 완전한 실패 상태
+
+2-3. 생성 이미지 시각적 분석
+
+  Phase 1 (학습 데이터 50개):
+  - 50/50 이미지 생성 자체는 성공 (크래시 없음)
+  - 그러나 생성된 이미지가 금속 표면 결함이 아닌 무지개색/네온 컬러의
+    추상적 패턴으로 출력됨
+  - Hint(빨간 마스크) 영역의 위치 정보가 일부 반영되는 듯하나,
+    출력 이미지가 현실적인 금속 표면과는 전혀 무관한 색감/패턴
+
+  Phase 2 (파라미터 조합 11개):
+  - guidance_scale 3.0/5.0/7.5/10.0 모든 값에서 동일한 비현실적 컬러 노이즈
+  - inference_steps 20/30/50 변경에도 본질적으로 같은 문제
+  - seed 변경 시에도 네온 패턴의 색상 조합만 미세하게 달라짐
+  - 결론: 파라미터 튜닝으로는 해결 불가능한 구조적 문제
+
+  Phase 3 (미학습 데이터 12개):
+  - 12/12 이미지 생성 성공
+  - Phase 1과 동일하게 비현실적인 컬러 패턴 출력
+  - 일반화 평가 이전에 기본 생성 능력 자체가 실패 상태
+
+2-4. Loss 곡선 분석
+
+  training_stats.json:
+  - total_steps: 120 (logging 기준, 실제 1,200 step)
+  - loss_mean: 0.070, loss_median: 0.064, loss_std: 0.035
+  - loss_min: 0.009 (step 130), loss_max: 0.185 (step 670)
+  - final_loss: 0.030
+  - nan_count: 0
+
+  Training Loss Curve (training_loss_curve.png):
+  - Warmup (step 0-50): LR 정상 증가, Loss 0.05~0.08
+  - step 50-1200: Loss가 0.01~0.185 범위에서 진동 지속
+  - 10-step 이동 평균도 0.05~0.08 범위에서 수렴하지 못함
+  - NaN은 0건이지만, 수렴 추세가 없는 전형적인 극소량 데이터 학습 패턴
+
+  Epoch Average Loss (epoch_avg_loss.png):
+  - 100 epoch 전 구간에서 주기적 spike(0.15~0.185) 반복 발생
+  - epoch 간 Loss 감소 추세 없음
+  - 과적합 후 불안정한 진동을 보여줌
+
+2-5. 생성 실패 근본 원인 진단
+
+  [1] 데이터 양 절대 부족 (50개)
+    - ControlNet fine-tuning에 50개 샘플은 극소량
+    - 각 샘플을 약 96회(1200 steps / 50 samples * 4 grad_accum) 반복 학습
+    - 심각한 과적합 + 모드 붕괴
+
+  [2] Loss 수렴 실패
+    - 0.01~0.185 범위 진동, 이동 평균도 수렴하지 못함
+    - epoch별 평균 Loss에서 주기적 spike 반복
+    - 모델이 학습 데이터의 패턴을 안정적으로 포착하지 못함
+
+  [3] ControlNet residual 파괴
+    - fine-tuning 과정에서 ControlNet이 UNet에 보내는 residual이
+      비정상적으로 변형되어 SD 1.5의 자연 이미지 생성 능력 상실
+    - conditioning_scale 제어 없이 1.0으로 full residual 전달
+    - 결과: 금속 표면 대신 무의미한 컬러 패턴 생성
+
+  [4] 검증 파이프라인 구조적 맹점
+    - Phase 1/3 PASS 기준이 "이미지가 1개라도 생성되었는가"만 확인
+    - 생성 이미지의 시각적/정량적 품질을 전혀 평가하지 않음
+    - 기존 QualityValidator(validate_augmented_quality.py)가 존재하지만
+      검증 파이프라인에 통합되지 않음
+
+3. 개선 계획 (4개 작업)
+--------------------------------------------------------------------------------
+
+3-1. 검증 스크립트 품질 평가 추가
+
+  [문제]
+  run_validation_phases.py의 Phase 1/3 PASS 기준:
+    - 기존: summary["generated"] > 0 (이미지 생성 여부만 확인)
+    - 결과: 네온 패턴 이미지도 PASS 처리됨
+
+  [목표]
+  생성 이미지에 대한 정량적 품질 게이트를 검증 파이프라인에 통합
+
+  [구현 계획]
+
+  (a) _compute_generation_quality() 헬퍼 함수 신규 추가
+    - 위치: scripts/run_validation_phases.py
+    - 생성된 이미지 디렉토리를 순회하며 품질 메트릭 계산
+    - 메트릭 (validate_augmented_quality.py의 QualityValidator 재활용):
+      - color_consistency_score: LAB 색공간 기반
+        → 금속 표면은 그레이스케일 계열, 네온 패턴은 0.3 이하 예상
+      - artifact_score: gradient 분석 기반 비현실적 패턴 감지
+      - blur_score: Laplacian variance 기반 선명도
+    - 마스크 기반 defect_consistency는 생성 이미지만으로 평가 불가하므로 제외
+    - 샘플별 quality_score 계산 → 평균값 반환
+
+  (b) Phase 1/3 PASS/FAIL 기준 강화
+    - 변경 후:
+      generated > 0 AND avg_quality_score >= quality_threshold
+    - quality_threshold 기본값: 0.5
+    - --quality_threshold CLI 인자 추가 (기본값 0.5)
+    - 임계값 미달 시 경고 메시지와 함께 FAIL 처리
+
+  (c) generation_summary.json 확장
+    - quality_scores 필드 추가: 샘플별 quality_score 리스트
+    - avg_quality_score 필드 추가
+    - quality_passed 필드 추가 (bool)
+
+  (d) Phase 4 리포트에 품질 점수 포함
+    - validation_report.txt에 품질 점수 섹션 추가
+    - 클래스별 평균 quality_score 출력
+
+  [변경 파일]
+  - scripts/run_validation_phases.py
+    - _compute_generation_quality() 함수 신규
+    - run_phase1() PASS 기준 변경 (line 96-108)
+    - run_phase3() PASS 기준 변경 (line 324-334)
+    - _generate_summary_report() 품질 섹션 추가 (line 733-798)
+    - parse_args()에 --quality_threshold 추가
+
+3-2. 데이터 확대 - 고품질 샘플 선별 로직
+
+  [문제]
+  현재 50개 샘플로는 ControlNet fine-tuning에 절대 부족.
+  16,011개 ROI 중 고품질 샘플을 효율적으로 선별해야 함.
+
+  [목표]
+  roi_metadata.csv에서 품질 기반 다단계 필터링으로 500개 고품질 샘플 선별
+
+  [구현 계획]
+
+  (a) _quality_filter() 메서드 신규 추가
+    - 위치: src/preprocessing/controlnet_packager.py
+    - 필터 기준 (20260212_4.docs 전략 적용):
+      1단계: recommendation == "suitable" (고품질 ROI 풀 확보)
+      2단계: stability_score > 0.3 (수치 불안정 샘플 제외)
+      3단계: matching_score >= 0.5 (클래스 특성 부합도 최소 기준)
+      4단계: area > 100 (너무 작은 노이즈 결함 제외)
+    - 필터 통과 후 suitability_score 내림차순 정렬
+
+  (b) _stratified_sample() 개선
+    - 현재: class_id별 균등 할당 + random sampling
+    - 변경: class_id별 균등 할당 + suitability_score 기준 상위 선별
+    - 추가: 같은 클래스 내 defect_subtype, background_type 다양성 확보
+      → 동일 subtype에서 최대 60% 이하로 제한
+
+  (c) package_dataset()에 quality_filter 옵션 추가
+    - --quality_filter 플래그: 다단계 품질 필터링 적용
+    - 필터 적용 후 _stratified_sample() 호출
+    - 필터링 결과 통계 출력:
+      원본 ROI 수 → 필터 통과 수 → 최종 선별 수 (클래스 분포)
+
+  (d) 예상 학습 시간 (Colab T4 기준)
+    - 500개 × 30 epoch: ~3,750 steps → ~3-5시간 (현실적)
+    - 500개 × 50 epoch: ~6,250 steps → ~5-8시간 (허용 가능)
+    - 1000개 × 30 epoch: ~7,500 steps → ~6-10시간 (경계)
+    - 권장: 500개, 30 epoch
+
+  [변경 파일]
+  - src/preprocessing/controlnet_packager.py
+    - _quality_filter() 메서드 신규 추가
+    - _stratified_sample() 개선 (suitability_score 기반 선별)
+    - package_dataset()에 quality_filter 옵션 추가
+
+3-3. 학습 설정 튜닝 - 과적합 방지
+
+  [문제]
+  현재 설정(LR=1e-5, 100 epoch, constant_with_warmup, conditioning_scale=1.0)이
+  소량 데이터에서 과적합과 모드 붕괴를 유발.
+
+  [구현 계획]
+
+  (a) ControlNet Conditioning Scale 제어 (가장 중요)
+    - --controlnet_conditioning_scale 인자 추가 (기본값: 1.0)
+    - ControlNet의 residual 강도를 조절하여 SD 1.5 base 생성 능력 보존
+    - 권장값: 0.5~0.8
+    - inference 시(test_controlnet.py)에도 동일 인자 연동
+    - 구현: train_controlnet.py의 pipeline.__call__()에서 조절
+      → UNet forward 시 ControlNet output에 scale factor 곱셈
+
+  (b) SNR Weighting (Min-SNR-gamma)
+    - --snr_gamma 인자 추가 (기본값: 5.0, 0이면 비활성)
+    - diffusers의 compute_snr() 활용
+    - 노이즈 스케줄 전 구간에서 균등 학습 → Loss 안정화
+
+  (c) LR Scheduler 개선
+    - 기본값 constant_with_warmup → cosine 권장
+    - cosine 스케줄러: 후반부에 LR 자연 감소 → 과적합 완화
+    - --lr_warmup_ratio 인자 추가 (기본값: 0.1)
+      → 전체 step의 10%를 warmup으로 자동 계산
+
+  (d) Validation Loss 기반 Early Stopping
+    - --early_stopping_patience 인자 추가 (기본값: 0 = 비활성)
+    - N epoch 연속 loss 개선 없으면 학습 중단
+    - best_loss 기준으로 patience 관리
+
+  [변경 파일]
+  - scripts/train_controlnet.py
+    - parse_args()에 4개 인자 추가
+    - train() 함수의 forward pass에 conditioning_scale 적용
+    - loss 계산에 SNR weighting 적용
+    - 학습 루프에 early stopping 로직 추가
+  - scripts/test_controlnet.py
+    - --controlnet_conditioning_scale 인자 추가
+
+3-4. 권장 재학습 설정
+
+  재학습 시 권장 명령 (데이터 확대 + 설정 튜닝 적용 후):
+
+    python scripts/train_controlnet.py \
+        --data_dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v3 \
+        --learning_rate 5e-6 \
+        --num_train_epochs 30 \
+        --lr_scheduler cosine \
+        --lr_warmup_steps 100 \
+        --controlnet_conditioning_scale 0.7 \
+        --snr_gamma 5.0 \
+        --max_grad_norm 0.5 \
+        --early_stopping_patience 5 \
+        --gradient_checkpointing \
+        --mixed_precision fp16 \
+        --save_fp16 \
+        --skip_save_pipeline \
+        --output_dir /content/drive/MyDrive/data/Severstal/controlnet_training_v3
+
+  이전 v2 설정과의 비교:
+
+    | 항목                       | v2                    | v3 (권장)              | 변경 이유                    |
+    |---------------------------|-----------------------|-----------------------|----------------------------|
+    | 학습 데이터                  | 50개                   | 500개                  | 과적합 방지의 근본 해결         |
+    | Learning Rate              | 1e-5                  | 5e-6                  | 작은 LR로 안정적 학습          |
+    | Epochs                     | 100                   | 30                    | 반복 횟수 감소 → 과적합 방지     |
+    | LR Scheduler               | constant_with_warmup  | cosine                | 후반부 LR 자연 감소            |
+    | Conditioning Scale         | 1.0 (암묵적)            | 0.7                   | SD 1.5 base 능력 보존          |
+    | SNR Gamma                  | 없음                   | 5.0                   | Loss 안정화                   |
+    | Max Grad Norm              | 1.0                   | 0.5                   | gradient 폭발 방지 강화        |
+    | Early Stopping             | 없음                   | patience=5            | 불필요한 학습 반복 방지          |
+    | 예상 Total Steps           | 1,200                 | ~3,750                | 적정 수준                     |
+    | 예상 학습 시간 (T4)          | ~1시간                 | ~3-5시간               | 허용 범위                     |
+
+4. 작업 우선순위
+--------------------------------------------------------------------------------
+
+  1순위: 본 문서 작성 (20260218.docs)
+  2순위: 검증 스크립트 품질 평가 추가 (run_validation_phases.py)
+         → 다음 검증 시 품질 게이트가 작동해야 의미 있는 판정 가능
+  3순위: 데이터 확대 로직 구현 (controlnet_packager.py)
+         → 재학습의 전제 조건
+  4순위: 학습 설정 튜닝 (train_controlnet.py, test_controlnet.py)
+         → 재학습 직전에 적용
+
+5. 주의 사항
+--------------------------------------------------------------------------------
+
+  - 검증 품질 평가에서 SSIM(Structural Similarity)은 사용하지 않음.
+    ControlNet은 hint 기반 조건부 생성이므로, 생성 이미지와 원본의
+    pixel-wise 유사도가 높을 필요는 없음. 대신 "현실적인 금속 표면인가"를
+    판단하는 색상 일관성, 아티팩트 부재, 선명도를 평가함.
+
+  - QualityValidator(validate_augmented_quality.py)는 Stage 4
+    (augmented data validation)용으로 설계됨.
+    검증 파이프라인(run_validation_phases.py)에서는 마스크 없이
+    생성 이미지만으로 평가해야 하므로, defect_consistency와 presence_score는
+    제외하고 color/artifact/blur 3개 메트릭만 활용함.
+
+  - controlnet_conditioning_scale은 학습 시와 inference 시 모두 적용해야 함.
+    학습 시: ControlNet의 output을 scale down하여 UNet에 전달
+    inference 시: pipeline.__call__(controlnet_conditioning_scale=0.7)
+
+6. 변경/생성 파일 (구현 완료)
+--------------------------------------------------------------------------------
+
+  [본 작업에서 생성]
+  - docs/20260218.docs (본 문서, 신규 작성)
+
+  [구현 완료 - Task 2: 검증 스크립트 품질 평가]
+  - scripts/run_validation_phases.py
+    - _compute_generation_quality() 함수 신규 추가 (lines 62-184)
+      → color_consistency, artifact, sharpness 3개 메트릭 가중 평균
+    - _score_color_consistency() (lines 187-239): LAB 색공간 기반 무채색 평가
+    - _score_artifacts() (lines 242-261): Sobel gradient 기반 아티팩트 감지
+    - _score_sharpness() (lines 264-282): Laplacian variance 기반 선명도
+    - run_phase1() PASS 기준 변경: generated > 0 AND quality_passed
+    - run_phase3() PASS 기준 변경: generated > 0 AND quality_passed
+    - generation_summary.json에 quality 필드 병합하여 저장
+    - _generate_summary_report(): Phase 1/3에 품질 점수 섹션 추가
+    - parse_args()에 --quality_threshold (기본값 0.5) 추가
+    - parse_args()에 --controlnet_conditioning_scale 추가 (test_controlnet.py에 전달)
+    - Phase 1/2/3의 test_controlnet.py 호출 시 conditioning_scale 전달
+
+  [구현 완료 - Task 3: 데이터 확대]
+  - src/preprocessing/controlnet_packager.py
+    - _quality_filter() 메서드 신규 추가
+      → recommendation, stability_score, matching_score, area 4단계 필터링
+    - _stratified_sample() 완전 재작성
+      → suitability_score 기반 상위 선택 (random → quality ranking)
+      → defect_subtype + background_type 다양성 보장 (라운드로빈 선택)
+    - _diverse_select() 메서드 신규 추가
+      → 그룹별 suitability_score 상위 라운드로빈 선택
+    - package_dataset()에 quality_filter 옵션 추가
+      → quality_filter=True 시 _quality_filter() → _stratified_sample() 순서 적용
+      → min_area, min_stability, min_matching 파라미터 추가
+
+  [구현 완료 - Task 4: 학습 설정 튜닝]
+  - scripts/train_controlnet.py
+    - parse_args()에 3개 인자 추가:
+      --controlnet_conditioning_scale (기본값 1.0, v3 권장 0.7)
+      --snr_gamma (기본값 None, 권장 5.0)
+      --early_stopping_patience (기본값 0, 권장 10)
+    - --lr_scheduler 기본값 변경: constant_with_warmup → cosine
+    - UNet forward에 conditioning_scale 적용 (ControlNet residual 스케일링)
+    - Loss 계산에 Min-SNR weighting 적용 (_compute_snr() 함수 신규)
+    - 학습 루프에 early stopping 로직 추가 (no_improve_count 카운터)
+
+  - scripts/test_controlnet.py
+    - --controlnet_conditioning_scale 인자 추가
+    - generate_single() 함수에 controlnet_conditioning_scale 파라미터 추가
+    - pipeline() 호출 시 controlnet_conditioning_scale 전달
+    - generate_from_jsonl(), generate_single_image() 모두 전달 확인

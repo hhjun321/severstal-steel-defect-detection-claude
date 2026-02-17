@@ -41,9 +41,70 @@ class ControlNetDatasetPackager:
         self.hint_generator = hint_generator or HintImageGenerator()
         self.prompt_generator = prompt_generator or PromptGenerator(style=prompt_style)
     
+    def _quality_filter(self, df: pd.DataFrame,
+                        min_area: int = 100,
+                        min_stability: float = 0.3,
+                        min_matching: float = 0.5,
+                        allowed_recommendations: Optional[List[str]] = None,
+                        ) -> pd.DataFrame:
+        """
+        품질 기준으로 ROI를 필터링합니다.
+
+        v2에서 50개 샘플만 사용하여 overfitting이 발생했으므로,
+        v3에서는 500개 샘플을 목표로 하되 품질 기준을 충족하는 ROI만 사용합니다.
+
+        Args:
+            df: ROI metadata DataFrame
+            min_area: 최소 결함 영역 (px). 너무 작은 결함은 hint가 불명확함.
+            min_stability: 최소 stability_score. 낮으면 마스크 품질이 불안정.
+            min_matching: 최소 matching_score. 낮으면 hint-target 불일치 가능.
+            allowed_recommendations: 허용할 recommendation 값 목록.
+                기본값: ['suitable', 'acceptable']
+
+        Returns:
+            필터링된 DataFrame
+        """
+        if allowed_recommendations is None:
+            allowed_recommendations = ['suitable', 'acceptable']
+
+        original_len = len(df)
+
+        # 1. recommendation 필터
+        if 'recommendation' in df.columns:
+            df = df[df['recommendation'].isin(allowed_recommendations)]
+
+        # 2. area 필터
+        if 'area' in df.columns:
+            df = df[df['area'] >= min_area]
+
+        # 3. stability_score 필터
+        if 'stability_score' in df.columns:
+            df = df[df['stability_score'] >= min_stability]
+
+        # 4. matching_score 필터
+        if 'matching_score' in df.columns:
+            df = df[df['matching_score'] >= min_matching]
+
+        filtered_len = len(df)
+        removed = original_len - filtered_len
+        print(f"Quality filter: {original_len} -> {filtered_len} "
+              f"({removed} removed, {removed/max(original_len,1)*100:.1f}%)")
+        print(f"  Criteria: area>={min_area}, stability>={min_stability}, "
+              f"matching>={min_matching}, recommendation in {allowed_recommendations}")
+
+        if 'class_id' in df.columns:
+            class_dist = df['class_id'].value_counts().sort_index()
+            print(f"  Post-filter class distribution: {dict(class_dist)}")
+
+        return df.reset_index(drop=True)
+
     def _stratified_sample(self, df: pd.DataFrame, n_samples: int) -> pd.DataFrame:
         """
-        클래스별 균등 분포로 샘플링합니다.
+        클래스별 균등 분포로 샘플링합니다 (품질 우선 + 다양성 고려).
+        
+        v2에서는 random sampling을 사용했으나, v3에서는:
+        - suitability_score 기준으로 상위 샘플 우선 선택
+        - defect_subtype, background_type의 다양성을 보장
         
         각 클래스에서 동일한 수의 샘플을 추출하되,
         샘플 수가 부족한 클래스는 가용한 전체 샘플을 사용하고
@@ -57,7 +118,9 @@ class ControlNetDatasetPackager:
             균등 분포로 샘플링된 DataFrame
         """
         if 'class_id' not in df.columns:
-            # class_id가 없으면 랜덤 샘플링 fallback
+            # class_id가 없으면 suitability_score 기반 상위 선택
+            if 'suitability_score' in df.columns:
+                return df.nlargest(min(n_samples, len(df)), 'suitability_score')
             return df.sample(n=min(n_samples, len(df)), random_state=42)
         
         classes = sorted(df['class_id'].unique())
@@ -70,17 +133,24 @@ class ControlNetDatasetPackager:
         sampled_parts = []
         deficit = 0  # 부족한 클래스에서 채우지 못한 수
         
+        has_suitability = 'suitability_score' in df.columns
+        has_subtype = 'defect_subtype' in df.columns
+        has_bg = 'background_type' in df.columns
+        
         for i, cls in enumerate(classes):
-            cls_df = df[df['class_id'] == cls]
+            cls_df = df[df['class_id'] == cls].copy()
             # 나머지는 앞쪽 클래스에 1개씩 추가 할당
             target = per_class + (1 if i < remainder else 0)
             
-            if len(cls_df) >= target:
-                sampled_parts.append(cls_df.sample(n=target, random_state=42))
-            else:
+            if len(cls_df) <= target:
                 # 부족한 클래스: 전체 사용
                 sampled_parts.append(cls_df)
                 deficit += target - len(cls_df)
+            else:
+                # 다양성 보장 샘플링
+                selected = self._diverse_select(cls_df, target,
+                                                has_suitability, has_subtype, has_bg)
+                sampled_parts.append(selected)
         
         # 부족분 재분배: 여유가 있는 클래스에서 추가 샘플링
         if deficit > 0:
@@ -88,12 +158,90 @@ class ControlNetDatasetPackager:
             remaining_df = df[~df.index.isin(already_sampled_idx)]
             
             if len(remaining_df) > 0:
-                additional = remaining_df.sample(
-                    n=min(deficit, len(remaining_df)), random_state=42
-                )
+                if has_suitability:
+                    additional = remaining_df.nlargest(
+                        min(deficit, len(remaining_df)), 'suitability_score'
+                    )
+                else:
+                    additional = remaining_df.sample(
+                        n=min(deficit, len(remaining_df)), random_state=42
+                    )
                 sampled_parts.append(additional)
         
         result = pd.concat(sampled_parts).reset_index(drop=True)
+        
+        # 다양성 통계 출력
+        if has_subtype:
+            subtype_counts = result['defect_subtype'].value_counts()
+            print(f"  Defect subtype diversity: {len(subtype_counts)} types")
+        if has_bg:
+            bg_counts = result['background_type'].value_counts()
+            print(f"  Background type diversity: {len(bg_counts)} types")
+        
+        return result
+    
+    def _diverse_select(self, cls_df: pd.DataFrame, target: int,
+                        has_suitability: bool, has_subtype: bool,
+                        has_bg: bool) -> pd.DataFrame:
+        """
+        다양성을 고려한 샘플 선택.
+        
+        전략:
+        1. defect_subtype과 background_type의 조합별로 그룹화
+        2. 각 그룹에서 suitability_score 상위 샘플을 라운드로빈으로 선택
+        3. 그룹이 없으면 suitability_score 상위 선택
+        """
+        if not (has_subtype or has_bg):
+            # 다양성 기준 없음 - suitability_score 상위 선택
+            if has_suitability:
+                return cls_df.nlargest(target, 'suitability_score')
+            return cls_df.sample(n=target, random_state=42)
+        
+        # 다양성 그룹 키 생성
+        if has_subtype and has_bg:
+            cls_df = cls_df.copy()
+            cls_df['_diversity_key'] = (
+                cls_df['defect_subtype'].astype(str) + '|' +
+                cls_df['background_type'].astype(str)
+            )
+        elif has_subtype:
+            cls_df = cls_df.copy()
+            cls_df['_diversity_key'] = cls_df['defect_subtype'].astype(str)
+        else:
+            cls_df = cls_df.copy()
+            cls_df['_diversity_key'] = cls_df['background_type'].astype(str)
+        
+        # 각 그룹을 suitability_score 내림차순으로 정렬
+        groups = {}
+        for key, group_df in cls_df.groupby('_diversity_key'):
+            if has_suitability:
+                groups[key] = group_df.sort_values(
+                    'suitability_score', ascending=False
+                ).index.tolist()
+            else:
+                groups[key] = group_df.index.tolist()
+        
+        # 라운드로빈으로 선택
+        selected_indices = []
+        group_keys = sorted(groups.keys())
+        group_pointers = {k: 0 for k in group_keys}
+        
+        while len(selected_indices) < target:
+            added_this_round = False
+            for key in group_keys:
+                if len(selected_indices) >= target:
+                    break
+                ptr = group_pointers[key]
+                if ptr < len(groups[key]):
+                    selected_indices.append(groups[key][ptr])
+                    group_pointers[key] = ptr + 1
+                    added_this_round = True
+            if not added_this_round:
+                break  # 모든 그룹 소진
+        
+        result = cls_df.loc[selected_indices]
+        if '_diversity_key' in result.columns:
+            result = result.drop(columns=['_diversity_key'])
         return result
     
     def package_single_roi(self, roi_data: Dict, 
@@ -237,7 +385,11 @@ class ControlNetDatasetPackager:
                        train_csv: Path,
                        output_dir: Path,
                        create_hints: bool = True,
-                       max_samples: Optional[int] = None) -> Path:
+                       max_samples: Optional[int] = None,
+                       quality_filter: bool = True,
+                       min_area: int = 100,
+                       min_stability: float = 0.3,
+                       min_matching: float = 0.5) -> Path:
         """
         Package complete dataset for ControlNet training.
         
@@ -247,7 +399,12 @@ class ControlNetDatasetPackager:
             train_csv: Path to train.csv with RLE annotations
             output_dir: Output directory for packaged dataset
             create_hints: Whether to generate hint images
-            max_samples: Maximum number of samples to package (for testing)
+            max_samples: Maximum number of samples to package.
+                v2에서 50개로 overfitting이 발생했으므로, v3에서는 500 권장.
+            quality_filter: 품질 필터 적용 여부 (기본: True)
+            min_area: 최소 결함 영역 (px, 기본: 100)
+            min_stability: 최소 stability_score (기본: 0.3)
+            min_matching: 최소 matching_score (기본: 0.5)
             
         Returns:
             Path to output directory
@@ -260,10 +417,20 @@ class ControlNetDatasetPackager:
         print(f"Input: {len(roi_metadata_df)} ROIs")
         print(f"Output: {output_dir}")
         print(f"Create hints: {create_hints}")
+        print(f"Quality filter: {quality_filter}")
         print("="*80)
         
         # Load train.csv for mask decoding
         train_df = pd.read_csv(train_csv)
+        
+        # 품질 필터 적용
+        if quality_filter:
+            roi_metadata_df = self._quality_filter(
+                roi_metadata_df,
+                min_area=min_area,
+                min_stability=min_stability,
+                min_matching=min_matching,
+            )
         
         # Limit samples if specified (stratified sampling by class)
         if max_samples and max_samples < len(roi_metadata_df):

@@ -751,6 +751,7 @@ def train(args):
     loss_log = []
     nan_count = 0
     max_nan_tolerance = 10  # 연속 NaN 허용 횟수
+    no_improve_count = 0  # early stopping 카운터
 
     for epoch in range(first_epoch, args.num_train_epochs):
         controlnet.train()
@@ -812,14 +813,25 @@ def train(args):
                 enabled=use_amp,
             ):
                 # 5. UNet forward (ControlNet residual 주입)
+                # conditioning_scale 적용: residual을 스케일링하여
+                # SD의 자연 이미지 생성 능력을 보존.
+                # v2에서 scale=1.0 (기본)으로 neon 패턴이 발생했으므로
+                # v3부터 0.7 권장.
+                cond_scale = args.controlnet_conditioning_scale
+                scaled_down_residuals = [
+                    s.to(dtype=weight_dtype) * cond_scale
+                    for s in down_block_res_samples
+                ]
+                scaled_mid_residual = (
+                    mid_block_res_sample.to(dtype=weight_dtype) * cond_scale
+                )
+
                 model_pred = unet(
                     noisy_latents,
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
-                    down_block_additional_residuals=[
-                        s.to(dtype=weight_dtype) for s in down_block_res_samples
-                    ],
-                    mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
+                    down_block_additional_residuals=scaled_down_residuals,
+                    mid_block_additional_residual=scaled_mid_residual,
                 ).sample
 
                 # 6. Loss 계산
@@ -833,8 +845,23 @@ def train(args):
                     )
 
                 loss = F.mse_loss(
-                    model_pred.float(), target.float(), reduction="mean"
+                    model_pred.float(), target.float(), reduction="none"
                 )
+                loss = loss.mean(dim=list(range(1, len(loss.shape))))  # per-sample loss
+
+                # Min-SNR weighting (timestep별 가중치 적용)
+                if args.snr_gamma is not None:
+                    snr = _compute_snr(noise_scheduler, timesteps)
+                    # Min-SNR-gamma: min(SNR, gamma) / SNR
+                    mse_loss_weights = torch.stack(
+                        [snr, args.snr_gamma * torch.ones_like(snr)], dim=1
+                    ).min(dim=1)[0] / snr
+                    # v_prediction 보정
+                    if noise_scheduler.config.prediction_type == "v_prediction":
+                        mse_loss_weights = mse_loss_weights + 1.0
+                    loss = loss * mse_loss_weights
+
+                loss = loss.mean()
                 loss = loss / args.gradient_accumulation_steps
 
             # =====================================================
@@ -983,12 +1010,24 @@ def train(args):
         # Save best model (NaN이 아닐 때만)
         if not math.isnan(avg_epoch_loss) and avg_epoch_loss < best_loss:
             best_loss = avg_epoch_loss
+            no_improve_count = 0
             save_path = Path(args.output_dir) / "best_model"
             if args.save_fp16:
                 _save_controlnet_fp16(controlnet, save_path)
             else:
                 controlnet.save_pretrained(save_path)
             logger.info(f"New best model (loss={best_loss:.6f}) -> {save_path}")
+        else:
+            no_improve_count += 1
+
+        # Early stopping
+        if (args.early_stopping_patience > 0
+                and no_improve_count >= args.early_stopping_patience):
+            logger.info(
+                f"Early stopping triggered: no improvement for "
+                f"{no_improve_count} epochs (patience={args.early_stopping_patience})"
+            )
+            break
 
     # =========================================================================
     # 6. 최종 저장
@@ -1116,6 +1155,31 @@ def save_full_pipeline(controlnet, args, device):
         logger.warning(f"Could not save full pipeline: {e}")
 
 
+def _compute_snr(noise_scheduler, timesteps):
+    """Min-SNR weighting을 위한 Signal-to-Noise Ratio 계산.
+
+    참조: https://arxiv.org/abs/2303.09556 (Efficient Diffusion Training via Min-SNR Weighting)
+
+    Args:
+        noise_scheduler: DDPMScheduler (alphas_cumprod 필요)
+        timesteps: (B,) tensor of timestep indices
+
+    Returns:
+        snr: (B,) tensor of SNR values
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(
+        device=timesteps.device, dtype=torch.float32
+    )
+    sqrt_alphas_cumprod = alphas_cumprod ** 0.5
+    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod) ** 0.5
+
+    alpha = sqrt_alphas_cumprod[timesteps]
+    sigma = sqrt_one_minus_alphas_cumprod[timesteps]
+
+    snr = (alpha / sigma) ** 2
+    return snr
+
+
 def _save_controlnet_fp16(controlnet, save_path):
     """ControlNet 가중치를 fp16으로 저장합니다.
 
@@ -1176,6 +1240,23 @@ def parse_args():
         "--mixed_precision", type=str, default="no",
         choices=["no", "fp16", "bf16"],
     )
+    parser.add_argument(
+        "--controlnet_conditioning_scale", type=float, default=1.0,
+        help="ControlNet conditioning scale. 1.0이면 ControlNet이 SD의 "
+             "생성 능력을 완전히 덮어씀. v2에서 이 값이 1.0 (기본)으로 "
+             "neon/rainbow 패턴이 발생. v3에서는 0.7 권장.",
+    )
+    parser.add_argument(
+        "--snr_gamma", type=float, default=None,
+        help="Min-SNR weighting gamma. 설정 시 timestep별 SNR 가중치를 "
+             "적용하여 학습 안정성을 개선합니다. 권장 값: 5.0. "
+             "None이면 일반 MSE loss 사용.",
+    )
+    parser.add_argument(
+        "--early_stopping_patience", type=int, default=0,
+        help="Early stopping patience (epochs). 0이면 비활성화. "
+             "N epoch 연속 best loss가 개선되지 않으면 학습 종료. 권장: 10.",
+    )
 
     # Optimizer
     parser.add_argument("--learning_rate", type=float, default=1e-5)
@@ -1187,9 +1268,11 @@ def parse_args():
 
     # LR Scheduler
     parser.add_argument(
-        "--lr_scheduler", type=str, default="constant_with_warmup",
+        "--lr_scheduler", type=str, default="cosine",
         choices=["linear", "cosine", "cosine_with_restarts",
                  "polynomial", "constant", "constant_with_warmup"],
+        help="LR scheduler type. v2에서 constant_with_warmup 사용 시 "
+             "loss가 수렴하지 않았으므로, v3부터 cosine을 기본값으로 변경.",
     )
     parser.add_argument("--lr_warmup_steps", type=int, default=50)
 

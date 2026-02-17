@@ -201,6 +201,7 @@ def generate_single(
     pipeline, hint_image, prompt, negative_prompt,
     num_inference_steps, guidance_scale, seed, device,
     num_images=1,
+    controlnet_conditioning_scale=1.0,
 ):
     """단일 hint 이미지로부터 결함 이미지를 생성합니다."""
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -220,6 +221,7 @@ def generate_single(
                 image=hint_image,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
+                controlnet_conditioning_scale=controlnet_conditioning_scale,
                 generator=gen,
             )
 
@@ -372,6 +374,7 @@ def generate_from_jsonl(pipeline, args, device):
             seed=args.seed + idx,
             device=device,
             num_images=args.num_images_per_sample,
+            controlnet_conditioning_scale=args.controlnet_conditioning_scale,
         )
 
         # 결과 저장
@@ -450,6 +453,7 @@ def generate_single_image(pipeline, args, device):
         seed=args.seed,
         device=device,
         num_images=args.num_images_per_sample,
+        controlnet_conditioning_scale=args.controlnet_conditioning_scale,
     )
 
     # 저장
@@ -514,6 +518,12 @@ def parse_args():
     parser.add_argument("--negative_prompt", type=str, default=None)
     parser.add_argument("--num_inference_steps", type=int, default=30)
     parser.add_argument("--guidance_scale", type=float, default=7.5)
+    parser.add_argument(
+        "--controlnet_conditioning_scale", type=float, default=1.0,
+        help="ControlNet conditioning scale (0.0~1.0). "
+             "낮을수록 SD의 자연 이미지 생성 능력이 보존됩니다. "
+             "v3 권장: 0.7",
+    )
     parser.add_argument("--num_images_per_sample", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
 
