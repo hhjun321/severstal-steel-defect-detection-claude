@@ -41,6 +41,73 @@ class ControlNetDatasetPackager:
         self.hint_generator = hint_generator or HintImageGenerator()
         self.prompt_generator = prompt_generator or PromptGenerator(style=prompt_style)
     
+    def _edge_filter(self, df: pd.DataFrame,
+                     edge_margin: float = 0.1) -> pd.DataFrame:
+        """
+        ROI 경계에 너무 가까운 결함을 가진 샘플을 제외합니다.
+
+        DatasetValidator.visual_check_sample()에서 경고만 출력하던
+        edge proximity 검사를 패키징 시점에 실제 제외 로직으로 적용합니다.
+
+        Args:
+            df: ROI metadata DataFrame (roi_bbox, defect_bbox 컬럼 필요)
+            edge_margin: ROI 크기 대비 최소 마진 비율 (기본 0.1 = 10%)
+
+        Returns:
+            edge-flagged 샘플이 제거된 DataFrame
+        """
+        if 'roi_bbox' not in df.columns or 'defect_bbox' not in df.columns:
+            print("Edge filter: roi_bbox/defect_bbox columns not found, skipping")
+            return df
+
+        original_len = len(df)
+        exclude_indices = []
+
+        for idx, row in df.iterrows():
+            roi_bbox = row['roi_bbox']
+            defect_bbox = row['defect_bbox']
+
+            # Convert string tuples if needed
+            if isinstance(roi_bbox, str):
+                roi_bbox = eval(roi_bbox)
+            if isinstance(defect_bbox, str):
+                defect_bbox = eval(defect_bbox)
+
+            roi_x1, roi_y1, roi_x2, roi_y2 = roi_bbox
+            def_x1, def_y1, def_x2, def_y2 = defect_bbox
+
+            roi_width = roi_x2 - roi_x1
+            roi_height = roi_y2 - roi_y1
+
+            # Skip if dimensions are zero to avoid division issues
+            if roi_width <= 0 or roi_height <= 0:
+                exclude_indices.append(idx)
+                continue
+
+            edge_issues = []
+            if (def_x1 - roi_x1) < roi_width * edge_margin:
+                edge_issues.append("left")
+            if (roi_x2 - def_x2) < roi_width * edge_margin:
+                edge_issues.append("right")
+            if (def_y1 - roi_y1) < roi_height * edge_margin:
+                edge_issues.append("top")
+            if (roi_y2 - def_y2) < roi_height * edge_margin:
+                edge_issues.append("bottom")
+
+            if edge_issues:
+                exclude_indices.append(idx)
+                image_id = row.get('image_id', 'unknown')
+                class_id = row.get('class_id', '?')
+                print(f"  Edge filter excluded: {image_id} (Class {class_id}) "
+                      f"- too close to {', '.join(edge_issues)} edge")
+
+        df = df.drop(index=exclude_indices).reset_index(drop=True)
+        removed = original_len - len(df)
+        print(f"Edge filter: {original_len} -> {len(df)} "
+              f"({removed} removed, {removed/max(original_len,1)*100:.1f}%)")
+
+        return df
+
     def _quality_filter(self, df: pd.DataFrame,
                         min_area: int = 100,
                         min_stability: float = 0.3,
@@ -423,6 +490,9 @@ class ControlNetDatasetPackager:
         # Load train.csv for mask decoding
         train_df = pd.read_csv(train_csv)
         
+        # Edge proximity 필터 적용 (결함이 ROI 경계에 너무 가까운 샘플 제외)
+        roi_metadata_df = self._edge_filter(roi_metadata_df)
+
         # 품질 필터 적용
         if quality_filter:
             roi_metadata_df = self._quality_filter(

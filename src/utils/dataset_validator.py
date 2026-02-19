@@ -64,17 +64,17 @@ class DatasetValidator:
         # Class imbalance (>60% in one class is concerning)
         max_class_pct = max(class_percentages.values())
         if max_class_pct > 60:
-            warnings.append(f"⚠️  Class imbalance detected: Class {max(class_percentages, key=class_percentages.get)} has {max_class_pct:.1f}%")
+            warnings.append(f"[WARN] Class imbalance detected: Class {max(class_percentages, key=class_percentages.get)} has {max_class_pct:.1f}%")
         
         # Subtype imbalance
         max_subtype_pct = max(subtype_percentages.values())
         if max_subtype_pct > 50:
-            warnings.append(f"⚠️  Subtype imbalance: '{max(subtype_percentages, key=subtype_percentages.get)}' has {max_subtype_pct:.1f}%")
+            warnings.append(f"[WARN] Subtype imbalance: '{max(subtype_percentages, key=subtype_percentages.get)}' has {max_subtype_pct:.1f}%")
         
         # Background imbalance
         max_bg_pct = max(bg_percentages.values())
         if max_bg_pct > 50:
-            warnings.append(f"⚠️  Background imbalance: '{max(bg_percentages, key=bg_percentages.get)}' has {max_bg_pct:.1f}%")
+            warnings.append(f"[WARN] Background imbalance: '{max(bg_percentages, key=bg_percentages.get)}' has {max_bg_pct:.1f}%")
         
         # Check for missing combinations
         combinations = roi_metadata_df.groupby(['defect_subtype', 'background_type']).size()
@@ -93,7 +93,7 @@ class DatasetValidator:
                 missing_combinations.append((subtype, bg_type))
         
         if missing_combinations:
-            warnings.append(f"⚠️  Missing ideal combinations: {missing_combinations}")
+            warnings.append(f"[WARN] Missing ideal combinations: {missing_combinations}")
         
         result = {
             'total_rois': total_rois,
@@ -158,10 +158,10 @@ class DatasetValidator:
         ax4.axis('off')
         
         if distribution_stats['is_balanced']:
-            status_text = "✅ Dataset is well-balanced"
+            status_text = "[PASS] Dataset is well-balanced"
             status_color = 'green'
         else:
-            status_text = "⚠️  Imbalance detected"
+            status_text = "[WARN] Imbalance detected"
             status_color = 'orange'
         
         summary_text = f"{status_text}\n\n"
@@ -328,7 +328,7 @@ class DatasetValidator:
                 ax.set_ylim(0, 1)
             
             # Title with status
-            status = "❌" if result['has_issues'] else "✅"
+            status = "[X]" if result['has_issues'] else "[OK]"
             title = f"{status} {result['defect_subtype']}\n{result['background_type']}"
             ax.set_title(title, fontsize=8)
             
@@ -395,11 +395,11 @@ class DatasetValidator:
             print(f"  {bg_type}: {count} ({pct:.1f}%)")
         
         if dist_stats['warnings']:
-            print(f"\n⚠️  Warnings:")
+            print(f"\n[WARN] Warnings:")
             for warning in dist_stats['warnings']:
                 print(f"  {warning}")
         else:
-            print(f"\n✅ Distribution looks balanced!")
+            print(f"\n[PASS] Distribution looks balanced!")
         
         # Visual inspection
         print(f"\n[2/2] Performing visual inspection on {num_visual_samples} samples...")

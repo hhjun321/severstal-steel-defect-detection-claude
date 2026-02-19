@@ -133,7 +133,7 @@ def main():
         )
         
         if validation_report['overall_status'] == 'WARNING':
-            print("\n⚠️  Validation warnings detected. Review the reports before proceeding.")
+            print("\n[WARN] Validation warnings detected. Review the reports before proceeding.")
             print(f"   Reports saved to: {output_dir / 'validation'}")
             
             response = input("\nDo you want to continue anyway? (y/n): ")
@@ -141,7 +141,7 @@ def main():
                 print("Aborting. Please address the issues and try again.")
                 return
         else:
-            print("\n✅ Dataset validation passed!")
+            print("\n[PASS] Dataset validation passed!")
     else:
         print("\n[Step 2/4] Skipping validation...")
     
@@ -174,7 +174,7 @@ def main():
     
     # Print final summary
     print("\n" + "="*80)
-    print("✅ ControlNet Training Data Preparation Complete!")
+    print("[DONE] ControlNet Training Data Preparation Complete!")
     print("="*80)
     print(f"\nOutput directory: {packaged_dir}")
     print(f"\nGenerated files:")
