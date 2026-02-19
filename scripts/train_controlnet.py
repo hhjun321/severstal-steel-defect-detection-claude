@@ -89,12 +89,16 @@ class SteelDefectControlNetDataset(Dataset):
         image_root: str = None,
         resolution: int = 512,
         tokenizer=None,
+        force_grayscale_target: bool = True,
+        augment: bool = False,
     ):
         self.resolution = resolution
         self.tokenizer = tokenizer
         self.image_root = Path(image_root) if image_root else None
         self.jsonl_path = Path(jsonl_path)
         self.data_dir = self.jsonl_path.parent
+        self.force_grayscale_target = force_grayscale_target
+        self.augment = augment
 
         # Load training entries
         self.samples = []
@@ -197,6 +201,37 @@ class SteelDefectControlNetDataset(Dataset):
 
         raise FileNotFoundError(f"Cannot resolve hint path: '{path_str}'")
 
+    def _apply_augmentation(self, target_image, conditioning_image):
+        """[B3] Target과 conditioning 이미지에 동일한 augmentation을 적용합니다.
+
+        적용되는 augmentation:
+        - Horizontal flip (50% 확률)
+        - Brightness jitter (0.9~1.1 범위)
+        - Contrast jitter (0.9~1.1 범위)
+
+        target과 conditioning에 동일한 flip을 적용하여 정합성을 유지합니다.
+        Brightness/contrast는 target에만 적용합니다 (hint 구조 보존).
+        """
+        import random
+        from PIL import ImageEnhance
+
+        # Horizontal flip (target과 conditioning에 동일하게 적용)
+        if random.random() > 0.5:
+            target_image = target_image.transpose(Image.FLIP_LEFT_RIGHT)
+            conditioning_image = conditioning_image.transpose(Image.FLIP_LEFT_RIGHT)
+
+        # Brightness jitter (target에만 적용, hint 구조 보존)
+        brightness_factor = random.uniform(0.9, 1.1)
+        enhancer = ImageEnhance.Brightness(target_image)
+        target_image = enhancer.enhance(brightness_factor)
+
+        # Contrast jitter (target에만 적용)
+        contrast_factor = random.uniform(0.9, 1.1)
+        enhancer = ImageEnhance.Contrast(target_image)
+        target_image = enhancer.enhance(contrast_factor)
+
+        return target_image, conditioning_image
+
     def __len__(self):
         return len(self.samples)
 
@@ -207,9 +242,23 @@ class SteelDefectControlNetDataset(Dataset):
         target_path = self._resolve_image_path(sample["target"])
         target_image = Image.open(target_path).convert("RGB")
 
+        # [B1] Target 이미지 grayscale 강제 변환
+        # SD 1.5 VAE의 latent space에서 3채널이 동일값을 갖게 하여
+        # 채널 분기(RGB 컬러 아티팩트)를 방지합니다.
+        # grayscale 변환 후 RGB 3채널로 복제: R==G==B 보장.
+        if self.force_grayscale_target:
+            gray = target_image.convert("L")
+            target_image = Image.merge("RGB", [gray, gray, gray])
+
         # Load hint/conditioning image
         hint_path = self._resolve_hint_path(sample["hint"])
         conditioning_image = Image.open(hint_path).convert("RGB")
+
+        # [B3] Data augmentation: horizontal flip, brightness/contrast jitter
+        if self.augment:
+            target_image, conditioning_image = self._apply_augmentation(
+                target_image, conditioning_image
+            )
 
         # Apply transforms
         target_tensor = self.image_transforms(target_image)
@@ -574,6 +623,8 @@ def train(args):
         image_root=args.image_root,
         resolution=args.resolution,
         tokenizer=tokenizer,
+        force_grayscale_target=args.force_grayscale_target,
+        augment=args.augment,
     )
 
     if len(train_dataset) == 0:
@@ -736,6 +787,12 @@ def train(args):
     logger.info(f"  LR scheduler       : {args.lr_scheduler}")
     logger.info(f"  Warmup steps       : {effective_warmup}")
     logger.info(f"  Max grad norm      : {args.max_grad_norm}")
+    logger.info(f"  Cond. scale        : {args.controlnet_conditioning_scale}")
+    logger.info(f"  SNR gamma          : {args.snr_gamma}")
+    logger.info(f"  Early stop patience: {args.early_stopping_patience}")
+    logger.info(f"  Force grayscale    : {args.force_grayscale_target}")
+    logger.info(f"  Gray loss lambda   : {args.gray_loss_lambda}")
+    logger.info(f"  Data augmentation  : {args.augment}")
     logger.info("=" * 80)
 
     progress_bar = tqdm(
@@ -850,7 +907,7 @@ def train(args):
                 loss = loss.mean(dim=list(range(1, len(loss.shape))))  # per-sample loss
 
                 # Min-SNR weighting (timestep별 가중치 적용)
-                if args.snr_gamma is not None:
+                if args.snr_gamma is not None and args.snr_gamma > 0:
                     snr = _compute_snr(noise_scheduler, timesteps)
                     # Min-SNR-gamma: min(SNR, gamma) / SNR
                     mse_loss_weights = torch.stack(
@@ -862,6 +919,25 @@ def train(args):
                     loss = loss * mse_loss_weights
 
                 loss = loss.mean()
+
+                # [B2] Grayscale 일관성 loss (channel-consistency loss)
+                # 생성되는 latent의 채널 간 차이를 최소화하여
+                # 디코딩 후 R==G==B(grayscale) 출력을 유도합니다.
+                # L_total = L_mse + gray_loss_lambda * L_gray
+                # L_gray = MSE(pred[:,0]-pred[:,1]) + MSE(pred[:,1]-pred[:,2])
+                if args.gray_loss_lambda > 0:
+                    pred_f = model_pred.float()
+                    # latent space의 4채널 중 처음 3채널은 RGB에 대응하는
+                    # 색상 정보를 인코딩합니다. 이들 간 차이를 최소화합니다.
+                    ch0 = pred_f[:, 0]
+                    ch1 = pred_f[:, 1]
+                    ch2 = pred_f[:, 2]
+                    gray_loss = (
+                        F.mse_loss(ch0, ch1, reduction="mean")
+                        + F.mse_loss(ch1, ch2, reduction="mean")
+                    )
+                    loss = loss + args.gray_loss_lambda * gray_loss
+
                 loss = loss / args.gradient_accumulation_steps
 
             # =====================================================
@@ -1241,21 +1317,44 @@ def parse_args():
         choices=["no", "fp16", "bf16"],
     )
     parser.add_argument(
-        "--controlnet_conditioning_scale", type=float, default=1.0,
+        "--controlnet_conditioning_scale", type=float, default=0.7,
         help="ControlNet conditioning scale. 1.0이면 ControlNet이 SD의 "
              "생성 능력을 완전히 덮어씀. v2에서 이 값이 1.0 (기본)으로 "
-             "neon/rainbow 패턴이 발생. v3에서는 0.7 권장.",
+             "neon/rainbow 패턴이 발생. v3부터 0.7을 기본값으로 적용.",
     )
     parser.add_argument(
-        "--snr_gamma", type=float, default=None,
-        help="Min-SNR weighting gamma. 설정 시 timestep별 SNR 가중치를 "
-             "적용하여 학습 안정성을 개선합니다. 권장 값: 5.0. "
-             "None이면 일반 MSE loss 사용.",
+        "--snr_gamma", type=float, default=5.0,
+        help="Min-SNR weighting gamma. timestep별 SNR 가중치를 "
+             "적용하여 학습 안정성을 개선합니다. v4부터 기본값 5.0 적용. "
+             "0이면 비활성화 (일반 MSE loss 사용).",
     )
     parser.add_argument(
-        "--early_stopping_patience", type=int, default=0,
+        "--early_stopping_patience", type=int, default=20,
         help="Early stopping patience (epochs). 0이면 비활성화. "
-             "N epoch 연속 best loss가 개선되지 않으면 학습 종료. 권장: 10.",
+             "N epoch 연속 best loss가 개선되지 않으면 학습 종료. "
+             "v4부터 기본값 20 적용.",
+    )
+    parser.add_argument(
+        "--force_grayscale_target", action="store_true", default=True,
+        help="[B1] Target 이미지를 grayscale로 강제 변환 후 RGB 3채널로 복제. "
+             "VAE latent space에서 3채널이 동일값을 갖게 하여 "
+             "채널 분기(RGB 컬러 아티팩트)를 방지합니다. 기본 활성화.",
+    )
+    parser.add_argument(
+        "--no_force_grayscale_target", dest="force_grayscale_target",
+        action="store_false",
+        help="Target grayscale 강제 변환을 비활성화합니다.",
+    )
+    parser.add_argument(
+        "--gray_loss_lambda", type=float, default=0.1,
+        help="[B2] Grayscale 일관성 loss 가중치 (lambda). "
+             "L_total = L_mse + lambda * L_gray. "
+             "0이면 비활성화. 권장 범위: 0.1~0.5. 기본값 0.1.",
+    )
+    parser.add_argument(
+        "--augment", action="store_true", default=False,
+        help="[B3] 학습 데이터 augmentation 활성화. "
+             "Horizontal flip (50%%), brightness/contrast jitter (0.9~1.1).",
     )
 
     # Optimizer

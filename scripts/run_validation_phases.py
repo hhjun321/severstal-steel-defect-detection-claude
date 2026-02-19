@@ -1316,9 +1316,10 @@ def parse_args():
 
     # Generation parameters (passed through to test_controlnet.py)
     parser.add_argument(
-        "--controlnet_conditioning_scale", type=float, default=1.0,
+        "--controlnet_conditioning_scale", type=float, default=0.7,
         help="ControlNet conditioning scale for inference (0.0~1.0). "
-             "v3 권장: 0.7. Passed through to test_controlnet.py.",
+             "v3부터 기본값 0.7 적용 (v2의 1.0에서 neon/rainbow 패턴 발생). "
+             "Passed through to test_controlnet.py.",
     )
 
     args = parser.parse_args()

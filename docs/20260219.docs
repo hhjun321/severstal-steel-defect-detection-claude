@@ -138,338 +138,272 @@ prepare_controlnet_data.py 실행 시 발생한 3건의 에러/경고를 분석�
   [신규]
   - docs/20260219.docs (본 문서)
 
-6. hint 이미지 RGB 색상 전이 문제 분석
+10. test_results_v3 분석: grayscale hint 학습 후 생성 결과 검증
 --------------------------------------------------------------------------------
 
-6-1. 문제 현상
+10-1. 분석 배경
+
+  section 7에서 hint 이미지를 grayscale로 변환(R*0.5 + G*0.3 + B*0.2)한 뒤
+  ControlNet v3 모델을 재학습하였다. 본 절은 재학습 모델의 validation 결과인
+  outputs/test_results_v3를 분석하여, grayscale hint 변환이 RGB 색상 전이 문제를
+  해결했는지 평가한다.
+
+10-2. Validation Phase 결과 요약
+
+  | Phase                        | 결과  | 비고                              |
+  |------------------------------|-------|-----------------------------------|
+  | Phase 1 (기본 생성)          | FAIL  | 미실행 (false)                    |
+  | Phase 2 (파라미터 탐색)      | PASS  | 11개 파라미터 조합 테스트 완료    |
+  | Phase 3 (미학습 데이터)      | PASS  | 12/12 샘플 생성, avg_quality=0.57 |
+  | Phase 4 (리포트/시각화)      | PASS  | 학습 통계 및 Loss 곡선 생성 완료  |
+
+  Phase 1이 미실행인 이유는 validation_results.json에 false로 기록되어 있으며,
+  실행 오류 또는 의도적 스킵으로 추정됨.
+
+10-3. 학습 통계 분석
+
+  (a) 학습 규모
+
+    | 항목           | 값                                        |
+    |----------------|-------------------------------------------|
+    | 총 step        | 1,200 (로그 기록 225 entries, 10step 간격) |
+    | 총 epoch       | 100 (config) / 18 (stats에 기록된 값)     |
+    | batch size     | 1 (grad_accum=4, effective=4)             |
+    | LR 스케줄러    | constant_with_warmup (config 기준)        |
+    | 학습률         | 1e-5 (warmup 50 step)                     |
+    | mixed precision| fp16                                      |
+
+    참고: training_config.json에는 lr_scheduler="constant_with_warmup"으로 기록되어
+    있으나, train_controlnet.py 코드의 v3 기본값은 "cosine"으로 변경됨.
+    실제 학습에 적용된 스케줄러는 training_log.json의 lr 값으로 확인 가능:
+    - step 50 이후 lr이 1e-5로 고정 → constant_with_warmup이 적용된 것으로 확인됨.
+    - cosine 스케줄러였다면 step 증가에 따라 lr이 감소해야 함.
+
+  (b) Loss 추이
+
+    | 항목        | 값      | 비고                    |
+    |-------------|---------|-------------------------|
+    | Loss 평균   | 0.0470  |                         |
+    | Loss 중앙값 | 0.0438  |                         |
+    | Loss 표준편차| 0.0194  | 높은 분산               |
+    | Loss 최소   | 0.0051  | step 640 부근           |
+    | Loss 최대   | 0.1143  | step 20 (warmup 구간)   |
+    | 최종 Loss   | 0.0567  |                         |
+    | NaN 발생    | 0회     |                         |
+
+    Loss 곡선 분석:
+    - warmup 구간(step 0-50): 0.05 → 0.08 → 0.05 수준으로 급등 후 안정화
+    - step 50-600: loss 0.02-0.15 범위에서 큰 진동, 10-step MA 기준 0.06 → 0.04
+    - step 600-1200: 0.02-0.18 범위, MA 기준 0.04-0.05에서 횡보
+    - 전체적으로 수렴하지 않고 진동하는 패턴
+    - 특히 step 670(0.184), step 970(0.181) 등 간헐적 spike 발생
+
+    비수렴 원인 추정:
+    - 학습 데이터 부족 (500개 샘플 × 100 epoch = 50,000 반복이지만
+      effective batch=4이므로 실제 가중치 업데이트는 12,500회)
+    - constant_with_warmup 스케줄러가 후반부에도 lr=1e-5를 유지하여
+      fine-grained 수렴이 불가능 (cosine이었다면 후반 lr 감소로 안정화)
+    - 작은 데이터셋에서의 overfitting-underfitting 진동
+
+10-4. 생성 이미지 품질 분석 (Phase 3)
+
+  (a) 정량적 품질 점수
+
+    | 이미지 ID               | Class | Quality | Color  | Artifact | Blur  |
+    |-------------------------|-------|---------|--------|----------|-------|
+    | 09e15218c (class3_r1)   | 3     | 0.6236  | 0.8091 | 0.0000   | 1.000 |
+    | 374d9c63f (class4_r0)   | 4     | 0.6952  | 0.4470 | 0.7363   | 0.985 |
+    | 3fe32ff2f (class2_r1)   | 2     | 0.5965  | 0.7412 | 0.0000   | 1.000 |
+    | 5fa81f2b5 (class3_r0)   | 3     | 0.5436  | 0.6091 | 0.0000   | 1.000 |
+    | 68cc04a14 (class2_r0)   | 2     | 0.5378  | 0.5944 | 0.0000   | 1.000 |
+    | 8b9c035ec (class2_r0)   | 2     | 0.5063  | 0.5158 | 0.0000   | 1.000 |
+    | 8f8a23f39 (class1_r1)   | 1     | 0.5418  | 0.6046 | 0.0000   | 1.000 |
+    | 9d57d9095 (class1_r0)   | 1     | 0.5521  | 0.6302 | 0.0000   | 1.000 |
+    | c22accc84 (class1_r0)   | 1     | 0.6195  | 0.7987 | 0.0000   | 1.000 |
+    | e8fefd824 (class3_r0)   | 3     | 0.5474  | 0.6185 | 0.0000   | 1.000 |
+    | f41732c94 (class4_r1)   | 4     | 0.4632  | 0.4079 | 0.0000   | 1.000 |
+    | f4495532f (class4_r0)   | 4     | 0.6528  | 0.8821 | 0.0000   | 1.000 |
+    |-------------------------|-------|---------|--------|----------|-------|
+    | 평균                    | -     | 0.5733  | 0.6382 | 0.0614   | 0.999 |
+
+    품질 점수 가중치: color(0.40) + artifact(0.30) + blur(0.30)
+    합격 기준: avg_quality >= 0.5 → PASS (0.5733 >= 0.5)
+
+  (b) 메트릭별 분석
+
+    Color Consistency (avg: 0.6382):
+    - 가장 취약한 지표, 범위 0.41 ~ 0.88
+    - 최저: f41732c94 (class4) = 0.4079
+    - 최고: f4495532f (class4) = 0.8821
+    - 동일 class 4에서도 편차가 매우 큼 (0.41 vs 0.88)
+    - LAB 색공간에서 a,b 채널 편차가 크다 = 무채색이 아닌 색상 존재
+
+    Artifact Score (avg: 0.0614):
+    - 12개 중 11개가 0.0 (아티팩트 없음 판정)
+    - 374d9c63f만 0.7363 (높은 gradient 비율 = 경계 아티팩트 존재)
+    - gradient 기반 감지이므로 색상 아티팩트는 포착하지 못함
 
-  ControlNet 학습 후 validation 시 생성 이미지가 그레이스케일 금속 표면이 아닌
-  RGB 컬러로 출력됨. 20260218.docs의 v2 네온/무지개 패턴과는 별도의 새로운 문제.
+    Blur Score (avg: 0.9987):
+    - 거의 만점, 모든 이미지가 선명
+    - 문제: "선명하게 잘못된 색상"이 생성되고 있음
 
-6-2. 전체 파이프라인 점검
+  (c) 클래스별 분석
 
-  hint 생성부터 학습, 추론, 검증까지 전 과정을 점검하였음.
+    | Class | 샘플 수 | avg Quality | avg Color |
+    |-------|---------|-------------|-----------|
+    | 1     | 3       | 0.5711      | 0.6778    |
+    | 2     | 3       | 0.5469      | 0.6171    |
+    | 3     | 3       | 0.5715      | 0.6789    |
+    | 4     | 3       | 0.6037      | 0.5790    |
 
-  (1) hint 생성 (src/preprocessing/hint_generator.py)
+    - Class 4가 quality 최고이나 color 최저 → 구조적으로는 양호하나 색상이 불안정
+    - Class 1, 3이 color에서 상대적 우위
 
-    generate_hint_image() (line 213-239):
-      - np.stack([red, green, blue], axis=2)로 3채널 RGB 이미지 생성
-      - 각 채널은 uint8 [0-255] 범위
+10-5. 핵심 문제: grayscale hint에도 불구하고 RGB 컬러 출력 지속
 
-    Red 채널 - 결함 마스크 (line 36-97):
-      - linearity > 0.7: skeleton 추출 → dilate → 255
-      - solidity > 0.8: 마스크 영역 fill → 200
-      - 일반: 마스크 내부 100 + Canny edge 255
-      - 배경: 0
+  (a) 문제 확인
 
-    Green 채널 - 배경 구조선 (line 99-159):
-      - vertical_stripe: abs(sobel_x)
-      - horizontal_stripe: abs(sobel_y)
-      - complex_pattern: sqrt(sobel_x^2 + sobel_y^2)
-      - smooth/textured: full gradient * 0.3
-      - cv2.normalize(0-255) 후 stability_score로 스케일링
+    생성 이미지를 직접 확인한 결과, 심각한 RGB 컬러 아티팩트가 관찰됨:
 
-    Blue 채널 - 배경 텍스처 (line 161-211):
-      - smooth: 상수 20
-      - 기타: 7x7 윈도우 local variance → normalize(0-255)
-      - textured/complex_pattern: 1.2x 부스트
+    - Hint 이미지: 정상 grayscale (R==G==B, 모든 픽셀에서 3채널 동일)
+    - 원본 GT 이미지: 정상 grayscale (실제 철강 표면, 무채색)
+    - 생성 이미지: 강렬한 RGB 색상 출력
+      - 빨강/마젠타/검정 패치 (class4_region0)
+      - 파랑/초록/네온 색상 오염 (class3_region0 비교 이미지)
+      - 가장자리에 청록/노란 색상 잔존 (f4495532f)
+      - Phase 2 guidance_scale 변경(3.0~10.0)으로도 해결되지 않음
 
-    저장: RGB → BGR 변환 후 cv2.imwrite(.png) (line 250-251)
+    정량적 확인:
+    - 생성 이미지의 grayscale 비율(R==G==B인 픽셀): 11~48%, 평균 20~30%
+    - R, G, B 채널 평균값이 서로 크게 불일치
+    - 최대 채널 간 차이: 255 (극단적 색상 포화)
 
-  (2) 학습 로딩 (scripts/train_controlnet.py)
+  (b) 결론: grayscale hint 변환만으로는 RGB 출력 문제가 해결되지 않음
 
-    SteelDefectControlNetDataset (line 75):
-      - hint 로딩: Image.open().convert("RGB") (line 212)
-      - hint 전처리 (line 122-126):
-          Resize(512) → CenterCrop(512) → ToTensor()
-          → float32 [0, 1] 범위, Normalize 없음
-      - target 전처리 (line 115-120):
-          Resize(512) → CenterCrop(512) → ToTensor() → Normalize([0.5],[0.5])
-          → float32 [-1, 1] 범위
-      - 채널 검증: assert shape[0] == 3 (line 280)
+    section 6-4에서 분석한 [문제 2](hint의 RGB 색상 shortcut 학습)는
+    grayscale hint로 차단되었으나, [문제 1](SD 1.5의 RGB 컬러 생성 본질)이
+    여전히 해결되지 않았음.
 
-    학습 루프:
-      - ControlNet forward: hint [0,1] → ControlNet → residual 생성 (line 799-807)
-      - conditioning_scale 적용: residual * scale (line 818-835)
-      - UNet forward: noisy_latents + scaled residual → noise prediction (line 829-835)
+10-6. RGB 컬러 출력의 근본 원인 분석
 
-  (3) 추론 (scripts/test_controlnet.py)
+  (1) SD 1.5 VAE의 3채널 독립 디코딩 (근본 원인)
 
-    hint 로딩: Image.open().convert("RGB") (line 353, 434)
-    hint 전처리: 없음 - PIL Image를 pipeline에 직접 전달 (line 221)
-    pipeline 내부에서 resize 및 [0,1] 변환 수행
+    Stable Diffusion v1.5의 VAE는 latent space에서 항상 3채널 RGB를 디코딩함.
+    ControlNet이 grayscale hint를 받더라도, UNet은 3채널 noise를 독립적으로
+    예측하며, 각 채널이 동일한 값으로 수렴할 제약이 없음.
 
-    출력: pipeline → PIL RGB Image → .save(.png)
+    학습 시 target 이미지가 grayscale(3채널 동일값)이더라도, VAE 인코딩-디코딩
+    과정에서 latent space의 각 채널 간 미세한 차이가 발생할 수 있고,
+    소량 학습에서는 이 차이를 정확히 보상하지 못함.
 
-  (4) 검증 (scripts/run_validation_phases.py)
+  (2) Target 이미지 로딩 방식 (기여 원인)
 
-    test_controlnet.py를 subprocess.run()으로 호출 (line 318)
-    품질 평가: color_consistency(0.4) + artifact(0.3) + sharpness(0.3) (line 141-145)
+    train_controlnet.py line 208:
+      target_image = Image.open(target_path).convert("RGB")
 
-6-3. 발견된 문제점
+    원본 철강 이미지가 grayscale이더라도 .convert("RGB")로 3채널 확장됨.
+    이때 R==G==B이 보장되지만, VAE latent 인코딩 시 채널 간 미세한 수치 차이가
+    발생할 수 있음. 모델이 이 차이를 학습하면 생성 시 채널 분기가 증폭됨.
 
-  [문제 1] SD 1.5 base model의 RGB 컬러 생성 (핵심 원인)
+  (3) 학습 부족 및 Loss 비수렴 (악화 원인)
 
-    SD 1.5는 RGB 컬러 모델이며, 학습 target이 그레이스케일 금속 표면이어도
-    Image.open().convert("RGB")로 3채널 RGB로 변환하여 학습함.
-    소량 샘플(50~500개)로는 "금속 표면 = 무채색"이라는 색상 분포를
-    충분히 학습하지 못하며, SD 1.5 사전학습 가중치의 컬러 편향이 잔존함.
+    1,200 step / constant_with_warmup에서 loss가 수렴하지 않고 진동:
+    - 10-step MA 기준 0.04~0.06 범위에서 횡보
+    - 간헐적 spike (step 670: 0.184, step 970: 0.181)
+    - 모델이 "grayscale 금속 표면" 분포를 충분히 학습하지 못한 상태
 
-  [문제 2] hint 이미지의 강한 RGB 색상 신호 (핵심 원인)
+  (4) controlnet_conditioning_scale=1.0 추론 (악화 원인)
 
-    hint 이미지의 채널별 색상이 시각적으로 뚜렷한 RGB 색상을 형성:
-      - Red 채널(결함 마스크): 밝은 빨간색
-      - Green 채널(배경 에지): 녹색 계열
-      - Blue 채널(텍스처 분산): 파란색 계열
+    test_controlnet.py 기본값: controlnet_conditioning_scale=1.0
+    run_validation_phases.py 기본값: controlnet_conditioning_scale=1.0
 
-    ControlNet은 이 3채널을 조건 입력으로 받으나, 소량 학습에서는
-    채널별 의미론적 분리(마스크/에지/텍스처)를 학습하지 못하고
-    hint의 RGB 색상 자체를 생성 이미지에 복사하는 shortcut 학습 발생.
+    v3 권장값은 0.7이나, 실제 테스트가 1.0으로 실행됨.
+    scale=1.0이면 ControlNet이 SD의 자연 이미지 생성 능력을 완전히 덮어써서
+    미학습 패턴(neon/rainbow 색상)이 더 강하게 나타남.
 
-  [문제 3] 학습-추론 전처리 불일치 (부차적)
+    Phase 2에서 guidance_scale(3.0~10.0)과 inference_steps(20~50)를
+    변경했으나, conditioning_scale은 모두 1.0으로 고정되어 비교 불가.
 
-    | 단계 | 전처리                                               |
-    |------|------------------------------------------------------|
-    | 학습 | Resize(512) → CenterCrop(512) → ToTensor [0,1]      |
-    | 추론 | PIL Image 직접 전달 (pipeline 내부 resize, crop 없음) |
+10-7. Phase 2 파라미터 탐색 결과
 
-    비정방형 hint에서 학습은 center crop, 추론은 stretch → 공간 정보 왜곡 가능.
+  (a) 테스트 파라미터
 
-6-4. hint 형식 변경 방안 검토
+    | 파라미터          | 테스트 값               |
+    |-------------------|-------------------------|
+    | guidance_scale    | 3.0, 5.0, 7.5, 10.0    |
+    | inference_steps   | 20, 30, 50              |
+    | seed              | 42, 123, 456, 789       |
+    | (고정) cond_scale | 1.0 (전체 동일)         |
 
-  [방안 1] 그레이스케일 hint (3ch 동일값)
+    대표 샘플: d84ad849e.jpg_class1_region1 (학습 데이터 첫 번째 hint)
 
-    개념:
-      R/G/B 3채널 정보를 가중 합산하여 단일 그레이스케일 값을 생성한 뒤,
-      3채널 모두에 동일 값을 복제하여 무채색 hint 이미지를 구성.
-
-    변환:
-      gray = w_r * R + w_g * G + w_b * B
-      hint_new = [gray, gray, gray]
-
-    예시 가중치:
-      w_r = 0.5 (결함 마스크 - 가장 중요)
-      w_g = 0.3 (배경 구조)
-      w_b = 0.2 (텍스처)
-
-    장점:
-      - ControlNet의 색상 shortcut 학습이 원천 차단됨
-        (모든 채널이 동일값이므로 색상 정보 자체가 존재하지 않음)
-      - 생성 이미지가 SD 1.5 사전학습의 색상 분포를 따르게 되어
-        금속 표면의 무채색 생성에 유리
-      - Canny/Depth 등 검증된 ControlNet 조건 형식과 동일한 구조
-      - 구현이 간단 (np.stack 후 가중 합산 추가)
-
-    단점:
-      - R/G/B 채널의 의미론적 정보(마스크/에지/텍스처)가 혼합되어 구분 불가
-      - 결함 마스크(R)와 배경 에지(G) 겹침 영역에서 정보 상쇄 가능
-      - 가중치 선택에 따라 특정 정보가 묻힐 수 있음
-
-    적합 상황: 소량 데이터(50~500개) 학습에서 안정적 결과를 우선시할 때
-
-  [방안 2] 채널 강도 축소 (멀티채널 유지)
-
-    개념:
-      기존 3채널 구조를 유지하되, 각 채널의 값 범위를 축소하여
-      전체적으로 색상 신호를 약화.
-
-    변환:
-      R_new = R * scale_r  (예: 0.3)
-      G_new = G * scale_g  (예: 0.3)
-      B_new = B * scale_b  (예: 0.3)
-
-    또는 중앙값 오프셋 방식:
-      base = 128
-      R_new = base + (R - 128) * 0.2
-      G_new = base + (G - 128) * 0.2
-      B_new = base + (B - 128) * 0.2
-
-    장점:
-      - 3채널의 의미론적 분리(마스크/에지/텍스처)가 유지됨
-      - 충분한 학습 시 채널별 정보를 구분하여 활용 가능
-      - 색상 신호 약화로 직접적인 색상 전이 감소
-
-    단점:
-      - 색상 정보가 완전히 제거되지 않음 → 소량 학습에서 shortcut 학습 잔존 가능
-      - 적정 scale 값을 찾기 위한 실험 필요
-      - 약한 신호에서 ControlNet input conv의 패턴 추출 어려움 (SNR 저하)
-      - 문제를 "완화"하지만 "해결"하지는 못할 가능성
-
-    적합 상황: 대량 데이터(1000개+)로 채널별 의미 분리를 기대할 수 있을 때
-
-  [방안 3] 단일채널 (결함 마스크만)
-
-    개념:
-      Red 채널(결함 마스크)만 사용하고 Green/Blue는 제거.
-      마스크를 3채널 모두에 복제하여 Canny/Segmentation ControlNet과 동일 구조.
-
-    변환:
-      hint_new = [R, R, R]  (마스크를 3ch로 복제)
-      또는
-      hint_new = [R, 0, 0]  (R만 사용, G/B 제거)
-
-    장점:
-      - 가장 단순하고 예측 가능한 구조
-      - 결함 위치/형태라는 핵심 정보에 집중
-      - Canny/Segmentation ControlNet 등 검증된 패턴과 동일
-      - 배경 정보(G/B)로 인한 노이즈 완전 제거
+  (b) 관찰 결과
 
-    단점:
-      - 배경 구조(G)와 텍스처(B) 정보를 완전히 버림
-      - "어떤 배경 위에 어떤 결함을 생성할지"에 대한 컨텍스트 감소
-      - 생성 이미지의 배경 다양성이 줄어들 수 있음
-      - 프롬프트에 배경 정보가 포함되어 있으므로 텍스트 보완 필요
-
-    적합 상황: 결함 위치/형태의 정확한 제어가 최우선이고,
-              배경은 프롬프트로 충분히 제어 가능할 때
-
-  [방안 비교 요약]
-
-    | 항목             | 방안1: 그레이스케일 | 방안2: 강도 축소 | 방안3: 마스크만 |
-    |------------------|---------------------|------------------|-----------------|
-    | 색상 전이 차단   | 완전 차단           | 부분 차단        | 완전 차단       |
-    | 정보 보존        | R+G+B 혼합 보존     | R/G/B 분리 보존  | R만 보존        |
-    | 소량 학습 안정성 | 높음                | 중간             | 높음            |
-    | 구현 복잡도      | 낮음                | 중간             | 매우 낮음       |
-    | 배경 제어력      | 중간 (혼합됨)       | 높음 (분리됨)    | 낮음 (프롬프트) |
-    | 검증된 패턴      | Canny/Depth 유사    | 독자적 구조      | Seg/Canny 동일  |
-    | 재학습 필요      | 예                  | 예               | 예              |
-
-    권장: v3 학습(500개 규모) 기준으로 방안 1(그레이스케일)이 가장 적합.
-    색상 전이를 완전히 차단하면서 3채널 정보를 가중 합산으로 보존.
-    향후 데이터 1000개 이상 확보 시 방안 2로 전환 검토 가능.
-
-7. 6-4 방안 1 수행: 그레이스케일 hint 변환
---------------------------------------------------------------------------------
+    - guidance_scale 변경(3.0~10.0): 모든 값에서 RGB 컬러 아티팩트 동일 발생
+    - inference_steps 변경(20~50): 색상 문제에 유의미한 차이 없음
+    - seed 변경(42~789): 색상 패턴이 달라지나 RGB 컬러 자체는 지속
 
-7-1. 수행 내용
+    결론: guidance_scale과 inference_steps는 RGB 컬러 문제의 원인이 아님.
+    conditioning_scale=0.7로 테스트하지 못한 것이 미진한 점.
 
-  [변경 파일] src/preprocessing/hint_generator.py
+10-8. 개선 방안
 
-  (a) 모듈 docstring 업데이트 (line 1-15)
-    - "Multi-Channel Hint Image Generation Module"
-      → "Grayscale Hint Image Generation Module"
-    - 가중 합산 방식(R*0.5 + G*0.3 + B*0.2)과 색상 shortcut 방지 목적을 명시
-    - docs/20260219.docs section 6-4 참조 기록 추가
-
-  (b) generate_hint_image() 메서드 수정 (line 216-261)
-    - 기존: np.stack([red, green, blue], axis=2) → 3채널 RGB hint
-    - 변경: R/G/B 채널을 가중 합산 후 3채널 모두에 동일 값 복제
-
-      gray = w_r * R + w_g * G + w_b * B
-      hint_new = [gray, gray, gray]
-
-      가중치:
-        w_r = 0.5 (결함 마스크 - 가장 중요)
-        w_g = 0.3 (배경 구조)
-        w_b = 0.2 (텍스처)
-
-    - float32로 연산 후 np.clip(0, 255) → uint8 변환
-    - 개별 채널 생성 로직(generate_red/green/blue_channel)은 변경 없이 유지
-
-7-2. 기대 효과
-
-  (1) ControlNet의 RGB 색상 shortcut 학습이 완전 차단됨
-    - 모든 채널이 동일값이므로 색상 정보 자체가 존재하지 않음
-    - 6-3 [문제 2]에서 분석한 hint RGB 색상 → 생성 이미지 전이 현상 해소
-
-  (2) 생성 이미지가 SD 1.5 사전학습의 색상 분포를 따르게 됨
-    - 금속 표면의 무채색 생성에 유리
-    - 소량 데이터(500개)에서도 안정적 결과 기대
-
-  (3) 기존 검증된 ControlNet 조건 형식(Canny/Depth)과 동일한 구조
-    - 3채널 동일값 그레이스케일 = Canny/Depth hint와 동일 패턴
-
-  (4) 향후 방안 전환 용이
-    - 개별 채널 생성 메서드가 그대로 보존되어 있으므로
-      데이터 1000개 이상 확보 시 방안 2(채널 강도 축소)로 전환 가능
-
-7-3. 미변경 사항
-
-  - generate_red_channel(): 변경 없음
-  - generate_green_channel(): 변경 없음
-  - generate_blue_channel(): 변경 없음
-  - save_hint_image(): 변경 없음 (RGB→BGR 변환은 그레이스케일에서도 무해)
-  - visualize_channels(): 변경 없음 (3채널이 동일값이므로 R/G/B 분리 시
-    각각 같은 그레이스케일 값을 해당 색상 채널로 표시)
-
-8. _edge_filter() 버그 수정: 전체 샘플 제외 문제
---------------------------------------------------------------------------------
-
-8-1. 문제 현상
-
-  prepare_controlnet_data.py 실행 시 모든 샘플이 edge filter에 의해 제외되어
-  hint 파일이 하나도 생성되지 않음.
-
-  로그 예시:
-    Edge filter excluded: ffbd081d5.jpg (Class 3)
-      - too close to left, right, top, bottom edge
-    (모든 샘플에서 동일 패턴 반복)
-
-8-2. 원인 분석
-
-  _edge_filter()는 roi_bbox와 defect_bbox 사이의 마진을 검사하여
-  결함이 ROI 경계 10% 이내에 있으면 해당 샘플을 제외하는 로직임.
-
-  그러나 실제 데이터에서 roi_bbox == defect_bbox (항상 동일):
-    - Severstal 이미지 크기: 1600x256
-    - ROI 최적화(optimize_roi_position)는 512x512 창을 배치하려 하나
-      이미지 높이(256) < ROI 크기(512)이므로 항상 실패
-    - 실패 시 fallback: roi_bbox = defect_bbox (roi_extraction.py line 137)
-    - 결과: roi_metadata.csv의 전체 16,011행에서 roi_bbox == defect_bbox
-
-  roi_bbox == defect_bbox이면:
-    def_x1 - roi_x1 = 0, roi_x2 - def_x2 = 0 (좌우 마진 모두 0)
-    def_y1 - roi_y1 = 0, roi_y2 - def_y2 = 0 (상하 마진 모두 0)
-    → 10% 마진(edge_margin=0.1) 조건을 항상 위반
-    → 모든 샘플이 "too close to left, right, top, bottom edge"로 제외
-
-8-3. 수정 내용
-
-  [변경 파일] src/preprocessing/controlnet_packager.py
-
-  _edge_filter() 메서드 수정 (line 44-119):
-    - roi_bbox == defect_bbox 동일성 검사 추가 (line 91-94)
-    - 동일한 경우 edge 검사를 건너뛰고 샘플을 유지
-    - 건너뛴 샘플 수를 별도 카운터(skipped_identical)로 추적
-    - 필터 결과 로그에 건너뛴 샘플 수 출력 (line 116-118)
-
-  변경 전:
-    모든 샘플에 대해 무조건 edge margin 검사 → 전량 제외
-
-  변경 후:
-    roi_bbox == defect_bbox인 샘플은 검사 건너뜀 → 정상 통과
-    roi_bbox != defect_bbox인 샘플만 edge margin 검사 적용
-
-8-4. 영향 범위
-
-  - 현재 Severstal 데이터셋에서는 roi_bbox == defect_bbox가 전체이므로
-    edge filter가 실질적으로 비활성화됨 (0개 제외)
-  - 향후 ROI 최적화가 정상 동작하는 이미지(512x512 이상)에서는
-    원래 의도대로 edge proximity 필터가 적용됨
-  - 기존 3-1에서 의도한 bb9bfedfd.jpg 같은 케이스는 현재 데이터에서
-    roi_bbox == defect_bbox이므로 edge filter 대상이 아님
-
-9. 변경 파일 목록 (최종)
---------------------------------------------------------------------------------
-
-  [수정]
-  - src/preprocessing/controlnet_packager.py
-    - _edge_filter() 메서드 신규 추가 (line 44-109) → 버그 수정 (line 44-119)
-    - package_dataset()에 _edge_filter() 호출 추가 (line 503-504)
-
-  - src/utils/dataset_validator.py
-    - check_distribution(): 이모지 → ASCII 마커 (line 67, 72, 77, 96)
-    - visualize_distributions(): 이모지 → ASCII 마커 (line 160-165)
-    - create_visual_inspection_report(): 이모지 → ASCII 마커 (line 331)
-    - generate_full_report(): 이모지 → ASCII 마커 (line 398, 402)
-
-  - scripts/prepare_controlnet_data.py
-    - 콘솔 출력 이모지 → ASCII 마커 (line 136, 144, 177)
-
-  - src/preprocessing/hint_generator.py
-    - 모듈 docstring 업데이트 (line 1-15)
-    - generate_hint_image(): RGB → 그레이스케일 가중 합산 변환 (line 216-261)
-
-  [신규]
-  - docs/20260219.docs (본 문서)
+  (a) 즉시 적용 가능한 수정 (추론 파이프라인)
+
+    [방안 A1] 생성 후 grayscale 후처리
+      - 생성 이미지를 즉시 grayscale 변환 후 3채널 복제
+      - test_controlnet.py의 generate_single() 출력에 적용:
+        image = output.images[0].convert("L").convert("RGB")
+      - 장점: 즉시 적용 가능, 코드 수정 1줄
+      - 단점: 모델이 올바르게 학습된 것은 아님, grayscale 범위가 제한될 수 있음
+
+    [방안 A2] controlnet_conditioning_scale=0.7로 재테스트
+      - test_controlnet.py와 run_validation_phases.py의 기본값을 0.7로 변경
+      - SD의 자연 이미지 생성 능력이 보존되어 neon 패턴 감소 기대
+      - v3 학습 시 권장된 값이나 실제 테스트에 미적용됨
+
+  (b) 재학습 시 적용 (근본 해결)
+
+    [방안 B1] Target 이미지 grayscale 강제 변환
+      - train_controlnet.py의 데이터 로딩에서 target을 grayscale로 변환:
+        gray = image.convert("L")
+        image = Image.merge("RGB", [gray, gray, gray])
+      - VAE latent space에서 3채널이 동일값을 갖게 하여 채널 분기 방지
+      - 학습 시 모델이 "동일 채널 출력"을 명시적으로 학습
+
+    [방안 B2] Grayscale 일관성 loss 추가
+      - 기존 MSE loss에 channel-consistency loss를 추가:
+        L_total = L_mse + lambda * L_gray
+        L_gray = MSE(pred[:,0] - pred[:,1]) + MSE(pred[:,1] - pred[:,2])
+      - lambda = 0.1~0.5 범위에서 실험 필요
+      - 3채널 출력이 동일하도록 명시적 제약
+
+    [방안 B3] 학습 하이퍼파라미터 개선
+      - LR 스케줄러: cosine 실제 적용 (config vs 코드 불일치 해소)
+      - controlnet_conditioning_scale=0.7 학습 시 적용
+      - SNR gamma=5.0 적용 (timestep별 loss 가중)
+      - epoch 수 300+ 증가 또는 early_stopping_patience=20 설정
+      - 데이터 augmentation: horizontal flip, brightness/contrast jitter
+
+  (c) 우선순위 권장
+
+    1순위: B1 (target grayscale 강제) + A2 (cond_scale=0.7 테스트)
+    2순위: B3 (하이퍼파라미터 개선) - cosine 스케줄러 실적용
+    3순위: A1 (grayscale 후처리) - 임시 해결책으로 병행
+    4순위: B2 (gray consistency loss) - 추가 실험 필요
+
+10-9. 분석 요약
+
+  grayscale hint 변환(section 7)은 hint의 RGB 색상이 생성 이미지에 직접
+  전이되는 "color-shortcut learning"은 차단하였으나, SD 1.5 모델 자체의
+  3채널 독립 생성 특성으로 인해 RGB 컬러 출력 문제가 지속됨.
+
+  핵심 원인은 3가지:
+  (1) SD 1.5 VAE의 3채널 독립 디코딩 (hint 변환으로 해결 불가)
+  (2) 학습 부족/비수렴 (1,200 step, constant_with_warmup)
+  (3) 추론 시 conditioning_scale=1.0 사용 (v3 권장 0.7 미적용)
+
+  다음 단계로 target grayscale 강제 변환(B1)과 conditioning_scale=0.7
+  재테스트(A2)를 우선 적용하고, 학습 하이퍼파라미터를 개선(B3)하여
+  v4 학습을 준비하는 것을 권장함.
+

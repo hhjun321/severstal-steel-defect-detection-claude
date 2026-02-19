@@ -201,9 +201,16 @@ def generate_single(
     pipeline, hint_image, prompt, negative_prompt,
     num_inference_steps, guidance_scale, seed, device,
     num_images=1,
-    controlnet_conditioning_scale=1.0,
+    controlnet_conditioning_scale=0.7,
+    grayscale_postprocess=True,
 ):
-    """단일 hint 이미지로부터 결함 이미지를 생성합니다."""
+    """단일 hint 이미지로부터 결함 이미지를 생성합니다.
+
+    Args:
+        grayscale_postprocess: True이면 생성 이미지를 grayscale 변환 후
+            RGB 3채널로 복제합니다. SD 1.5 VAE의 3채널 독립 디코딩으로 인한
+            RGB 컬러 아티팩트를 제거합니다.
+    """
     generator = torch.Generator(device=device).manual_seed(seed)
 
     # hint 이미지가 PIL Image인지 확인
@@ -225,7 +232,15 @@ def generate_single(
                 generator=gen,
             )
 
-        results.append(output.images[0])
+        image = output.images[0]
+
+        # Grayscale 후처리: RGB 컬러 아티팩트 제거
+        # SD 1.5 VAE가 3채널을 독립적으로 디코딩하여 발생하는
+        # 비현실적 RGB 색상을 grayscale 변환으로 제거합니다.
+        if grayscale_postprocess:
+            image = image.convert("L").convert("RGB")
+
+        results.append(image)
 
     return results
 
@@ -375,6 +390,7 @@ def generate_from_jsonl(pipeline, args, device):
             device=device,
             num_images=args.num_images_per_sample,
             controlnet_conditioning_scale=args.controlnet_conditioning_scale,
+            grayscale_postprocess=args.grayscale_postprocess,
         )
 
         # 결과 저장
@@ -454,6 +470,7 @@ def generate_single_image(pipeline, args, device):
         device=device,
         num_images=args.num_images_per_sample,
         controlnet_conditioning_scale=args.controlnet_conditioning_scale,
+        grayscale_postprocess=args.grayscale_postprocess,
     )
 
     # 저장
@@ -519,13 +536,24 @@ def parse_args():
     parser.add_argument("--num_inference_steps", type=int, default=30)
     parser.add_argument("--guidance_scale", type=float, default=7.5)
     parser.add_argument(
-        "--controlnet_conditioning_scale", type=float, default=1.0,
+        "--controlnet_conditioning_scale", type=float, default=0.7,
         help="ControlNet conditioning scale (0.0~1.0). "
              "낮을수록 SD의 자연 이미지 생성 능력이 보존됩니다. "
-             "v3 권장: 0.7",
+             "v3부터 기본값 0.7 적용 (v2의 1.0에서 neon/rainbow 패턴 발생).",
     )
     parser.add_argument("--num_images_per_sample", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--grayscale_postprocess", action="store_true", default=True,
+        help="생성 이미지를 grayscale 변환 후 RGB 복제. "
+             "SD 1.5 VAE의 3채널 독립 디코딩으로 인한 RGB 컬러 아티팩트를 제거합니다. "
+             "기본 활성화.",
+    )
+    parser.add_argument(
+        "--no_grayscale_postprocess", dest="grayscale_postprocess",
+        action="store_false",
+        help="Grayscale 후처리를 비활성화합니다.",
+    )
 
     # Output
     parser.add_argument(
