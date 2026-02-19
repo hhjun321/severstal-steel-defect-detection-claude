@@ -1,14 +1,17 @@
 """
-Multi-Channel Hint Image Generation Module
+Grayscale Hint Image Generation Module
 
-This module creates 3-channel hint images for ControlNet conditioning.
-According to PROJECT(prepare_control).md:
+This module creates 3-channel grayscale hint images for ControlNet conditioning.
 
-Red Channel: Precise defect mask reflecting 4 indicators (Linearity, Solidity, etc.)
-Green Channel: Background structure lines (edge information from Stripe patterns)
-Blue Channel: Background fine texture or noise density
+Internally, three feature channels are computed:
+  Red Channel: Precise defect mask reflecting 4 indicators (Linearity, Solidity, etc.)
+  Green Channel: Background structure lines (edge information from Stripe patterns)
+  Blue Channel: Background fine texture or noise density
 
-This multi-channel approach is more effective than simple binary masks.
+These are then combined into a single grayscale value via weighted summation
+(R*0.5 + G*0.3 + B*0.2) and replicated across all 3 channels. This eliminates
+RGB color signals that cause ControlNet color-shortcut learning, where hint
+colors bleed into the generated images (see docs/20260219.docs section 6-4).
 """
 import numpy as np
 import cv2
@@ -218,6 +221,15 @@ class HintImageGenerator:
         """
         Generate complete 3-channel hint image for ControlNet.
         
+        The hint is converted to grayscale (identical values across all 3 channels)
+        via weighted summation of R/G/B channels. This prevents ControlNet from
+        learning color shortcuts where RGB hint colors bleed into generated images.
+        
+        Grayscale weights:
+            R (defect mask):        0.5 (most important for defect localization)
+            G (background structure): 0.3
+            B (texture density):     0.2
+        
         Args:
             roi_image: Original ROI image (H, W, 3)
             roi_mask: Binary defect mask (H, W)
@@ -226,15 +238,25 @@ class HintImageGenerator:
             stability_score: Background stability score
             
         Returns:
-            3-channel hint image (H, W, 3) with RGB channels
+            3-channel grayscale hint image (H, W, 3) — all channels hold
+            the same weighted-sum value
         """
         # Generate each channel
         red = self.generate_red_channel(roi_mask, defect_metrics)
         green = self.generate_green_channel(roi_image, background_type, stability_score)
         blue = self.generate_blue_channel(roi_image, background_type)
         
-        # Stack into 3-channel image
-        hint_image = np.stack([red, green, blue], axis=2)
+        # Weighted grayscale conversion to eliminate RGB color signals.
+        # This prevents ControlNet color-shortcut learning where hint RGB
+        # colors directly transfer to the generated image.
+        w_r, w_g, w_b = 0.5, 0.3, 0.2
+        gray = (w_r * red.astype(np.float32)
+                + w_g * green.astype(np.float32)
+                + w_b * blue.astype(np.float32))
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+        
+        # Replicate the single grayscale channel across all 3 channels
+        hint_image = np.stack([gray, gray, gray], axis=2)
         
         return hint_image
     

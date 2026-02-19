@@ -1,0 +1,418 @@
+20260219 작업 일지 - prepare_controlnet_data.py 실행 에러 수정
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+prepare_controlnet_data.py 실행 시 발생한 3건의 에러/경고를 분석하고 수정한다.
+
+  에러 목록:
+  (1) bb9bfedfd.jpg (Class 4): Defect too close to left edge, Defect too close to right edge
+  (2) dataset_validator.py:181: UserWarning: Glyph 65039 (VARIATION SELECTOR-16)
+      missing from font(s) DejaVu Sans Mono
+  (3) dataset_validator.py:350: UserWarning: Glyph 10060 (CROSS MARK)
+      missing from font(s) DejaVu Sans
+
+2. 원인 분석
+--------------------------------------------------------------------------------
+
+2-1. Edge Defect 경고 (bb9bfedfd.jpg)
+
+  발생 위치: src/utils/dataset_validator.py (visual_check_sample 메서드, line 261-266)
+
+  원인:
+  - DatasetValidator.visual_check_sample()은 결함(defect bbox)이 ROI 경계로부터
+    10% 마진 이내에 위치하면 경고를 출력함
+  - bb9bfedfd.jpg의 Class 4 결함은 ROI 폭 전체에 가깝게 분포하여
+    좌측/우측 경계 모두 10% 마진을 위반
+  - 이 경고는 DatasetValidator에서 출력만 하고, 실제 패키징 시점에서는
+    해당 샘플을 제외하지 않았음 (기존 로직의 맹점)
+
+  판단:
+  - ROI 경계에 결함이 밀착된 샘플은 hint 이미지에서 결함 영역이 잘리거나
+    배경 컨텍스트가 부족하여 ControlNet 학습 품질을 저하시킴
+  - 패키징 시점에서 자동 제외하는 것이 적절함
+
+2-2. Glyph 65039 (VARIATION SELECTOR-16) 경고
+
+  발생 위치: src/utils/dataset_validator.py line 181 (visualize_distributions)
+
+  원인:
+  - check_distribution()에서 생성한 경고 문자열에 이모지 "⚠️" 사용
+  - "⚠️"는 U+26A0 (WARNING SIGN) + U+FE0F (VARIATION SELECTOR-16) 조합
+  - 이 경고 문자열이 matplotlib plot text (line 177, fontfamily='monospace')에
+    렌더링될 때 DejaVu Sans Mono 폰트에 U+FE0F 글리프가 없어 경고 발생
+  - 영향받는 위치: line 67, 72, 77, 96의 warnings.append() 문자열
+    → line 172에서 plot에 렌더링
+
+2-3. Glyph 10060 (CROSS MARK) 경고
+
+  발생 위치: src/utils/dataset_validator.py line 350 (create_visual_inspection_report)
+
+  원인:
+  - line 331에서 검사 결과 상태 표시에 이모지 "❌" (U+274C, CROSS MARK) 사용
+  - matplotlib의 기본 폰트 DejaVu Sans에 해당 글리프가 없어 경고 발생
+  - 동일 코드에서 "✅" (U+2705, WHITE HEAVY CHECK MARK)도 사용 중
+
+3. 수정 내용
+--------------------------------------------------------------------------------
+
+3-1. Edge Defect 샘플 자동 제외
+
+  [변경 파일] src/preprocessing/controlnet_packager.py
+
+  (a) _edge_filter() 메서드 신규 추가 (line 44-109)
+    - DatasetValidator.visual_check_sample()과 동일한 edge proximity 검사 로직
+    - roi_bbox, defect_bbox를 비교하여 10% 마진 이내 결함 감지
+    - 좌/우/상/하 어느 방향이든 마진 위반 시 해당 샘플을 제외
+    - 제외된 샘플의 image_id, class_id, 위반 방향을 로그 출력
+    - edge_margin 파라미터로 마진 비율 조정 가능 (기본값 0.1 = 10%)
+    - roi_bbox/defect_bbox 컬럼이 없으면 필터를 건너뜀 (하위 호환)
+
+  (b) package_dataset()에 _edge_filter() 호출 추가 (line 493-494)
+    - 품질 필터(_quality_filter) 적용 이전에 edge 필터를 먼저 적용
+    - 실행 순서: 원본 ROI → edge 필터 → 품질 필터 → stratified sampling
+    - bb9bfedfd.jpg와 같은 edge 밀착 샘플이 자동으로 제외됨
+
+3-2. matplotlib 이모지 경고 수정
+
+  [변경 파일] src/utils/dataset_validator.py
+
+  matplotlib plot에 렌더링되는 모든 이모지 문자를 ASCII 텍스트 마커로 교체:
+
+  (a) check_distribution() 경고 문자열 (line 67, 72, 77, 96)
+    - "⚠️  Class imbalance..."  → "[WARN] Class imbalance..."
+    - "⚠️  Subtype imbalance..."  → "[WARN] Subtype imbalance..."
+    - "⚠️  Background imbalance..." → "[WARN] Background imbalance..."
+    - "⚠️  Missing ideal..."  → "[WARN] Missing ideal..."
+
+  (b) visualize_distributions() 상태 텍스트 (line 160-165)
+    - "✅ Dataset is well-balanced" → "[PASS] Dataset is well-balanced"
+    - "⚠️  Imbalance detected"   → "[WARN] Imbalance detected"
+
+  (c) create_visual_inspection_report() 타이틀 (line 331)
+    - "❌" → "[X]"
+    - "✅" → "[OK]"
+
+  (d) generate_full_report() 콘솔 출력 (line 398, 402)
+    - "⚠️  Warnings:"        → "[WARN] Warnings:"
+    - "✅ Distribution looks..." → "[PASS] Distribution looks..."
+
+  [변경 파일] scripts/prepare_controlnet_data.py
+
+  콘솔 출력의 이모지도 일관성을 위해 교체 (line 136, 144, 177):
+    - "⚠️  Validation warnings..." → "[WARN] Validation warnings..."
+    - "✅ Dataset validation..."  → "[PASS] Dataset validation..."
+    - "✅ ControlNet Training..."  → "[DONE] ControlNet Training..."
+
+4. 수정 효과
+--------------------------------------------------------------------------------
+
+  (1) Edge defect 샘플 자동 제외
+    - bb9bfedfd.jpg 등 경계 밀착 결함 샘플이 패키징에서 자동 제외됨
+    - 제외된 샘플 수와 상세 정보가 로그에 출력되어 추적 가능
+    - v3 데이터셋(500개 목표)에서 학습 품질 저하 요인이 사전 차단됨
+
+  (2) matplotlib Glyph 경고 해소
+    - Glyph 65039 (VARIATION SELECTOR-16) 경고 해소
+    - Glyph 10060 (CROSS MARK) 경고 해소
+    - Colab 환경의 DejaVu Sans/DejaVu Sans Mono 폰트와 호환됨
+    - 시각적 구분이 필요한 곳은 [PASS], [WARN], [X], [OK] 마커로 대체
+
+5. 변경 파일 목록
+--------------------------------------------------------------------------------
+
+  [수정]
+  - src/preprocessing/controlnet_packager.py
+    - _edge_filter() 메서드 신규 추가 (line 44-109)
+    - package_dataset()에 _edge_filter() 호출 추가 (line 493-494)
+
+  - src/utils/dataset_validator.py
+    - check_distribution(): 이모지 → ASCII 마커 (line 67, 72, 77, 96)
+    - visualize_distributions(): 이모지 → ASCII 마커 (line 160-165)
+    - create_visual_inspection_report(): 이모지 → ASCII 마커 (line 331)
+    - generate_full_report(): 이모지 → ASCII 마커 (line 398, 402)
+
+  - scripts/prepare_controlnet_data.py
+    - 콘솔 출력 이모지 → ASCII 마커 (line 136, 144, 177)
+
+  [신규]
+  - docs/20260219.docs (본 문서)
+
+6. hint 이미지 RGB 색상 전이 문제 분석
+--------------------------------------------------------------------------------
+
+6-1. 문제 현상
+
+  ControlNet 학습 후 validation 시 생성 이미지가 그레이스케일 금속 표면이 아닌
+  RGB 컬러로 출력됨. 20260218.docs의 v2 네온/무지개 패턴과는 별도의 새로운 문제.
+
+6-2. 전체 파이프라인 점검
+
+  hint 생성부터 학습, 추론, 검증까지 전 과정을 점검하였음.
+
+  (1) hint 생성 (src/preprocessing/hint_generator.py)
+
+    generate_hint_image() (line 213-239):
+      - np.stack([red, green, blue], axis=2)로 3채널 RGB 이미지 생성
+      - 각 채널은 uint8 [0-255] 범위
+
+    Red 채널 - 결함 마스크 (line 36-97):
+      - linearity > 0.7: skeleton 추출 → dilate → 255
+      - solidity > 0.8: 마스크 영역 fill → 200
+      - 일반: 마스크 내부 100 + Canny edge 255
+      - 배경: 0
+
+    Green 채널 - 배경 구조선 (line 99-159):
+      - vertical_stripe: abs(sobel_x)
+      - horizontal_stripe: abs(sobel_y)
+      - complex_pattern: sqrt(sobel_x^2 + sobel_y^2)
+      - smooth/textured: full gradient * 0.3
+      - cv2.normalize(0-255) 후 stability_score로 스케일링
+
+    Blue 채널 - 배경 텍스처 (line 161-211):
+      - smooth: 상수 20
+      - 기타: 7x7 윈도우 local variance → normalize(0-255)
+      - textured/complex_pattern: 1.2x 부스트
+
+    저장: RGB → BGR 변환 후 cv2.imwrite(.png) (line 250-251)
+
+  (2) 학습 로딩 (scripts/train_controlnet.py)
+
+    SteelDefectControlNetDataset (line 75):
+      - hint 로딩: Image.open().convert("RGB") (line 212)
+      - hint 전처리 (line 122-126):
+          Resize(512) → CenterCrop(512) → ToTensor()
+          → float32 [0, 1] 범위, Normalize 없음
+      - target 전처리 (line 115-120):
+          Resize(512) → CenterCrop(512) → ToTensor() → Normalize([0.5],[0.5])
+          → float32 [-1, 1] 범위
+      - 채널 검증: assert shape[0] == 3 (line 280)
+
+    학습 루프:
+      - ControlNet forward: hint [0,1] → ControlNet → residual 생성 (line 799-807)
+      - conditioning_scale 적용: residual * scale (line 818-835)
+      - UNet forward: noisy_latents + scaled residual → noise prediction (line 829-835)
+
+  (3) 추론 (scripts/test_controlnet.py)
+
+    hint 로딩: Image.open().convert("RGB") (line 353, 434)
+    hint 전처리: 없음 - PIL Image를 pipeline에 직접 전달 (line 221)
+    pipeline 내부에서 resize 및 [0,1] 변환 수행
+
+    출력: pipeline → PIL RGB Image → .save(.png)
+
+  (4) 검증 (scripts/run_validation_phases.py)
+
+    test_controlnet.py를 subprocess.run()으로 호출 (line 318)
+    품질 평가: color_consistency(0.4) + artifact(0.3) + sharpness(0.3) (line 141-145)
+
+6-3. 발견된 문제점
+
+  [문제 1] SD 1.5 base model의 RGB 컬러 생성 (핵심 원인)
+
+    SD 1.5는 RGB 컬러 모델이며, 학습 target이 그레이스케일 금속 표면이어도
+    Image.open().convert("RGB")로 3채널 RGB로 변환하여 학습함.
+    소량 샘플(50~500개)로는 "금속 표면 = 무채색"이라는 색상 분포를
+    충분히 학습하지 못하며, SD 1.5 사전학습 가중치의 컬러 편향이 잔존함.
+
+  [문제 2] hint 이미지의 강한 RGB 색상 신호 (핵심 원인)
+
+    hint 이미지의 채널별 색상이 시각적으로 뚜렷한 RGB 색상을 형성:
+      - Red 채널(결함 마스크): 밝은 빨간색
+      - Green 채널(배경 에지): 녹색 계열
+      - Blue 채널(텍스처 분산): 파란색 계열
+
+    ControlNet은 이 3채널을 조건 입력으로 받으나, 소량 학습에서는
+    채널별 의미론적 분리(마스크/에지/텍스처)를 학습하지 못하고
+    hint의 RGB 색상 자체를 생성 이미지에 복사하는 shortcut 학습 발생.
+
+  [문제 3] 학습-추론 전처리 불일치 (부차적)
+
+    | 단계 | 전처리                                               |
+    |------|------------------------------------------------------|
+    | 학습 | Resize(512) → CenterCrop(512) → ToTensor [0,1]      |
+    | 추론 | PIL Image 직접 전달 (pipeline 내부 resize, crop 없음) |
+
+    비정방형 hint에서 학습은 center crop, 추론은 stretch → 공간 정보 왜곡 가능.
+
+6-4. hint 형식 변경 방안 검토
+
+  [방안 1] 그레이스케일 hint (3ch 동일값)
+
+    개념:
+      R/G/B 3채널 정보를 가중 합산하여 단일 그레이스케일 값을 생성한 뒤,
+      3채널 모두에 동일 값을 복제하여 무채색 hint 이미지를 구성.
+
+    변환:
+      gray = w_r * R + w_g * G + w_b * B
+      hint_new = [gray, gray, gray]
+
+    예시 가중치:
+      w_r = 0.5 (결함 마스크 - 가장 중요)
+      w_g = 0.3 (배경 구조)
+      w_b = 0.2 (텍스처)
+
+    장점:
+      - ControlNet의 색상 shortcut 학습이 원천 차단됨
+        (모든 채널이 동일값이므로 색상 정보 자체가 존재하지 않음)
+      - 생성 이미지가 SD 1.5 사전학습의 색상 분포를 따르게 되어
+        금속 표면의 무채색 생성에 유리
+      - Canny/Depth 등 검증된 ControlNet 조건 형식과 동일한 구조
+      - 구현이 간단 (np.stack 후 가중 합산 추가)
+
+    단점:
+      - R/G/B 채널의 의미론적 정보(마스크/에지/텍스처)가 혼합되어 구분 불가
+      - 결함 마스크(R)와 배경 에지(G) 겹침 영역에서 정보 상쇄 가능
+      - 가중치 선택에 따라 특정 정보가 묻힐 수 있음
+
+    적합 상황: 소량 데이터(50~500개) 학습에서 안정적 결과를 우선시할 때
+
+  [방안 2] 채널 강도 축소 (멀티채널 유지)
+
+    개념:
+      기존 3채널 구조를 유지하되, 각 채널의 값 범위를 축소하여
+      전체적으로 색상 신호를 약화.
+
+    변환:
+      R_new = R * scale_r  (예: 0.3)
+      G_new = G * scale_g  (예: 0.3)
+      B_new = B * scale_b  (예: 0.3)
+
+    또는 중앙값 오프셋 방식:
+      base = 128
+      R_new = base + (R - 128) * 0.2
+      G_new = base + (G - 128) * 0.2
+      B_new = base + (B - 128) * 0.2
+
+    장점:
+      - 3채널의 의미론적 분리(마스크/에지/텍스처)가 유지됨
+      - 충분한 학습 시 채널별 정보를 구분하여 활용 가능
+      - 색상 신호 약화로 직접적인 색상 전이 감소
+
+    단점:
+      - 색상 정보가 완전히 제거되지 않음 → 소량 학습에서 shortcut 학습 잔존 가능
+      - 적정 scale 값을 찾기 위한 실험 필요
+      - 약한 신호에서 ControlNet input conv의 패턴 추출 어려움 (SNR 저하)
+      - 문제를 "완화"하지만 "해결"하지는 못할 가능성
+
+    적합 상황: 대량 데이터(1000개+)로 채널별 의미 분리를 기대할 수 있을 때
+
+  [방안 3] 단일채널 (결함 마스크만)
+
+    개념:
+      Red 채널(결함 마스크)만 사용하고 Green/Blue는 제거.
+      마스크를 3채널 모두에 복제하여 Canny/Segmentation ControlNet과 동일 구조.
+
+    변환:
+      hint_new = [R, R, R]  (마스크를 3ch로 복제)
+      또는
+      hint_new = [R, 0, 0]  (R만 사용, G/B 제거)
+
+    장점:
+      - 가장 단순하고 예측 가능한 구조
+      - 결함 위치/형태라는 핵심 정보에 집중
+      - Canny/Segmentation ControlNet 등 검증된 패턴과 동일
+      - 배경 정보(G/B)로 인한 노이즈 완전 제거
+
+    단점:
+      - 배경 구조(G)와 텍스처(B) 정보를 완전히 버림
+      - "어떤 배경 위에 어떤 결함을 생성할지"에 대한 컨텍스트 감소
+      - 생성 이미지의 배경 다양성이 줄어들 수 있음
+      - 프롬프트에 배경 정보가 포함되어 있으므로 텍스트 보완 필요
+
+    적합 상황: 결함 위치/형태의 정확한 제어가 최우선이고,
+              배경은 프롬프트로 충분히 제어 가능할 때
+
+  [방안 비교 요약]
+
+    | 항목             | 방안1: 그레이스케일 | 방안2: 강도 축소 | 방안3: 마스크만 |
+    |------------------|---------------------|------------------|-----------------|
+    | 색상 전이 차단   | 완전 차단           | 부분 차단        | 완전 차단       |
+    | 정보 보존        | R+G+B 혼합 보존     | R/G/B 분리 보존  | R만 보존        |
+    | 소량 학습 안정성 | 높음                | 중간             | 높음            |
+    | 구현 복잡도      | 낮음                | 중간             | 매우 낮음       |
+    | 배경 제어력      | 중간 (혼합됨)       | 높음 (분리됨)    | 낮음 (프롬프트) |
+    | 검증된 패턴      | Canny/Depth 유사    | 독자적 구조      | Seg/Canny 동일  |
+    | 재학습 필요      | 예                  | 예               | 예              |
+
+    권장: v3 학습(500개 규모) 기준으로 방안 1(그레이스케일)이 가장 적합.
+    색상 전이를 완전히 차단하면서 3채널 정보를 가중 합산으로 보존.
+    향후 데이터 1000개 이상 확보 시 방안 2로 전환 검토 가능.
+
+7. 6-4 방안 1 수행: 그레이스케일 hint 변환
+--------------------------------------------------------------------------------
+
+7-1. 수행 내용
+
+  [변경 파일] src/preprocessing/hint_generator.py
+
+  (a) 모듈 docstring 업데이트 (line 1-15)
+    - "Multi-Channel Hint Image Generation Module"
+      → "Grayscale Hint Image Generation Module"
+    - 가중 합산 방식(R*0.5 + G*0.3 + B*0.2)과 색상 shortcut 방지 목적을 명시
+    - docs/20260219.docs section 6-4 참조 기록 추가
+
+  (b) generate_hint_image() 메서드 수정 (line 216-261)
+    - 기존: np.stack([red, green, blue], axis=2) → 3채널 RGB hint
+    - 변경: R/G/B 채널을 가중 합산 후 3채널 모두에 동일 값 복제
+
+      gray = w_r * R + w_g * G + w_b * B
+      hint_new = [gray, gray, gray]
+
+      가중치:
+        w_r = 0.5 (결함 마스크 - 가장 중요)
+        w_g = 0.3 (배경 구조)
+        w_b = 0.2 (텍스처)
+
+    - float32로 연산 후 np.clip(0, 255) → uint8 변환
+    - 개별 채널 생성 로직(generate_red/green/blue_channel)은 변경 없이 유지
+
+7-2. 기대 효과
+
+  (1) ControlNet의 RGB 색상 shortcut 학습이 완전 차단됨
+    - 모든 채널이 동일값이므로 색상 정보 자체가 존재하지 않음
+    - 6-3 [문제 2]에서 분석한 hint RGB 색상 → 생성 이미지 전이 현상 해소
+
+  (2) 생성 이미지가 SD 1.5 사전학습의 색상 분포를 따르게 됨
+    - 금속 표면의 무채색 생성에 유리
+    - 소량 데이터(500개)에서도 안정적 결과 기대
+
+  (3) 기존 검증된 ControlNet 조건 형식(Canny/Depth)과 동일한 구조
+    - 3채널 동일값 그레이스케일 = Canny/Depth hint와 동일 패턴
+
+  (4) 향후 방안 전환 용이
+    - 개별 채널 생성 메서드가 그대로 보존되어 있으므로
+      데이터 1000개 이상 확보 시 방안 2(채널 강도 축소)로 전환 가능
+
+7-3. 미변경 사항
+
+  - generate_red_channel(): 변경 없음
+  - generate_green_channel(): 변경 없음
+  - generate_blue_channel(): 변경 없음
+  - save_hint_image(): 변경 없음 (RGB→BGR 변환은 그레이스케일에서도 무해)
+  - visualize_channels(): 변경 없음 (3채널이 동일값이므로 R/G/B 분리 시
+    각각 같은 그레이스케일 값을 해당 색상 채널로 표시)
+
+8. 변경 파일 목록 (최종)
+--------------------------------------------------------------------------------
+
+  [수정]
+  - src/preprocessing/controlnet_packager.py
+    - _edge_filter() 메서드 신규 추가 (line 44-109)
+    - package_dataset()에 _edge_filter() 호출 추가 (line 493-494)
+
+  - src/utils/dataset_validator.py
+    - check_distribution(): 이모지 → ASCII 마커 (line 67, 72, 77, 96)
+    - visualize_distributions(): 이모지 → ASCII 마커 (line 160-165)
+    - create_visual_inspection_report(): 이모지 → ASCII 마커 (line 331)
+    - generate_full_report(): 이모지 → ASCII 마커 (line 398, 402)
+
+  - scripts/prepare_controlnet_data.py
+    - 콘솔 출력 이모지 → ASCII 마커 (line 136, 144, 177)
+
+  - src/preprocessing/hint_generator.py
+    - 모듈 docstring 업데이트 (line 1-15)
+    - generate_hint_image(): RGB → 그레이스케일 가중 합산 변환 (line 216-261)
+
+  [신규]
+  - docs/20260219.docs (본 문서)
