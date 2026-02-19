@@ -49,6 +49,11 @@ class ControlNetDatasetPackager:
         DatasetValidator.visual_check_sample()에서 경고만 출력하던
         edge proximity 검사를 패키징 시점에 실제 제외 로직으로 적용합니다.
 
+        NOTE: roi_bbox == defect_bbox인 경우 (ROI 최적화가 실패하여
+        결함 bbox를 그대로 ROI로 사용하는 경우) edge margin이 항상 0이므로
+        해당 샘플은 검사를 건너뜁니다. 이 상황은 Severstal 이미지
+        (1600x256)에서 512x512 ROI 창이 맞지 않아 발생합니다.
+
         Args:
             df: ROI metadata DataFrame (roi_bbox, defect_bbox 컬럼 필요)
             edge_margin: ROI 크기 대비 최소 마진 비율 (기본 0.1 = 10%)
@@ -62,6 +67,7 @@ class ControlNetDatasetPackager:
 
         original_len = len(df)
         exclude_indices = []
+        skipped_identical = 0
 
         for idx, row in df.iterrows():
             roi_bbox = row['roi_bbox']
@@ -72,6 +78,13 @@ class ControlNetDatasetPackager:
                 roi_bbox = eval(roi_bbox)
             if isinstance(defect_bbox, str):
                 defect_bbox = eval(defect_bbox)
+
+            # roi_bbox == defect_bbox이면 ROI 최적화 실패로 결함 bbox를
+            # 그대로 사용한 것이므로 edge 검사가 무의미 (margin 항상 0).
+            # 이 경우 검사를 건너뛰고 샘플을 유지합니다.
+            if tuple(roi_bbox) == tuple(defect_bbox):
+                skipped_identical += 1
+                continue
 
             roi_x1, roi_y1, roi_x2, roi_y2 = roi_bbox
             def_x1, def_y1, def_x2, def_y2 = defect_bbox
@@ -105,6 +118,9 @@ class ControlNetDatasetPackager:
         removed = original_len - len(df)
         print(f"Edge filter: {original_len} -> {len(df)} "
               f"({removed} removed, {removed/max(original_len,1)*100:.1f}%)")
+        if skipped_identical > 0:
+            print(f"  ({skipped_identical} samples with roi_bbox==defect_bbox, "
+                  f"edge check skipped)")
 
         return df
 

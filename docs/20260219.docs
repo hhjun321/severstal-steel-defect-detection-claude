@@ -393,13 +393,70 @@ prepare_controlnet_data.py 실행 시 발생한 3건의 에러/경고를 분석�
   - visualize_channels(): 변경 없음 (3채널이 동일값이므로 R/G/B 분리 시
     각각 같은 그레이스케일 값을 해당 색상 채널로 표시)
 
-8. 변경 파일 목록 (최종)
+8. _edge_filter() 버그 수정: 전체 샘플 제외 문제
+--------------------------------------------------------------------------------
+
+8-1. 문제 현상
+
+  prepare_controlnet_data.py 실행 시 모든 샘플이 edge filter에 의해 제외되어
+  hint 파일이 하나도 생성되지 않음.
+
+  로그 예시:
+    Edge filter excluded: ffbd081d5.jpg (Class 3)
+      - too close to left, right, top, bottom edge
+    (모든 샘플에서 동일 패턴 반복)
+
+8-2. 원인 분석
+
+  _edge_filter()는 roi_bbox와 defect_bbox 사이의 마진을 검사하여
+  결함이 ROI 경계 10% 이내에 있으면 해당 샘플을 제외하는 로직임.
+
+  그러나 실제 데이터에서 roi_bbox == defect_bbox (항상 동일):
+    - Severstal 이미지 크기: 1600x256
+    - ROI 최적화(optimize_roi_position)는 512x512 창을 배치하려 하나
+      이미지 높이(256) < ROI 크기(512)이므로 항상 실패
+    - 실패 시 fallback: roi_bbox = defect_bbox (roi_extraction.py line 137)
+    - 결과: roi_metadata.csv의 전체 16,011행에서 roi_bbox == defect_bbox
+
+  roi_bbox == defect_bbox이면:
+    def_x1 - roi_x1 = 0, roi_x2 - def_x2 = 0 (좌우 마진 모두 0)
+    def_y1 - roi_y1 = 0, roi_y2 - def_y2 = 0 (상하 마진 모두 0)
+    → 10% 마진(edge_margin=0.1) 조건을 항상 위반
+    → 모든 샘플이 "too close to left, right, top, bottom edge"로 제외
+
+8-3. 수정 내용
+
+  [변경 파일] src/preprocessing/controlnet_packager.py
+
+  _edge_filter() 메서드 수정 (line 44-119):
+    - roi_bbox == defect_bbox 동일성 검사 추가 (line 91-94)
+    - 동일한 경우 edge 검사를 건너뛰고 샘플을 유지
+    - 건너뛴 샘플 수를 별도 카운터(skipped_identical)로 추적
+    - 필터 결과 로그에 건너뛴 샘플 수 출력 (line 116-118)
+
+  변경 전:
+    모든 샘플에 대해 무조건 edge margin 검사 → 전량 제외
+
+  변경 후:
+    roi_bbox == defect_bbox인 샘플은 검사 건너뜀 → 정상 통과
+    roi_bbox != defect_bbox인 샘플만 edge margin 검사 적용
+
+8-4. 영향 범위
+
+  - 현재 Severstal 데이터셋에서는 roi_bbox == defect_bbox가 전체이므로
+    edge filter가 실질적으로 비활성화됨 (0개 제외)
+  - 향후 ROI 최적화가 정상 동작하는 이미지(512x512 이상)에서는
+    원래 의도대로 edge proximity 필터가 적용됨
+  - 기존 3-1에서 의도한 bb9bfedfd.jpg 같은 케이스는 현재 데이터에서
+    roi_bbox == defect_bbox이므로 edge filter 대상이 아님
+
+9. 변경 파일 목록 (최종)
 --------------------------------------------------------------------------------
 
   [수정]
   - src/preprocessing/controlnet_packager.py
-    - _edge_filter() 메서드 신규 추가 (line 44-109)
-    - package_dataset()에 _edge_filter() 호출 추가 (line 493-494)
+    - _edge_filter() 메서드 신규 추가 (line 44-109) → 버그 수정 (line 44-119)
+    - package_dataset()에 _edge_filter() 호출 추가 (line 503-504)
 
   - src/utils/dataset_validator.py
     - check_distribution(): 이모지 → ASCII 마커 (line 67, 72, 77, 96)
