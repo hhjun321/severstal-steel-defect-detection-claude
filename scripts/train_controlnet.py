@@ -178,19 +178,24 @@ class SteelDefectControlNetDataset(Dataset):
     def _resolve_hint_path(self, path_str: str) -> Path:
         """hint 이미지 경로를 해석합니다."""
         path = Path(path_str)
+        tried = []
 
         if path.is_absolute() and path.exists():
             return path
+        if path.is_absolute():
+            tried.append(f"absolute: {path}")
 
         # 프로젝트 루트 기준
         project_root = Path(__file__).parent.parent
         candidate = project_root / path_str
+        tried.append(f"project_root: {candidate}")
         if candidate.exists():
             return candidate
 
         # data_dir 및 data_dir.parent 기준 전체 상대 경로
         for base in [self.data_dir, self.data_dir.parent]:
             candidate = base / path_str
+            tried.append(f"base({base}): {candidate}")
             if candidate.exists():
                 return candidate
 
@@ -199,13 +204,20 @@ class SteelDefectControlNetDataset(Dataset):
             self.data_dir / Path(path_str).name,
             self.data_dir / "hints" / Path(path_str).name,
         ]:
+            tried.append(f"filename_fallback: {candidate}")
             if candidate.exists():
                 return candidate
 
         if path.exists():
             return path
+        tried.append(f"cwd_relative: {Path.cwd() / path}")
 
-        raise FileNotFoundError(f"Cannot resolve hint path: '{path_str}'")
+        raise FileNotFoundError(
+            f"Cannot resolve hint path: '{path_str}'\n"
+            f"  data_dir='{self.data_dir}'\n"
+            f"  Tried paths:\n" +
+            "\n".join(f"    - {t}" for t in tried)
+        )
 
     def _apply_augmentation(self, target_image, conditioning_image):
         """[B3] Target과 conditioning 이미지에 동일한 augmentation을 적용합니다.
