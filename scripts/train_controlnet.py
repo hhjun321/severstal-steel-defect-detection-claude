@@ -188,7 +188,13 @@ class SteelDefectControlNetDataset(Dataset):
         if candidate.exists():
             return candidate
 
-        # data_dir 기준
+        # data_dir 및 data_dir.parent 기준 전체 상대 경로
+        for base in [self.data_dir, self.data_dir.parent]:
+            candidate = base / path_str
+            if candidate.exists():
+                return candidate
+
+        # data_dir 기준 filename만으로 재시도
         for candidate in [
             self.data_dir / Path(path_str).name,
             self.data_dir / "hints" / Path(path_str).name,
