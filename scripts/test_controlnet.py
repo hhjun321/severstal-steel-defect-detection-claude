@@ -203,6 +203,7 @@ def generate_single(
     num_images=1,
     controlnet_conditioning_scale=0.7,
     grayscale_postprocess=True,
+    resolution=None,
 ):
     """단일 hint 이미지로부터 결함 이미지를 생성합니다.
 
@@ -210,12 +211,28 @@ def generate_single(
         grayscale_postprocess: True이면 생성 이미지를 grayscale 변환 후
             RGB 3채널로 복제합니다. SD 1.5 VAE의 3채널 독립 디코딩으로 인한
             RGB 컬러 아티팩트를 제거합니다.
+        resolution: 생성 해상도. 지정 시 resolution×resolution 고정 해상도 사용.
+            None이면 hint 이미지 크기에서 8의 배수로 올림 계산 (최소 64px).
     """
     generator = torch.Generator(device=device).manual_seed(seed)
 
     # hint 이미지가 PIL Image인지 확인
     if not isinstance(hint_image, Image.Image):
         hint_image = Image.open(hint_image).convert("RGB")
+
+    # 생성 해상도 결정
+    if resolution is not None:
+        # 고정 해상도 (예: 512x512)
+        gen_h, gen_w = resolution, resolution
+        logger.info(f"Using fixed resolution: {gen_w}x{gen_h}")
+    else:
+        # hint 이미지 크기 기반 자동 계산 (8의 배수, 최소 64px)
+        orig_w, orig_h = hint_image.size
+        gen_h = max(64, ((orig_h + 7) // 8) * 8)
+        gen_w = max(64, ((orig_w + 7) // 8) * 8)
+        logger.info(
+            f"Auto resolution from hint ({orig_w}x{orig_h}): {gen_w}x{gen_h}"
+        )
 
     results = []
     for i in range(num_images):
@@ -226,6 +243,8 @@ def generate_single(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 image=hint_image,
+                height=gen_h,
+                width=gen_w,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 controlnet_conditioning_scale=controlnet_conditioning_scale,
@@ -391,6 +410,7 @@ def generate_from_jsonl(pipeline, args, device):
             num_images=args.num_images_per_sample,
             controlnet_conditioning_scale=args.controlnet_conditioning_scale,
             grayscale_postprocess=args.grayscale_postprocess,
+            resolution=args.resolution,
         )
 
         # 결과 저장
@@ -471,6 +491,7 @@ def generate_single_image(pipeline, args, device):
         num_images=args.num_images_per_sample,
         controlnet_conditioning_scale=args.controlnet_conditioning_scale,
         grayscale_postprocess=args.grayscale_postprocess,
+        resolution=args.resolution,
     )
 
     # 저장
@@ -479,6 +500,13 @@ def generate_single_image(pipeline, args, device):
         save_path = output_dir / f"{hint_stem}_generated_{i}.png"
         img.save(save_path)
         logger.info(f"Saved: {save_path}")
+
+    # hint 이미지를 sources/ 디렉토리에 참조용으로 저장
+    # (run_validation_phases.py의 품질 평가에서 SSIM/LPIPS 참조로 사용)
+    sources_dir = output_dir / "sources"
+    sources_dir.mkdir(exist_ok=True)
+    hint_image.save(sources_dir / f"{hint_stem}.png")
+    logger.info(f"Source hint saved: {sources_dir / f'{hint_stem}.png'}")
 
     # 비교 그리드
     grid = create_comparison_grid(
@@ -543,6 +571,12 @@ def parse_args():
     )
     parser.add_argument("--num_images_per_sample", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--resolution", type=int, default=None,
+        help="생성 해상도 (정사각형). 지정 시 resolution×resolution 고정 해상도 사용. "
+             "미지정 시 hint 이미지 크기에서 8의 배수로 올림 자동 계산 (최소 64px). "
+             "예: --resolution 512",
+    )
     parser.add_argument(
         "--grayscale_postprocess", action="store_true", default=True,
         help="생성 이미지를 grayscale 변환 후 RGB 복제. "

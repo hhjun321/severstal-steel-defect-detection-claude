@@ -33,6 +33,11 @@ Note:
     디렉토리가 생성되지 않으므로 --model_path를 사용해야 합니다.
     --model_path는 test_controlnet.py에서 pipeline_reference.json을 참조하여
     base SD model을 자동으로 로드합니다.
+
+Dependencies (Colab):
+    pip install lpips scikit-image
+    # lpips: LPIPS 지각적 유사도 메트릭 (선택사항, 없으면 자동 스킵)
+    # scikit-image: SSIM 구조적 유사도 메트릭 (선택사항, 없으면 자동 스킵)
 """
 
 import argparse
@@ -161,15 +166,16 @@ def _compute_generation_quality(
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # 1. Color consistency (weight: 0.30)
-        # 금속 표면은 그레이스케일 계열이어야 함.
-        # LAB 색공간에서 a, b 채널의 편차가 작을수록 높은 점수.
+        # 1. Color/distribution quality (weight: 0.30)
+        # 채도, 밝기 범위, 히스토그램 엔트로피, 텍스처 복잡도 종합 평가
         color_score = _score_color_consistency(img_rgb)
 
         # 2. Artifact detection (weight: 0.20)
+        # 통계적 gradient 이상치 + 고주파 패턴 분석
         artifact_score = _score_artifacts(gray)
 
-        # 3. Blur/sharpness (weight: 0.20)
+        # 3. Sharpness (weight: 0.20)
+        # Laplacian variance + gradient contrast ratio
         blur_score = _score_sharpness(gray)
 
         # 4. SSIM (weight: 0.15, 참조 이미지 존재 시)
@@ -287,8 +293,10 @@ def _build_reference_map(output_dir: Path) -> Dict[str, Path]:
     """생성 이미지에 대응하는 참조(원본) 이미지 경로 매핑을 구축합니다.
 
     다음 위치에서 참조 이미지를 탐색:
-    1. comparisons/ 디렉토리의 *_source.png 파일
-    2. 파일명 패턴에서 base_id를 추출하여 sources/ 디렉토리에서 탐색
+    1. comparisons/ 디렉토리의 *_comparison.png 파일 (batch 모드)
+    2. sources/ 디렉토리의 *.png 파일 (batch/single 모드 공통)
+    3. output_dir 직접의 *_generated_*.png 패턴 (single-image 모드)
+       → 파일명에서 base_name을 추출하여 sources/ 참조 매핑
     """
     ref_map = {}
 
@@ -307,17 +315,35 @@ def _build_reference_map(output_dir: Path) -> Dict[str, Path]:
                 for gen_file in output_dir.glob(gen_pattern):
                     ref_map[gen_file.name] = comp_file
 
-    # 2. sources/ 디렉토리에서 원본 ROI 이미지 탐색
+    # 2. sources/ 디렉토리에서 원본 ROI/hint 이미지 탐색
     sources_dir = output_dir / "sources"
     if sources_dir.exists():
         for src_file in sources_dir.glob("*.png"):
             base_name = src_file.stem
             for gen_pattern in [f"{base_name}_gen*.png",
                                 f"{base_name}_generated_*.png"]:
+                # batch 모드: generated/ 하위
                 for gen_file in output_dir.glob(f"generated/{gen_pattern}"):
                     ref_map[gen_file.name] = src_file
+                # single-image 모드: output_dir 직접
                 for gen_file in output_dir.glob(gen_pattern):
                     ref_map[gen_file.name] = src_file
+
+    # 3. single-image 모드 폴백:
+    #    sources/ 없이 output_dir에 *_generated_*.png가 직접 있는 경우,
+    #    같은 디렉토리의 *_comparison.png를 참조로 사용
+    if not ref_map:
+        for gen_file in output_dir.glob("*_generated_*.png"):
+            # {hint_stem}_generated_{i}.png → hint_stem 추출
+            gen_stem = gen_file.stem
+            # "_generated_" 이전의 모든 부분이 hint_stem
+            idx = gen_stem.rfind("_generated_")
+            if idx > 0:
+                hint_stem = gen_stem[:idx]
+                # comparison.png를 참조로 사용 (hint + generated 그리드)
+                comp_file = output_dir / f"{hint_stem}_comparison.png"
+                if comp_file.exists():
+                    ref_map[gen_file.name] = comp_file
 
     if ref_map:
         logger.info(f"  Reference images found: {len(ref_map)} mappings")
@@ -328,7 +354,11 @@ def _build_reference_map(output_dir: Path) -> Dict[str, Path]:
 
 
 def _compute_ssim(gen_gray: np.ndarray, ref_img: np.ndarray) -> float:
-    """두 이미지 간 SSIM(Structural Similarity Index)을 계산합니다.
+    """생성 이미지와 참조 이미지의 구조적 유사도를 계산합니다.
+
+    참조 이미지가 hint (에지 마스크)인 경우, 생성 이미지의 Canny 에지맵과
+    hint 간 SSIM을 계산하여 구조적 정합성을 평가합니다.
+    참조 이미지가 실사 이미지인 경우, 직접 SSIM을 계산합니다.
 
     Args:
         gen_gray: 생성 이미지 (grayscale)
@@ -346,7 +376,30 @@ def _compute_ssim(gen_gray: np.ndarray, ref_img: np.ndarray) -> float:
     if gen_gray.shape != ref_gray.shape:
         ref_gray = cv2.resize(ref_gray, (gen_gray.shape[1], gen_gray.shape[0]))
 
-    score, _ = ssim(gen_gray, ref_gray, full=True)
+    # 참조가 hint (에지 마스크)인지 판별:
+    # hint 이미지는 대부분 0(검정)과 255(흰색) 값을 가짐
+    unique_ratio = len(np.unique(ref_gray)) / 256.0
+    is_hint = unique_ratio < 0.15  # 전체 밝기의 15% 미만만 사용 → 바이너리 마스크
+
+    if is_hint:
+        # 생성 이미지의 Canny 에지맵을 추출하여 hint와 비교
+        # → ControlNet이 hint 구조를 얼마나 잘 따르는지 평가
+        edges = cv2.Canny(gen_gray, 50, 150)
+
+        # 에지맵과 hint의 구조적 유사도 (win_size는 작은 이미지 대응)
+        min_dim = min(edges.shape[0], edges.shape[1])
+        win_size = min(7, min_dim if min_dim % 2 == 1 else min_dim - 1)
+        if win_size < 3:
+            win_size = 3
+        score, _ = ssim(edges, ref_gray, full=True, win_size=win_size)
+    else:
+        # 실사 참조 이미지와 직접 비교
+        min_dim = min(gen_gray.shape[0], gen_gray.shape[1])
+        win_size = min(7, min_dim if min_dim % 2 == 1 else min_dim - 1)
+        if win_size < 3:
+            win_size = 3
+        score, _ = ssim(gen_gray, ref_gray, full=True, win_size=win_size)
+
     return float(max(0.0, min(1.0, score)))
 
 
@@ -391,64 +444,93 @@ def _compute_lpips(gen_img: np.ndarray, ref_img: np.ndarray,
 
 
 def _score_color_consistency(img_rgb: np.ndarray) -> float:
-    """LAB 색공간 기반 금속 표면 색상 일관성 점수.
+    """LAB 색공간 + 히스토그램 분석 기반 금속 표면 품질 점수.
 
-    금속 표면 이미지는 무채색(그레이스케일) 계열이어야 합니다.
-    a, b 채널의 표준편차가 크면 비현실적인 컬러 패턴으로 판단합니다.
+    금속 표면 이미지의 시각적 품질을 다각도로 평가합니다:
+    - 채도: 금속 표면은 무채색 계열이어야 함
+    - 밝기 분포: 적절한 dynamic range를 가져야 함
+    - 텍스처 풍부함: 너무 균일하거나 노이즈만 있으면 안 됨
+    - 히스토그램 엔트로피: 밝기 값의 다양성
 
     Returns:
-        0.0~1.0 (1.0 = 무채색에 가까움)
+        0.0~1.0 (1.0 = 고품질 금속 표면)
     """
     import cv2
 
     lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
 
-    # L 채널: 30~200 범위 (너무 어둡거나 밝지 않은지)
-    l_mean = np.mean(lab[:, :, 0])
-    l_score = 1.0 if 30 <= l_mean <= 200 else 0.5
-
-    # a, b 채널: 128 중심에서 벗어날수록 채도가 높음
-    # LAB에서 OpenCV는 a, b를 0-255 범위로 저장 (128이 중심)
+    # 1. 채도 점수 (a, b 채널 편차가 작을수록 무채색)
     a_channel = lab[:, :, 1].astype(float) - 128.0
     b_channel = lab[:, :, 2].astype(float) - 128.0
+    ab_abs_mean = (np.mean(np.abs(a_channel)) + np.mean(np.abs(b_channel))) / 2.0
 
-    # a, b의 절대값 평균이 작을수록 무채색
-    a_abs_mean = np.mean(np.abs(a_channel))
-    b_abs_mean = np.mean(np.abs(b_channel))
-    ab_mean = (a_abs_mean + b_abs_mean) / 2.0
-
-    # ab_mean이 5 이하면 1.0, 30 이상이면 0.0 (선형 보간)
-    if ab_mean <= 5.0:
-        ab_score = 1.0
-    elif ab_mean >= 30.0:
-        ab_score = 0.0
+    if ab_abs_mean <= 3.0:
+        chroma_score = 1.0
+    elif ab_abs_mean >= 25.0:
+        chroma_score = 0.0
     else:
-        ab_score = 1.0 - (ab_mean - 5.0) / 25.0
+        chroma_score = 1.0 - (ab_abs_mean - 3.0) / 22.0
 
-    # a, b의 표준편차가 크면 다양한 색상 = 비현실적
-    a_std = np.std(a_channel)
-    b_std = np.std(b_channel)
-    ab_std = (a_std + b_std) / 2.0
+    # 2. 밝기 범위 (dynamic range)
+    #    L 채널의 5th-95th percentile 범위가 적절해야 함
+    l_channel = lab[:, :, 0].astype(float)
+    l_p5 = np.percentile(l_channel, 5)
+    l_p95 = np.percentile(l_channel, 95)
+    l_range = l_p95 - l_p5
 
-    if ab_std <= 5.0:
-        std_score = 1.0
-    elif ab_std >= 40.0:
-        std_score = 0.0
+    # 적절한 dynamic range: 30~150 (금속 표면의 자연스러운 밝기 변화)
+    if 30 <= l_range <= 150:
+        range_score = 1.0
+    elif l_range < 15:
+        range_score = 0.2  # 너무 균일 (빈 이미지 의심)
+    elif l_range < 30:
+        range_score = 0.2 + 0.8 * (l_range - 15) / 15.0
     else:
-        std_score = 1.0 - (ab_std - 5.0) / 35.0
+        # l_range > 150: 과도한 콘트라스트
+        range_score = max(0.3, 1.0 - (l_range - 150) / 100.0)
 
-    # L의 표준편차: 너무 균일하면 빈 이미지, 너무 크면 문제
-    l_std = np.std(lab[:, :, 0].astype(float))
-    texture_score = 1.0 if 5 <= l_std <= 60 else 0.5
+    # 3. 히스토그램 엔트로피 (밝기 값 다양성)
+    #    엔트로피가 높을수록 풍부한 밝기 분포 → 자연스러움
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
+    hist = hist.flatten() / hist.sum()
+    hist = hist[hist > 0]  # log(0) 방지
+    entropy = -np.sum(hist * np.log2(hist))
 
-    score = (0.3 * l_score + 0.3 * ab_score + 0.2 * std_score + 0.2 * texture_score)
+    # 엔트로피 범위: 이론상 0~6 (64 bins), 자연 이미지 ~4.5-5.5
+    if entropy >= 4.5:
+        entropy_score = 1.0
+    elif entropy <= 2.0:
+        entropy_score = 0.1
+    else:
+        entropy_score = 0.1 + 0.9 * (entropy - 2.0) / 2.5
+
+    # 4. 텍스처 복잡도 (L 채널의 국소 분산)
+    #    금속 표면은 미세한 텍스처가 있어야 함
+    l_std = np.std(l_channel)
+    if 8 <= l_std <= 50:
+        texture_score = 1.0
+    elif l_std < 3:
+        texture_score = 0.1  # 거의 단색
+    elif l_std < 8:
+        texture_score = 0.1 + 0.9 * (l_std - 3) / 5.0
+    else:
+        # l_std > 50: 과도한 변화
+        texture_score = max(0.3, 1.0 - (l_std - 50) / 30.0)
+
+    score = (0.20 * chroma_score
+             + 0.25 * range_score
+             + 0.30 * entropy_score
+             + 0.25 * texture_score)
     return float(score)
 
 
 def _score_artifacts(gray: np.ndarray) -> float:
     """Gradient 분석 기반 아티팩트 감지.
 
-    비정상적으로 높은 gradient가 많으면 아티팩트로 판단합니다.
+    비정상적으로 높은 gradient 비율 + 체커보드/반복 패턴을 감지합니다.
+    금속 표면은 자연스러운 에지와 텍스처를 가지므로, 단순 gradient 임계값
+    대신 통계적 이상치 비율 + 고주파 에너지 비율을 사용합니다.
 
     Returns:
         0.0~1.0 (1.0 = 아티팩트 없음)
@@ -459,32 +541,97 @@ def _score_artifacts(gray: np.ndarray) -> float:
     sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
     gradient_magnitude = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
 
-    # 비정상적으로 높은 gradient 비율
-    high_gradient_ratio = np.sum(gradient_magnitude > 200) / gradient_magnitude.size
+    # 1. 통계적 이상치 비율 (mean + 3*std 초과)
+    #    자연 이미지: 이상치 비율 < 1%
+    #    아티팩트 이미지: 이상치 비율 > 5%
+    grad_mean = np.mean(gradient_magnitude)
+    grad_std = np.std(gradient_magnitude)
+    outlier_threshold = grad_mean + 3.0 * grad_std
+    # grad_std가 0이면 (균일한 이미지) 아티팩트 없음으로 판정
+    if grad_std < 1e-6:
+        outlier_ratio = 0.0
+    else:
+        outlier_ratio = np.sum(gradient_magnitude > outlier_threshold) / gradient_magnitude.size
 
-    # 비율이 낮을수록 좋음
-    score = 1.0 - min(high_gradient_ratio * 10, 1.0)
+    # outlier_ratio: 0~0.01 → 1.0, 0.05+ → 0.0 (선형)
+    if outlier_ratio <= 0.01:
+        edge_score = 1.0
+    elif outlier_ratio >= 0.05:
+        edge_score = 0.0
+    else:
+        edge_score = 1.0 - (outlier_ratio - 0.01) / 0.04
+
+    # 2. 고주파 에너지 비율 (체커보드/반복 아티팩트 감지)
+    #    Laplacian의 절대값 평균 대비 gradient 평균의 비율로,
+    #    급격한 on-off 패턴이 많을수록 높아짐
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    lap_energy = np.mean(np.abs(laplacian))
+    grad_energy = grad_mean + 1e-6  # 0 방지
+
+    hf_ratio = lap_energy / grad_energy
+    # hf_ratio: 자연이미지 ~1.0-2.5, 체커보드 아티팩트 >3.0
+    if hf_ratio <= 2.5:
+        hf_score = 1.0
+    elif hf_ratio >= 5.0:
+        hf_score = 0.0
+    else:
+        hf_score = 1.0 - (hf_ratio - 2.5) / 2.5
+
+    # 가중 결합
+    score = 0.6 * edge_score + 0.4 * hf_score
     return float(score)
 
 
 def _score_sharpness(gray: np.ndarray) -> float:
-    """Laplacian variance 기반 선명도 점수.
+    """Laplacian variance + gradient 분석 기반 선명도 점수.
+
+    단순 Laplacian variance만으로는 diffusion 모델 출력 간 차이를
+    구분하기 어려우므로, gradient 기반 에지 선명도를 추가합니다.
 
     Returns:
         0.0~1.0 (1.0 = 선명)
     """
     import cv2
 
+    # 1. Laplacian variance (전체 선명도)
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-    # 100 이상이면 충분히 선명, 10 이하면 매우 흐림
-    if laplacian_var >= 100:
-        score = 1.0
-    elif laplacian_var <= 10:
-        score = 0.1
+    # 금속 표면 이미지의 Laplacian variance 범위:
+    # - 흐린 diffusion 출력: 50~200
+    # - 적절한 출력: 200~800
+    # - 매우 선명/노이즈: 800+
+    if laplacian_var >= 500:
+        lap_score = 1.0
+    elif laplacian_var <= 30:
+        lap_score = 0.1
     else:
-        score = 0.1 + 0.9 * (laplacian_var - 10) / 90.0
+        lap_score = 0.1 + 0.9 * (laplacian_var - 30) / 470.0
 
+    # 2. Gradient 기반 에지 선명도
+    #    Sobel gradient의 P90/P50 비율: 선명한 이미지는 에지가 뚜렷하여
+    #    gradient 분포가 넓고, 흐린 이미지는 분포가 좁음
+    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    gradient = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+
+    p50 = np.percentile(gradient, 50)
+    p90 = np.percentile(gradient, 90)
+
+    if p50 < 1e-6:
+        # 거의 균일한 이미지
+        edge_sharpness = 0.1
+    else:
+        contrast_ratio = p90 / p50
+        # 자연 이미지: contrast_ratio ~3-8
+        # 흐린 이미지: contrast_ratio ~1.5-2.5
+        if contrast_ratio >= 4.0:
+            edge_sharpness = 1.0
+        elif contrast_ratio <= 1.5:
+            edge_sharpness = 0.1
+        else:
+            edge_sharpness = 0.1 + 0.9 * (contrast_ratio - 1.5) / 2.5
+
+    score = 0.5 * lap_score + 0.5 * edge_sharpness
     return float(score)
 
 
@@ -640,6 +787,9 @@ def run_phase1(args):
     if args.image_root:
         cmd += ["--image_root", args.image_root]
 
+    if args.resolution is not None:
+        cmd += ["--resolution", str(args.resolution)]
+
     logger.info(f"Running: {' '.join(cmd)}")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -736,6 +886,9 @@ def run_phase2(args):
         if args.image_root:
             cmd += ["--image_root", args.image_root]
 
+        if args.resolution is not None:
+            cmd += ["--resolution", str(args.resolution)]
+
         logger.info(f"  guidance_scale={gs}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -770,6 +923,9 @@ def run_phase2(args):
         if args.image_root:
             cmd += ["--image_root", args.image_root]
 
+        if args.resolution is not None:
+            cmd += ["--resolution", str(args.resolution)]
+
         logger.info(f"  num_inference_steps={steps}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -803,6 +959,9 @@ def run_phase2(args):
 
         if args.image_root:
             cmd += ["--image_root", args.image_root]
+
+        if args.resolution is not None:
+            cmd += ["--resolution", str(args.resolution)]
 
         logger.info(f"  seed={seed}")
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -942,6 +1101,9 @@ def run_phase3(args):
 
     if args.image_root:
         cmd += ["--image_root", args.image_root]
+
+    if args.resolution is not None:
+        cmd += ["--resolution", str(args.resolution)]
 
     logger.info(f"Running inference on unseen data...")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -1958,6 +2120,14 @@ def parse_args():
         help="v1 모델 검증 결과 디렉토리. Phase 4에서 v1 vs v4 "
              "생성 이미지 비교를 수행합니다. "
              "예: /content/drive/.../test_results_v1",
+    )
+
+    # Resolution
+    parser.add_argument(
+        "--resolution", type=int, default=None,
+        help="생성 해상도 (정사각형). 지정 시 resolution×resolution 고정 해상도 사용. "
+             "미지정 시 hint 이미지 크기에서 8의 배수로 올림 자동 계산 (최소 64px). "
+             "Passed through to test_controlnet.py. 예: --resolution 512",
     )
 
     args = parser.parse_args()
