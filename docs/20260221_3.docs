@@ -1,0 +1,305 @@
+20260221 작업 일지 #3 - 벤치마크 실험 코드 구현 (3 Models x 4 Groups = 12 Runs)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+작업 일지 #2 섹션 6 "다음 단계" 5번 항목 및 docs/experiment.md 설계 문서에 따라,
+CASDA 증강 효과를 정량적으로 검증하기 위한 벤치마크 실험 코드를 전면 구현한다.
+
+Data-centric AI 접근법에 따라 모델 아키텍처는 "고정된 측정 도구"로 사용하고,
+학습 데이터만 변경하여 CASDA 합성 데이터의 효과를 분리 측정한다.
+
+  - 3개 모델: YOLO-MFD, EB-YOLOv8, DeepLabV3+
+  - 4개 데이터셋 그룹: Baseline Raw, Baseline Trad, CASDA-Full, CASDA-Pruning
+  - 5개 가설 검증: H1~H5
+
+
+2. 실험 설계 요약
+================================================================================
+
+  | 구분           | 내용                                                    |
+  |----------------|---------------------------------------------------------|
+  | 독립 변수      | 학습 데이터셋 (4 groups)                                |
+  | 종속 변수      | mAP@0.5, per-class AP, Dice, IoU, FID                  |
+  | 통제 변수      | 모델 아키텍처, 하이퍼파라미터, seed(42), split 비율     |
+  | 실험 규모      | 3 x 4 = 12 training runs                               |
+  | 데이터 분할    | train 70% / val 15% / test 15% (stratified)            |
+
+  가설:
+  H1: CASDA > Traditional augmentation (mAP)
+  H2: CASDA-Pruning > CASDA-Full (효율성)
+  H3: CASDA 효과가 아키텍처 독립적
+  H4: CASDA가 소수 클래스(Class 3, 4) 개선
+  H5: CASDA 합성 이미지의 물리적 타당성 (FID)
+
+
+3. 변경 파일
+================================================================================
+
+  | 파일                                  | 상태 | 라인 | 변경 내용                                |
+  |---------------------------------------|------|------|------------------------------------------|
+  | configs/benchmark_experiment.yaml     | 신규 | 197  | 실험 전체 설정 (모델/데이터/평가/가설)   |
+  | src/models/__init__.py                | 신규 |  14  | 모델 모듈 exports                        |
+  | src/models/yolo_mfd.py                | 신규 | 469  | YOLO-MFD 모델 (MEFE 모듈 포함)          |
+  | src/models/eb_yolov8.py               | 신규 | 422  | EB-YOLOv8 모델 (BiFPN 포함)             |
+  | src/models/deeplabv3plus.py           | 신규 | 266  | DeepLabV3+ 세그멘테이션 모델            |
+  | src/training/__init__.py              | 신규 |  36  | 학습 모듈 exports                        |
+  | src/training/dataset.py               | 신규 | 729  | 데이터셋 로더 및 4 그룹 파이프라인       |
+  | src/training/trainer.py               | 신규 | 398  | 통합 트레이너 (조기 종료, 스케줄링)      |
+  | src/training/metrics.py               | 신규 | 560  | 평가 메트릭 (mAP, Dice, FID, 리포터)    |
+  | scripts/run_benchmark.py              | 신규 | 492  | 벤치마크 실행 오케스트레이터             |
+  | scripts/analyze_benchmark_results.py  | 신규 | 435  | 결과 분석 및 시각화                      |
+  | requirements.txt                      | 수정 |  47  | scipy>=1.7.0, lpips>=0.1.4 추가          |
+  |---------------------------------------|------|------|------------------------------------------|
+  | 합계                                  |      |4,065 | 신규 11 + 수정 1 = 12 파일               |
+
+
+4. 모듈별 상세 설명
+================================================================================
+
+4.1 설정 파일 (configs/benchmark_experiment.yaml, 197줄)
+---------------------------------------------------------
+YAML 형식으로 실험 전체를 단일 파일에서 관리한다.
+
+  - experiment: 실험 이름(casda_benchmark_v1), seed(42), device, 출력 경로
+  - dataset: Severstal 이미지 경로, 256x1600 해상도, 4클래스, 7:1.5:1.5 분할
+  - dataset.casda: CASDA-Full(5,000장)/Pruning(2,000장, suitability≥0.7) 경로
+  - dataset_groups: 4개 그룹 정의
+    - baseline_raw: 원본만, augmentation 없음
+    - baseline_trad: 원본 + 기하학적 증강 (flip, rotation±15, scale 0.8~1.2 등)
+    - casda_full: 원본 + CASDA 5,000장
+    - casda_pruning: 원본 + CASDA 상위 2,000장
+  - models: 3개 모델 하이퍼파라미터
+    - YOLO-MFD/EB-YOLOv8: epochs 100, batch 16, AdamW lr=0.001, cosine LR
+    - DeepLabV3+: epochs 100, batch 8, AdamW lr=0.0001, poly LR (power=0.9)
+  - evaluation: mAP@0.5, per-class AP, PR curve, Dice, IoU, FID(dims=2048)
+  - reporting: hypothesis_tests H1~H5 정의 (비교 대상 그룹, 메트릭, focus 클래스)
+
+
+4.2 YOLO-MFD (src/models/yolo_mfd.py, 469줄)
+----------------------------------------------
+2025 YOLO-MFD 논문 기반. YOLOv8에 MEFE 모듈을 추가하여 미세 결함 검출 강화.
+
+주요 클래스:
+  - SobelEdgeExtractor: Sobel 커널(3x3)로 x/y 방향 에지 추출, magnitude 계산
+  - MEFEModule: 3개 스케일(1x1, 3x3, 5x5) 에지 특징 + 채널 어텐션(SE block)
+    → 에지 특징과 원본 feature map을 concat 후 fusion
+  - YOLOBackbone: CSP 기반 4-stage backbone (C3k2 블록), stride 4/8/16/32
+  - PANetNeck: FPN top-down + PAN bottom-up 경로로 P3/P4/P5 생성
+  - DetectionHead: 각 스케일별 cls/reg 분리 헤드
+  - YOLOMFD: 통합 모델 클래스
+    - compute_loss(): CIoU bbox loss + BCE cls loss (가중 합산)
+    - predict(): forward + NMS로 최종 검출 결과 반환
+    - nms(): confidence 필터링 → IoU 기반 NMS
+
+특징:
+  - MEFE가 backbone의 각 스케일 출력에 에지 정보를 주입
+  - 채널 어텐션으로 에지/텍스처 특징의 중요도를 적응적으로 조절
+  - 미세 결함(Class 3, 4)에 효과적인 multi-scale 에지 표현
+
+
+4.3 EB-YOLOv8 (src/models/eb_yolov8.py, 422줄)
+-------------------------------------------------
+2025 EB-YOLOv8 논문 기반. BiFPN으로 양방향 특징 융합을 수행.
+
+주요 클래스:
+  - ConvBNSiLU: Conv + BN + SiLU 기본 블록
+  - C2fBlock: CSP Bottleneck with 2 convolutions (YOLOv8 표준)
+  - SPPF: Spatial Pyramid Pooling Fast (5x5 maxpool 3회 연쇄)
+  - BiFPNLayer: 단일 BiFPN 레이어
+    - Fast normalized fusion: w_i / (Σw_j + ε) 가중 합산
+    - Top-down (P5→P4→P3) + Bottom-up (P3→P4→P5) 양방향
+  - StackedBiFPN: BiFPN 3층 스택 (반복 정제)
+  - DecoupledHead: cls/reg 분리 (각 branch 2층 conv)
+  - EBYOLOv8: 통합 모델 클래스
+    - backbone 4단계 + SPPF + BiFPN neck + 3-scale decoupled heads
+    - compute_loss()/predict()/nms(): YOLO-MFD와 동일 인터페이스
+
+특징:
+  - Fast normalized fusion으로 학습 안정성 확보 (softmax 대비 경량)
+  - 3-layer stacking으로 P3~P5 간 정보 반복 교환
+  - Decoupled head로 분류/회귀 분리 → 수렴 속도 향상
+
+
+4.4 DeepLabV3+ (src/models/deeplabv3plus.py, 266줄)
+-----------------------------------------------------
+Severstal 세그멘테이션 기준 모델. ResNet-101 backbone + ASPP + decoder.
+
+주요 클래스:
+  - ASPPConv: Atrous convolution (dilation rate별)
+  - ASPPPooling: Global average pooling → 1x1 conv → upsample
+  - ASPP: 1x1 conv + rate 6/12/18 atrous conv + GAP → concat → project
+  - DeepLabDecoder: low-level feature(layer1, 48ch) + ASPP 출력 concat → 3x3 conv
+  - DeepLabV3Plus: 통합 모델 클래스
+    - ResNet-101 pretrained backbone (torchvision, graceful fallback)
+    - output_stride=16, 256x512 입력
+    - compute_loss(): BCE + Dice 결합 손실 (0.5 + 0.5)
+    - predict(): sigmoid → threshold 0.5 → 4-class mask
+
+특징:
+  - torchvision 없을 때 graceful fallback (HAS_TORCHVISION 플래그)
+  - BCE + Dice loss 조합으로 클래스 불균형 대응
+  - Detection 모델과 다른 관점(픽셀 단위)에서 CASDA 효과 측정
+
+
+4.5 데이터셋 로더 (src/training/dataset.py, 729줄)
+----------------------------------------------------
+4개 데이터셋 그룹을 통합 관리하는 데이터 파이프라인.
+
+주요 클래스:
+  - SeverstalDetectionDataset: YOLO bbox 형식 (RLE → mask → bounding box)
+    - train.csv의 ImageId_ClassId 결합/분리 칼럼 모두 지원
+    - mask에서 connected component → bbox 추출
+    - [class_id, x_center, y_center, w, h] 정규화 좌표 반환
+  - SeverstalSegmentationDataset: 4-class 멀티 클래스 마스크 반환
+    - 256x1600 원본 → 지정 크기로 리사이즈
+    - (H, W, C) 형태의 바이너리 마스크 (C=4)
+  - CASDASyntheticDataset: CASDA 합성 이미지 전용 로더
+    - JSON 메타데이터 (suitability_score, class_id 등) 파싱
+    - 디렉토리 내 이미지 + 마스크 자동 매핑
+  - create_data_loaders(): 4 그룹 DataLoader 생성 핵심 함수
+    - ConcatDataset으로 원본 + 합성 데이터 결합
+    - stratified split (train_test_split) 사용
+    - albumentations 변환 (traditional augmentation 그룹)
+
+  기존 src/utils/rle_utils.py의 rle_decode() 함수를 import하여 사용.
+
+
+4.6 통합 트레이너 (src/training/trainer.py, 398줄)
+----------------------------------------------------
+Detection과 Segmentation 모델을 모두 지원하는 범용 학습 루프.
+
+주요 클래스:
+  - EarlyStopping: patience 기반 조기 종료 (max/min 모드)
+  - BenchmarkTrainer: 핵심 트레이너
+    - AdamW optimizer (모델별 lr/weight_decay)
+    - LR 스케줄러: cosine (detection), poly (segmentation)
+    - Warmup: 처음 N epochs linear warmup
+    - Gradient clipping (max_norm=10.0)
+    - TensorBoard 로깅 (선택적)
+    - Best model checkpointing (val metric 기준)
+    - train_one_epoch() → validate() → early_stopping_check
+    - 학습 이력 JSON 저장 (epoch별 loss/metric)
+
+
+4.7 평가 메트릭 (src/training/metrics.py, 560줄)
+--------------------------------------------------
+Detection/Segmentation/FID/Reporting 4개 평가 체계.
+
+주요 클래스:
+  - compute_iou() / compute_iou_matrix(): 박스 IoU 유틸리티
+  - DetectionEvaluator:
+    - mAP@0.5 계산 (전체 + per-class AP)
+    - Precision-Recall 커브 생성
+    - confidence 기반 매칭 (IoU threshold greedy matching)
+  - SegmentationEvaluator:
+    - Dice Score (전체 + per-class)
+    - IoU (전체 + per-class)
+    - threshold 적용 후 TP/FP/FN 집계
+  - FIDCalculator:
+    - InceptionV3 feature 추출 (dims=2048)
+    - Frechet Distance 계산 (mean/covariance 비교)
+    - per-class FID 지원
+  - BenchmarkReporter:
+    - 12 runs 결과를 JSON + CSV로 통합 저장
+    - 가설 검증 요약 (H1~H5 비교 결과)
+
+
+4.8 벤치마크 실행기 (scripts/run_benchmark.py, 492줄)
+------------------------------------------------------
+12 training runs 전체를 오케스트레이션하는 메인 스크립트.
+
+기능:
+  - CLI 인터페이스:
+    --config: YAML 설정 파일 경로
+    --models: 실행할 모델 선택 (예: yolo_mfd eb_yolov8)
+    --groups: 실행할 그룹 선택 (예: baseline_raw casda_pruning)
+    --fid-only: FID 계산만 수행
+    --device: cuda/cpu 지정
+  - create_model(): 모델 팩토리 (model_key → 모델 인스턴스)
+  - run_single_experiment(): 단일 (model, group) 조합 학습 + 평가
+  - run_fid_evaluation(): CASDA 합성 이미지 FID 계산
+  - run_hypothesis_tests(): H1~H5 통계 검증 수행
+  - main(): 전체 파이프라인 (12 runs → FID → 가설 검증 → 리포트)
+
+실행 흐름:
+  1) YAML 설정 로드
+  2) models × groups 조합 생성 (필터링 가능)
+  3) 각 조합에 대해 DataLoader 생성 → 모델 생성 → 학습 → 평가
+  4) FID 계산 (CASDA-Full/Pruning vs 원본)
+  5) H1~H5 가설 검증 (그룹 간 메트릭 비교)
+  6) BenchmarkReporter로 통합 결과 저장
+
+
+4.9 결과 분석 도구 (scripts/analyze_benchmark_results.py, 435줄)
+-----------------------------------------------------------------
+벤치마크 완료 후 결과를 시각화하고 논문용 표를 생성.
+
+기능:
+  - Markdown 비교 표 (모델 × 그룹 매트릭스)
+  - LaTeX 비교 표 (논문 삽입용)
+  - 모델별/그룹별 성능 막대 차트 (matplotlib)
+  - PR 커브 시각화
+  - 학습 곡선 (train/val loss + metric)
+  - 가설별 개선률(%) 계산 및 요약
+  - scipy.stats를 이용한 통계 검정 (paired t-test 등)
+
+
+5. 설계 결정 사항
+================================================================================
+
+5.1 아키텍처 동결 (Data-centric AI)
+------------------------------------
+모델 아키텍처와 하이퍼파라미터를 고정하고 데이터만 변경함으로써,
+성능 차이가 순수하게 데이터 품질/양에 의한 것임을 보장한다.
+YOLO-MFD/EB-YOLOv8은 동일한 training config (lr=0.001, cosine, epochs 100),
+DeepLabV3+만 세그멘테이션 특성에 맞게 별도 설정 (lr=0.0001, poly).
+
+5.2 Detection + Segmentation 이중 검증
+---------------------------------------
+Detection 모델 2개(YOLO-MFD, EB-YOLOv8)와 Segmentation 모델 1개(DeepLabV3+)를
+포함하여, bbox 수준과 pixel 수준 모두에서 CASDA 효과를 검증한다.
+H3(아키텍처 독립성) 가설을 위해 3개 모델 모두에서 일관된 개선을 확인.
+
+5.3 Graceful Dependency Handling
+---------------------------------
+모든 모듈에서 선택적 의존성을 try/except로 처리:
+  - torchvision: DeepLabV3+ pretrained backbone
+  - albumentations: Traditional augmentation
+  - tensorboard: 학습 로깅
+  - matplotlib: 차트 생성
+  - scipy: 통계 검정
+Colab 환경에서 누락된 패키지가 있어도 핵심 기능이 동작하도록 설계.
+
+5.4 기존 유틸리티 재사용
+--------------------------
+src/utils/rle_utils.py의 rle_decode() 함수를 SeverstalDetectionDataset과
+SeverstalSegmentationDataset에서 import하여 사용. 기존 코드와의 일관성 유지.
+
+5.5 Colab 최적화
+------------------
+로컬 환경에 PyTorch가 설치되어 있지 않으므로 (ast.parse 수준의 문법 검증만 수행),
+실제 실행은 Colab에서 이루어진다. 배치 크기, 메모리 사용량 등을 T4 GPU 기준으로 설정.
+
+
+6. 다음 단계
+================================================================================
+  1. Colab에서 수정된 코드로 Phase 2 재실행 → 품질 차별화 확인
+  2. Phase 3 SSIM이 hint-alignment 기반으로 의미 있는 값을 반환하는지 확인
+  3. 5,000장 합성 이미지 생성 (500 samples x 10 images)
+  4. CASDA-Pruning 선별 (suitability >= 0.7 → 상위 2,000장)
+  5. 벤치마크 실험 실행 (scripts/run_benchmark.py → 12 training runs)
+  6. 결과 분석 및 가설 검증 (scripts/analyze_benchmark_results.py)
+
+
+7. 문법 검증
+================================================================================
+  ast.parse(src/models/yolo_mfd.py)               → OK
+  ast.parse(src/models/eb_yolov8.py)               → OK
+  ast.parse(src/models/deeplabv3plus.py)            → OK
+  ast.parse(src/training/dataset.py)                → OK
+  ast.parse(src/training/trainer.py)                → OK
+  ast.parse(src/training/metrics.py)                → OK
+  ast.parse(scripts/run_benchmark.py)               → OK
+  ast.parse(scripts/analyze_benchmark_results.py)   → OK
+  yaml.safe_load(configs/benchmark_experiment.yaml) → OK
