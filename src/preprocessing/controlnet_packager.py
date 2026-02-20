@@ -585,7 +585,7 @@ class ControlNetDatasetPackager:
             packaged_data, 
             train_jsonl_path,
             relative_paths=True,
-            base_dir=output_dir.parent
+            base_dir=output_dir
         )
         
         # Create metadata.json

@@ -65,10 +65,12 @@ def _compute_generation_quality(
 ) -> Dict:
     """생성된 이미지의 정량적 품질을 평가합니다.
 
-    마스크 없이 생성 이미지만으로 평가 가능한 3개 메트릭을 사용합니다:
+    5개 메트릭을 사용합니다 (SSIM/LPIPS는 참조 이미지 존재 시에만 산출):
     - color_consistency: LAB 색공간 기반 금속 표면 색상 일관성
     - artifact_score: gradient 분석 기반 비현실적 패턴 감지
     - blur_score: Laplacian variance 기반 선명도
+    - ssim_score: 구조적 유사도 (Structural Similarity Index)
+    - lpips_score: 지각적 유사도 (Learned Perceptual Image Patch Similarity)
 
     Args:
         output_dir: 생성 이미지가 포함된 디렉토리
@@ -82,7 +84,11 @@ def _compute_generation_quality(
             "avg_color_score": float,
             "avg_artifact_score": float,
             "avg_blur_score": float,
+            "avg_ssim_score": float or None,
+            "avg_lpips_score": float or None,
             "num_evaluated": int,
+            "num_ssim_evaluated": int,
+            "num_lpips_evaluated": int,
         }
     """
     try:
@@ -96,6 +102,30 @@ def _compute_generation_quality(
             "num_evaluated": 0,
             "error": "cv2 not available",
         }
+
+    # SSIM 사용 가능 여부 확인
+    ssim_available = False
+    try:
+        from skimage.metrics import structural_similarity as ssim
+        ssim_available = True
+    except ImportError:
+        logger.info("  skimage not available, SSIM will be skipped")
+
+    # LPIPS 사용 가능 여부 확인
+    lpips_available = False
+    lpips_model = None
+    try:
+        import torch
+        import lpips as lpips_module
+        lpips_model = lpips_module.LPIPS(net="alex", verbose=False)
+        if torch.cuda.is_available():
+            lpips_model = lpips_model.cuda()
+        lpips_available = True
+        logger.info("  LPIPS model loaded (AlexNet)")
+    except ImportError:
+        logger.info("  lpips/torch not available, LPIPS will be skipped")
+    except Exception as e:
+        logger.info(f"  LPIPS initialization failed: {e}")
 
     # 생성 이미지 수집 (generated/ 하위 또는 직접)
     image_paths = []
@@ -116,6 +146,11 @@ def _compute_generation_quality(
             "error": "no generated images found",
         }
 
+    # 참조(소스) 이미지 매핑 구축 (SSIM/LPIPS용)
+    # comparisons/ 디렉토리에서 원본 이미지를 찾거나,
+    # 파일명 패턴에서 원본 파일명을 추출
+    reference_map = _build_reference_map(output_dir)
+
     sample_scores = []
 
     for img_path in sorted(image_paths):
@@ -126,31 +161,78 @@ def _compute_generation_quality(
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # 1. Color consistency (weight: 0.40)
+        # 1. Color consistency (weight: 0.30)
         # 금속 표면은 그레이스케일 계열이어야 함.
         # LAB 색공간에서 a, b 채널의 편차가 작을수록 높은 점수.
         color_score = _score_color_consistency(img_rgb)
 
-        # 2. Artifact detection (weight: 0.30)
+        # 2. Artifact detection (weight: 0.20)
         artifact_score = _score_artifacts(gray)
 
-        # 3. Blur/sharpness (weight: 0.30)
+        # 3. Blur/sharpness (weight: 0.20)
         blur_score = _score_sharpness(gray)
 
-        # 가중 평균
-        quality_score = (
-            0.40 * color_score
-            + 0.30 * artifact_score
-            + 0.30 * blur_score
-        )
+        # 4. SSIM (weight: 0.15, 참조 이미지 존재 시)
+        ssim_score = None
+        if ssim_available and img_path.name in reference_map:
+            ref_img = cv2.imread(str(reference_map[img_path.name]))
+            if ref_img is not None:
+                ssim_score = _compute_ssim(gray, ref_img)
 
-        sample_scores.append({
+        # 5. LPIPS (weight: 0.15, 참조 이미지 존재 시)
+        lpips_score = None
+        if lpips_available and img_path.name in reference_map:
+            ref_img = cv2.imread(str(reference_map[img_path.name]))
+            if ref_img is not None:
+                lpips_score = _compute_lpips(img, ref_img, lpips_model)
+
+        # 가중 평균 계산 (SSIM/LPIPS 가용성에 따라 동적 가중치)
+        if ssim_score is not None and lpips_score is not None:
+            # 5개 메트릭 모두 사용 가능
+            quality_score = (
+                0.30 * color_score
+                + 0.20 * artifact_score
+                + 0.20 * blur_score
+                + 0.15 * ssim_score
+                + 0.15 * (1.0 - lpips_score)  # LPIPS는 낮을수록 좋음
+            )
+        elif ssim_score is not None:
+            # SSIM만 사용 가능
+            quality_score = (
+                0.30 * color_score
+                + 0.25 * artifact_score
+                + 0.25 * blur_score
+                + 0.20 * ssim_score
+            )
+        elif lpips_score is not None:
+            # LPIPS만 사용 가능
+            quality_score = (
+                0.30 * color_score
+                + 0.25 * artifact_score
+                + 0.25 * blur_score
+                + 0.20 * (1.0 - lpips_score)
+            )
+        else:
+            # 기존 3개 메트릭만 사용
+            quality_score = (
+                0.40 * color_score
+                + 0.30 * artifact_score
+                + 0.30 * blur_score
+            )
+
+        score_entry = {
             "filename": img_path.name,
             "quality_score": round(float(quality_score), 4),
             "color_score": round(float(color_score), 4),
             "artifact_score": round(float(artifact_score), 4),
             "blur_score": round(float(blur_score), 4),
-        })
+        }
+        if ssim_score is not None:
+            score_entry["ssim_score"] = round(float(ssim_score), 4)
+        if lpips_score is not None:
+            score_entry["lpips_score"] = round(float(lpips_score), 4)
+
+        sample_scores.append(score_entry)
 
     if not sample_scores:
         return {
@@ -167,21 +249,145 @@ def _compute_generation_quality(
     avg_blur = np.mean([s["blur_score"] for s in sample_scores])
     quality_passed = float(avg_quality) >= quality_threshold
 
+    # SSIM 평균 (산출된 샘플만)
+    ssim_scores = [s["ssim_score"] for s in sample_scores if "ssim_score" in s]
+    avg_ssim = round(float(np.mean(ssim_scores)), 4) if ssim_scores else None
+
+    # LPIPS 평균 (산출된 샘플만)
+    lpips_scores = [s["lpips_score"] for s in sample_scores if "lpips_score" in s]
+    avg_lpips = round(float(np.mean(lpips_scores)), 4) if lpips_scores else None
+
     logger.info(f"  Quality evaluation: {len(sample_scores)} images")
     logger.info(f"    avg_quality={avg_quality:.4f}  (threshold={quality_threshold})")
     logger.info(f"    color={avg_color:.4f}  artifact={avg_artifact:.4f}  "
                 f"blur={avg_blur:.4f}")
+    if avg_ssim is not None:
+        logger.info(f"    ssim={avg_ssim:.4f}  ({len(ssim_scores)} samples)")
+    if avg_lpips is not None:
+        logger.info(f"    lpips={avg_lpips:.4f}  ({len(lpips_scores)} samples)")
     logger.info(f"    quality_passed={quality_passed}")
 
-    return {
+    result = {
         "avg_quality_score": round(float(avg_quality), 4),
         "quality_passed": quality_passed,
         "sample_scores": sample_scores,
         "avg_color_score": round(float(avg_color), 4),
         "avg_artifact_score": round(float(avg_artifact), 4),
         "avg_blur_score": round(float(avg_blur), 4),
+        "avg_ssim_score": avg_ssim,
+        "avg_lpips_score": avg_lpips,
         "num_evaluated": len(sample_scores),
+        "num_ssim_evaluated": len(ssim_scores),
+        "num_lpips_evaluated": len(lpips_scores),
     }
+    return result
+
+
+def _build_reference_map(output_dir: Path) -> Dict[str, Path]:
+    """생성 이미지에 대응하는 참조(원본) 이미지 경로 매핑을 구축합니다.
+
+    다음 위치에서 참조 이미지를 탐색:
+    1. comparisons/ 디렉토리의 *_source.png 파일
+    2. 파일명 패턴에서 base_id를 추출하여 sources/ 디렉토리에서 탐색
+    """
+    ref_map = {}
+
+    # 1. comparisons/ 디렉토리에서 source 이미지 탐색
+    comparisons_dir = output_dir / "comparisons"
+    if comparisons_dir.exists():
+        for comp_file in comparisons_dir.glob("*_comparison.png"):
+            # comparison 파일에서 base_id 추출
+            # 형식: {image_id}_class{N}_region{M}_comparison.png
+            base_name = comp_file.stem.replace("_comparison", "")
+            # 대응하는 생성 이미지명 패턴
+            for gen_pattern in [f"{base_name}_gen*.png",
+                                f"{base_name}_generated_*.png"]:
+                for gen_file in output_dir.glob(f"generated/{gen_pattern}"):
+                    ref_map[gen_file.name] = comp_file
+                for gen_file in output_dir.glob(gen_pattern):
+                    ref_map[gen_file.name] = comp_file
+
+    # 2. sources/ 디렉토리에서 원본 ROI 이미지 탐색
+    sources_dir = output_dir / "sources"
+    if sources_dir.exists():
+        for src_file in sources_dir.glob("*.png"):
+            base_name = src_file.stem
+            for gen_pattern in [f"{base_name}_gen*.png",
+                                f"{base_name}_generated_*.png"]:
+                for gen_file in output_dir.glob(f"generated/{gen_pattern}"):
+                    ref_map[gen_file.name] = src_file
+                for gen_file in output_dir.glob(gen_pattern):
+                    ref_map[gen_file.name] = src_file
+
+    if ref_map:
+        logger.info(f"  Reference images found: {len(ref_map)} mappings")
+    else:
+        logger.info("  No reference images found; SSIM/LPIPS will be skipped")
+
+    return ref_map
+
+
+def _compute_ssim(gen_gray: np.ndarray, ref_img: np.ndarray) -> float:
+    """두 이미지 간 SSIM(Structural Similarity Index)을 계산합니다.
+
+    Args:
+        gen_gray: 생성 이미지 (grayscale)
+        ref_img: 참조 이미지 (BGR)
+
+    Returns:
+        SSIM 값 (0.0~1.0, 높을수록 유사)
+    """
+    import cv2
+    from skimage.metrics import structural_similarity as ssim
+
+    ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY)
+
+    # 크기가 다르면 참조 이미지를 생성 이미지 크기로 리사이즈
+    if gen_gray.shape != ref_gray.shape:
+        ref_gray = cv2.resize(ref_gray, (gen_gray.shape[1], gen_gray.shape[0]))
+
+    score, _ = ssim(gen_gray, ref_gray, full=True)
+    return float(max(0.0, min(1.0, score)))
+
+
+def _compute_lpips(gen_img: np.ndarray, ref_img: np.ndarray,
+                   lpips_model) -> float:
+    """두 이미지 간 LPIPS(Learned Perceptual Similarity)를 계산합니다.
+
+    Args:
+        gen_img: 생성 이미지 (BGR, uint8)
+        ref_img: 참조 이미지 (BGR, uint8)
+        lpips_model: 초기화된 LPIPS 모델
+
+    Returns:
+        LPIPS 거리 (0.0~1.0, 낮을수록 유사)
+    """
+    import cv2
+    import torch
+
+    # 크기 맞추기
+    if gen_img.shape[:2] != ref_img.shape[:2]:
+        ref_img = cv2.resize(ref_img, (gen_img.shape[1], gen_img.shape[0]))
+
+    # BGR → RGB, [0,255] → [-1,1], HWC → CHW → NCHW
+    def _to_tensor(img_bgr):
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        t = torch.from_numpy(img_rgb).float() / 255.0  # [0,1]
+        t = t * 2.0 - 1.0  # [-1,1]
+        t = t.permute(2, 0, 1).unsqueeze(0)  # NCHW
+        return t
+
+    gen_t = _to_tensor(gen_img)
+    ref_t = _to_tensor(ref_img)
+
+    device = next(lpips_model.parameters()).device
+    gen_t = gen_t.to(device)
+    ref_t = ref_t.to(device)
+
+    with torch.no_grad():
+        distance = lpips_model(gen_t, ref_t)
+
+    return float(distance.item())
 
 
 def _score_color_consistency(img_rgb: np.ndarray) -> float:
@@ -282,17 +488,138 @@ def _score_sharpness(gray: np.ndarray) -> float:
     return float(score)
 
 
+def _create_oversampled_jsonl(
+    original_jsonl_path: str,
+    output_dir: Path,
+) -> Optional[Path]:
+    """소수 클래스를 오버샘플링한 JSONL을 생성합니다.
+
+    각 클래스의 샘플 수를 최다 클래스와 동일하게 맞춥니다.
+    오버샘플링 시 seed를 변경하여 다양성을 확보합니다.
+
+    Args:
+        original_jsonl_path: 원본 train.jsonl 경로
+        output_dir: 오버샘플링된 JSONL 저장 디렉토리
+
+    Returns:
+        생성된 오버샘플링 JSONL 경로, 실패 시 None
+    """
+    import re
+
+    original_path = Path(original_jsonl_path)
+    if not original_path.exists():
+        logger.warning(f"Original JSONL not found: {original_jsonl_path}")
+        return None
+
+    # 원본 JSONL 로드
+    samples = []
+    with open(original_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                samples.append(json.loads(line))
+
+    if not samples:
+        return None
+
+    # 클래스별 분류 (hint 경로에서 class 정보 추출)
+    class_pattern = re.compile(r"class(\d+)")
+    samples_by_class = {}
+
+    for sample in samples:
+        hint = sample.get("hint", "")
+        prompt = sample.get("prompt", "")
+        # hint 파일명 또는 prompt에서 class 추출
+        match = class_pattern.search(hint) or class_pattern.search(prompt)
+        class_id = int(match.group(1)) if match else 0
+
+        if class_id not in samples_by_class:
+            samples_by_class[class_id] = []
+        samples_by_class[class_id].append(sample)
+
+    # 분포 로깅
+    logger.info("  Original class distribution:")
+    for cls in sorted(samples_by_class.keys()):
+        logger.info(f"    Class {cls}: {len(samples_by_class[cls])} samples")
+
+    if len(samples_by_class) <= 1:
+        logger.info("  Only one class found, skipping oversampling")
+        return None
+
+    # 최다 클래스 샘플 수
+    max_count = max(len(v) for v in samples_by_class.values())
+
+    # 오버샘플링
+    oversampled = []
+    for cls in sorted(samples_by_class.keys()):
+        cls_samples = samples_by_class[cls]
+        oversampled.extend(cls_samples)  # 원본 그대로 추가
+
+        # 부족한 수만큼 반복 추가 (seed_offset으로 다양성 확보)
+        deficit = max_count - len(cls_samples)
+        if deficit > 0:
+            logger.info(
+                f"    Oversampling Class {cls}: "
+                f"{len(cls_samples)} → {max_count} (+{deficit})"
+            )
+            for i in range(deficit):
+                # 원본 샘플을 순환 선택하고 seed_offset 표시
+                src = cls_samples[i % len(cls_samples)].copy()
+                src["_oversample_seed_offset"] = (i + 1) * 100
+                oversampled.append(src)
+
+    # 오버샘플링된 JSONL 저장
+    output_dir.mkdir(parents=True, exist_ok=True)
+    oversampled_path = output_dir / "train_oversampled.jsonl"
+    with open(oversampled_path, "w", encoding="utf-8") as f:
+        for sample in oversampled:
+            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+
+    logger.info(f"  Oversampled JSONL: {len(samples)} → {len(oversampled)} samples")
+    logger.info(f"  Saved to: {oversampled_path}")
+
+    # 오버샘플링 후 분포 확인
+    logger.info("  Oversampled class distribution:")
+    new_by_class = {}
+    for sample in oversampled:
+        hint = sample.get("hint", "")
+        prompt = sample.get("prompt", "")
+        match = class_pattern.search(hint) or class_pattern.search(prompt)
+        class_id = int(match.group(1)) if match else 0
+        new_by_class[class_id] = new_by_class.get(class_id, 0) + 1
+    for cls in sorted(new_by_class.keys()):
+        logger.info(f"    Class {cls}: {new_by_class[cls]} samples")
+
+    return oversampled_path
+
+
 # =============================================================================
 # Phase 1: 기본 생성 검증
 # =============================================================================
 
 def run_phase1(args):
-    """Phase 1: 학습 데이터로 기본 생성 검증"""
+    """Phase 1: 학습 데이터로 기본 생성 검증
+
+    --oversample_minority가 활성화된 경우, Class 3/4 등 소수 클래스의
+    샘플을 seed 변경을 통해 오버샘플링하여 클래스 균형을 맞춥니다.
+    """
     logger.info("=" * 60)
     logger.info("  Phase 1: Basic Generation Validation")
     logger.info("=" * 60)
 
     output_dir = Path(args.output_base) / "phase1_basic"
+
+    # 클래스 불균형 오버샘플링 처리
+    jsonl_path = args.jsonl_path
+    oversample = getattr(args, "oversample_minority", False)
+
+    if oversample:
+        oversampled_path = _create_oversampled_jsonl(
+            jsonl_path, output_dir
+        )
+        if oversampled_path:
+            jsonl_path = str(oversampled_path)
+            logger.info(f"  Using oversampled JSONL: {jsonl_path}")
 
     cmd = [
         sys.executable, str(args.script_dir / "test_controlnet.py"),
@@ -302,7 +629,7 @@ def run_phase1(args):
     cmd += _model_source_args(args)
 
     cmd += [
-        "--jsonl_path", args.jsonl_path,
+        "--jsonl_path", jsonl_path,
         "--output_dir", str(output_dir),
         "--num_inference_steps", "30",
         "--guidance_scale", "7.5",
@@ -487,6 +814,50 @@ def run_phase2(args):
                 "output_dir": str(output_dir),
             })
 
+    # Phase 2 결과에 대해 정량적 품질 평가 수행
+    logger.info("--- Phase 2 Quality Evaluation ---")
+    quality_threshold = getattr(args, "quality_threshold", 0.5)
+    for entry in phase2_results:
+        entry_output_dir = Path(entry["output_dir"])
+        if entry_output_dir.exists():
+            quality_result = _compute_generation_quality(
+                entry_output_dir, quality_threshold
+            )
+            entry["quality"] = {
+                "avg_quality_score": quality_result.get("avg_quality_score"),
+                "avg_color_score": quality_result.get("avg_color_score"),
+                "avg_artifact_score": quality_result.get("avg_artifact_score"),
+                "avg_blur_score": quality_result.get("avg_blur_score"),
+                "avg_ssim_score": quality_result.get("avg_ssim_score"),
+                "avg_lpips_score": quality_result.get("avg_lpips_score"),
+                "num_evaluated": quality_result.get("num_evaluated", 0),
+                "quality_passed": quality_result.get("quality_passed"),
+            }
+            logger.info(
+                f"  {entry['param']}={entry['value']}: "
+                f"quality={quality_result.get('avg_quality_score', -1):.4f}"
+            )
+
+    # 최적 파라미터 조합 결정
+    best_result = None
+    best_score = -1.0
+    for entry in phase2_results:
+        q = entry.get("quality", {})
+        score = q.get("avg_quality_score", -1.0)
+        if score is not None and score > best_score:
+            best_score = score
+            best_result = entry
+
+    best_params = None
+    if best_result is not None:
+        best_params = {
+            "param": best_result["param"],
+            "value": best_result["value"],
+            "quality_score": best_score,
+        }
+        logger.info(f"  Best combination: {best_params['param']}="
+                     f"{best_params['value']} (score={best_score:.4f})")
+
     # Phase 2 결과 요약 저장
     summary_path = Path(args.output_base) / "phase2_summary.json"
     with open(summary_path, "w") as f:
@@ -495,6 +866,7 @@ def run_phase2(args):
             "inference_steps_tested": PHASE2_INFERENCE_STEPS,
             "seeds_tested": PHASE2_SEEDS,
             "results": phase2_results,
+            "best_combination": best_params,
         }, f, indent=2)
 
     logger.info(f"Phase 2 complete: {len(phase2_results)} parameter combinations tested")
@@ -887,6 +1259,17 @@ def run_phase4(args):
     # 4-3. Phase 2 파라미터별 비교 그리드
     _create_phase2_comparison_grid(args.output_base, output_dir)
 
+    # 4-4. v1 vs v4 생성 이미지 비교 (v1 결과 디렉토리가 지정된 경우)
+    v1_output_dir = getattr(args, "v1_output_dir", None)
+    if v1_output_dir and Path(v1_output_dir).exists():
+        _compare_v1_v4_generations(
+            v1_dir=Path(v1_output_dir),
+            v4_dir=Path(args.output_base),
+            report_dir=output_dir,
+        )
+    else:
+        logger.info("  v1 output dir not specified, skipping v1/v4 comparison")
+
     logger.info(f"Phase 4 complete: reports saved to {output_dir}")
     return success
 
@@ -1043,6 +1426,12 @@ def _generate_summary_report(output_base: str, report_dir: Path):
             report_lines.append(f"    Color Consistency: {q1['avg_color_score']:.4f}")
             report_lines.append(f"    Artifact Score: {q1['avg_artifact_score']:.4f}")
             report_lines.append(f"    Sharpness Score: {q1['avg_blur_score']:.4f}")
+            if q1.get("avg_ssim_score") is not None:
+                report_lines.append(f"    SSIM Score: {q1['avg_ssim_score']:.4f}"
+                                    f"  ({q1.get('num_ssim_evaluated', 0)} samples)")
+            if q1.get("avg_lpips_score") is not None:
+                report_lines.append(f"    LPIPS Score: {q1['avg_lpips_score']:.4f}"
+                                    f"  ({q1.get('num_lpips_evaluated', 0)} samples)")
             report_lines.append(f"    Images Evaluated: {q1['num_evaluated']}")
             q_status = "PASS" if q1["quality_passed"] else "FAIL"
             report_lines.append(f"  Quality Status: {q_status}")
@@ -1069,6 +1458,32 @@ def _generate_summary_report(output_base: str, report_dir: Path):
         report_lines.append(f"  Inference steps: {p2.get('inference_steps_tested', [])}")
         report_lines.append(f"  Seeds: {p2.get('seeds_tested', [])}")
         report_lines.append(f"  Combinations tested: {len(p2.get('results', []))}")
+
+        # 파라미터별 품질 점수 표시
+        results_with_quality = [
+            r for r in p2.get("results", [])
+            if r.get("quality", {}).get("num_evaluated", 0) > 0
+        ]
+        if results_with_quality:
+            report_lines.append("  Quality Scores by Parameter:")
+            for r in results_with_quality:
+                q = r["quality"]
+                score_str = f"{q['avg_quality_score']:.4f}"
+                ssim_str = (f"  SSIM={q['avg_ssim_score']:.4f}"
+                            if q.get('avg_ssim_score') is not None else "")
+                lpips_str = (f"  LPIPS={q['avg_lpips_score']:.4f}"
+                             if q.get('avg_lpips_score') is not None else "")
+                report_lines.append(
+                    f"    {r['param']}={r['value']}: "
+                    f"quality={score_str}{ssim_str}{lpips_str}"
+                )
+
+        # 최적 조합 표시
+        best = p2.get("best_combination")
+        if best:
+            report_lines.append(f"  Best: {best['param']}={best['value']} "
+                                f"(score={best['quality_score']:.4f})")
+
         report_lines.append("")
     else:
         report_lines.append("Phase 2: Not executed")
@@ -1090,6 +1505,12 @@ def _generate_summary_report(output_base: str, report_dir: Path):
             report_lines.append(f"    Color Consistency: {q3['avg_color_score']:.4f}")
             report_lines.append(f"    Artifact Score: {q3['avg_artifact_score']:.4f}")
             report_lines.append(f"    Sharpness Score: {q3['avg_blur_score']:.4f}")
+            if q3.get("avg_ssim_score") is not None:
+                report_lines.append(f"    SSIM Score: {q3['avg_ssim_score']:.4f}"
+                                    f"  ({q3.get('num_ssim_evaluated', 0)} samples)")
+            if q3.get("avg_lpips_score") is not None:
+                report_lines.append(f"    LPIPS Score: {q3['avg_lpips_score']:.4f}"
+                                    f"  ({q3.get('num_lpips_evaluated', 0)} samples)")
             report_lines.append(f"    Images Evaluated: {q3['num_evaluated']}")
             q_status = "PASS" if q3["quality_passed"] else "FAIL"
             report_lines.append(f"  Quality Status: {q_status}")
@@ -1186,6 +1607,207 @@ def _create_phase2_comparison_grid(output_base: str, report_dir: Path):
     grid_path = report_dir / "phase2_parameter_comparison.png"
     grid.save(grid_path)
     logger.info(f"  Phase 2 comparison grid saved: {grid_path}")
+
+
+def _compare_v1_v4_generations(
+    v1_dir: Path,
+    v4_dir: Path,
+    report_dir: Path,
+):
+    """v1과 v4 모델의 생성 결과를 시각적/정량적으로 비교합니다.
+
+    동일한 ROI(hint)에 대해 v1, v4 각각의 생성 이미지를 나란히 비교하고,
+    SSIM/품질 메트릭 차이를 리포트합니다.
+
+    Args:
+        v1_dir: v1 모델 검증 결과 디렉토리 (phase1_basic/generated/ 포함)
+        v4_dir: v4 모델 검증 결과 base 디렉토리
+        report_dir: 비교 결과 저장 디렉토리
+    """
+    try:
+        import cv2
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        logger.warning("cv2/PIL not available, skipping v1/v4 comparison")
+        return
+
+    # v1, v4 생성 이미지 수집
+    v1_generated = {}
+    v4_generated = {}
+
+    # v1 이미지 수집
+    for pattern in ["phase1_basic/generated/*.png", "generated/*.png", "*.png"]:
+        for img_path in v1_dir.glob(pattern):
+            # base_id 추출 (예: d84ad849e_class1_region1)
+            base_id = _extract_base_id(img_path.stem)
+            if base_id and base_id not in v1_generated:
+                v1_generated[base_id] = img_path
+
+    # v4 이미지 수집
+    v4_base = Path(v4_dir)
+    for pattern in ["phase1_basic/generated/*.png", "generated/*.png"]:
+        for img_path in v4_base.glob(pattern):
+            base_id = _extract_base_id(img_path.stem)
+            if base_id and base_id not in v4_generated:
+                v4_generated[base_id] = img_path
+
+    # 공통 base_id 찾기
+    common_ids = set(v1_generated.keys()) & set(v4_generated.keys())
+    logger.info(f"  v1/v4 comparison: {len(common_ids)} common ROIs found")
+    logger.info(f"    v1: {len(v1_generated)} images, v4: {len(v4_generated)} images")
+
+    if not common_ids:
+        logger.info("  No matching images for v1/v4 comparison")
+        return
+
+    # 비교 결과 생성
+    comparison_results = []
+
+    for base_id in sorted(common_ids):
+        v1_img = cv2.imread(str(v1_generated[base_id]))
+        v4_img = cv2.imread(str(v4_generated[base_id]))
+
+        if v1_img is None or v4_img is None:
+            continue
+
+        # 크기 맞추기
+        if v1_img.shape[:2] != v4_img.shape[:2]:
+            v1_img = cv2.resize(
+                v1_img, (v4_img.shape[1], v4_img.shape[0])
+            )
+
+        v1_gray = cv2.cvtColor(v1_img, cv2.COLOR_BGR2GRAY)
+        v4_gray = cv2.cvtColor(v4_img, cv2.COLOR_BGR2GRAY)
+
+        # 품질 비교
+        v1_color = _score_color_consistency(
+            cv2.cvtColor(v1_img, cv2.COLOR_BGR2RGB)
+        )
+        v4_color = _score_color_consistency(
+            cv2.cvtColor(v4_img, cv2.COLOR_BGR2RGB)
+        )
+        v1_artifact = _score_artifacts(v1_gray)
+        v4_artifact = _score_artifacts(v4_gray)
+        v1_blur = _score_sharpness(v1_gray)
+        v4_blur = _score_sharpness(v4_gray)
+
+        # RGB 채널 간 편차 비교 (grayscale 개선 효과 측정)
+        v1_rgb_std = float(np.std(np.std(v1_img.astype(float), axis=2)))
+        v4_rgb_std = float(np.std(np.std(v4_img.astype(float), axis=2)))
+
+        comparison_results.append({
+            "base_id": base_id,
+            "v1_color": round(v1_color, 4),
+            "v4_color": round(v4_color, 4),
+            "v1_artifact": round(v1_artifact, 4),
+            "v4_artifact": round(v4_artifact, 4),
+            "v1_blur": round(v1_blur, 4),
+            "v4_blur": round(v4_blur, 4),
+            "v1_rgb_std": round(v1_rgb_std, 4),
+            "v4_rgb_std": round(v4_rgb_std, 4),
+        })
+
+    if not comparison_results:
+        return
+
+    # 통계 요약
+    summary = {
+        "num_compared": len(comparison_results),
+        "avg_v1_color": round(np.mean([r["v1_color"] for r in comparison_results]), 4),
+        "avg_v4_color": round(np.mean([r["v4_color"] for r in comparison_results]), 4),
+        "avg_v1_artifact": round(np.mean([r["v1_artifact"] for r in comparison_results]), 4),
+        "avg_v4_artifact": round(np.mean([r["v4_artifact"] for r in comparison_results]), 4),
+        "avg_v1_blur": round(np.mean([r["v1_blur"] for r in comparison_results]), 4),
+        "avg_v4_blur": round(np.mean([r["v4_blur"] for r in comparison_results]), 4),
+        "avg_v1_rgb_std": round(np.mean([r["v1_rgb_std"] for r in comparison_results]), 4),
+        "avg_v4_rgb_std": round(np.mean([r["v4_rgb_std"] for r in comparison_results]), 4),
+        "details": comparison_results,
+    }
+
+    # JSON 저장
+    comparison_path = report_dir / "v1_v4_comparison.json"
+    with open(comparison_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    logger.info(f"  v1/v4 comparison saved: {comparison_path}")
+
+    # 비교 이미지 그리드 생성 (최대 8개)
+    grid_count = min(8, len(common_ids))
+    grid_ids = sorted(common_ids)[:grid_count]
+
+    try:
+        imgs_v1 = []
+        imgs_v4 = []
+        for bid in grid_ids:
+            img1 = Image.open(v1_generated[bid]).convert("RGB")
+            img4 = Image.open(v4_generated[bid]).convert("RGB")
+            imgs_v1.append(img1)
+            imgs_v4.append(img4)
+
+        if imgs_v1:
+            target_h = min(min(i.height for i in imgs_v1),
+                           min(i.height for i in imgs_v4))
+            target_w = min(min(i.width for i in imgs_v1),
+                           min(i.width for i in imgs_v4))
+
+            label_h = 30
+            n = len(imgs_v1)
+            grid_w = target_w * n
+            grid_h = (target_h + label_h) * 2  # v1 위, v4 아래
+
+            grid = Image.new("RGB", (grid_w, grid_h), (255, 255, 255))
+            draw = ImageDraw.Draw(grid)
+            try:
+                font = ImageFont.truetype("arial.ttf", 12)
+            except (IOError, OSError):
+                font = ImageFont.load_default()
+
+            for i, (img1, img4, bid) in enumerate(
+                zip(imgs_v1, imgs_v4, grid_ids)
+            ):
+                x = i * target_w
+
+                # v1 (상단)
+                r1 = img1.resize((target_w, target_h), Image.LANCZOS)
+                grid.paste(r1, (x, label_h))
+                draw.text((x + 2, 2), f"v1: {bid[:12]}", fill=(0, 0, 255),
+                          font=font)
+
+                # v4 (하단)
+                r4 = img4.resize((target_w, target_h), Image.LANCZOS)
+                grid.paste(r4, (x, target_h + label_h * 2))
+                draw.text((x + 2, target_h + label_h + 2),
+                          f"v4: {bid[:12]}", fill=(255, 0, 0), font=font)
+
+            grid_path = report_dir / "v1_v4_comparison_grid.png"
+            grid.save(grid_path)
+            logger.info(f"  v1/v4 comparison grid saved: {grid_path}")
+    except Exception as e:
+        logger.warning(f"  v1/v4 grid creation failed: {e}")
+
+    # 로그 출력
+    logger.info(f"  v1/v4 Comparison Summary ({summary['num_compared']} images):")
+    logger.info(f"    Color:    v1={summary['avg_v1_color']:.4f}  "
+                f"v4={summary['avg_v4_color']:.4f}")
+    logger.info(f"    Artifact: v1={summary['avg_v1_artifact']:.4f}  "
+                f"v4={summary['avg_v4_artifact']:.4f}")
+    logger.info(f"    Blur:     v1={summary['avg_v1_blur']:.4f}  "
+                f"v4={summary['avg_v4_blur']:.4f}")
+    logger.info(f"    RGB Std:  v1={summary['avg_v1_rgb_std']:.4f}  "
+                f"v4={summary['avg_v4_rgb_std']:.4f}  "
+                f"(lower = more grayscale)")
+
+
+def _extract_base_id(stem: str) -> Optional[str]:
+    """파일명 stem에서 base_id를 추출합니다.
+
+    예: 'd84ad849e_class1_region1_gen0' → 'd84ad849e_class1_region1'
+        '8f8a23f39.jpg_class1_region1_gen0' → '8f8a23f39.jpg_class1_region1'
+    """
+    import re
+    # _gen{N}, _generated_{N} 패턴 제거
+    cleaned = re.sub(r"_gen\d+$", "", stem)
+    cleaned = re.sub(r"_generated_\d+$", "", cleaned)
+    return cleaned if cleaned else None
 
 
 # =============================================================================
@@ -1320,6 +1942,22 @@ def parse_args():
         help="ControlNet conditioning scale for inference (0.0~1.0). "
              "v3부터 기본값 0.7 적용 (v2의 1.0에서 neon/rainbow 패턴 발생). "
              "Passed through to test_controlnet.py.",
+    )
+
+    # Class imbalance
+    parser.add_argument(
+        "--oversample_minority", action="store_true", default=False,
+        help="Phase 1에서 소수 클래스(Class 3/4)를 오버샘플링하여 "
+             "클래스 균형을 맞춘 JSONL을 생성합니다. "
+             "seed 변경을 통해 다양성을 확보합니다.",
+    )
+
+    # v1 vs v4 comparison
+    parser.add_argument(
+        "--v1_output_dir", type=str, default=None,
+        help="v1 모델 검증 결과 디렉토리. Phase 4에서 v1 vs v4 "
+             "생성 이미지 비교를 수행합니다. "
+             "예: /content/drive/.../test_results_v1",
     )
 
     args = parser.parse_args()
