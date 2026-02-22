@@ -1,0 +1,151 @@
+20260223 작업 일지 #1 - 벤치마크 실행 준비 (버그 수정 및 Colab 최적화)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+작업 일지 #3(20260221_3)에서 구현한 벤치마크 실험 코드를 Colab에서 실행하기
+위한 사전 준비 작업을 수행한다.
+
+  - 코드 정적 분석 중 발견된 버그 3건 수정
+  - Colab T4 GPU 환경에 맞춘 설정 조정
+  - Baseline-only 실행 전략 수립 (CASDA 데이터 미생성 상태)
+  - 실행 명령어 준비
+
+
+2. 변경 파일
+================================================================================
+
+  | 파일                              | 상태 | 변경 내용                                      |
+  |-----------------------------------|------|-------------------------------------------------|
+  | scripts/run_benchmark.py          | 수정 | 버그 3건 수정 (typing import, FID skip, --epochs)|
+  | configs/benchmark_experiment.yaml | 수정 | num_workers 4→2 (Colab 호환)                    |
+
+
+3. 버그 수정 상세
+================================================================================
+
+3.1 typing import 위치 오류 (Critical)
+---------------------------------------
+  위치: scripts/run_benchmark.py
+  증상: `from typing import Dict`가 파일 489번 줄(하단)에 위치
+  영향: create_model() 함수 시그니처에서 `Dict` 타입 힌트 사용 →
+        모듈 로드 시 NameError 발생 (Dict가 아직 import되지 않은 상태)
+  수정: 36번 줄(상단 import 블록)으로 이동
+
+  변경 전:
+    # (파일 489번 줄 부근)
+    from typing import Dict
+
+  변경 후:
+    # (파일 36번 줄, import 블록 최하단)
+    from typing import Dict
+
+
+3.2 FID 무조건 실행 오류 (Medium)
+----------------------------------
+  위치: scripts/run_benchmark.py, 431~439번 줄
+  증상: FID 평가가 --groups 필터링과 무관하게 항상 실행됨
+  영향: baseline_raw/baseline_trad만 실행할 때도 InceptionV3 로드 시도,
+        CASDA 디렉토리가 존재하지 않으면 FileNotFoundError 발생
+  수정: CASDA 그룹 포함 여부를 확인하는 조건문 추가
+
+  변경 후 로직 (431~439번 줄):
+    casda_groups = {'casda_full', 'casda_pruning'}
+    has_casda = any(g in casda_groups for g in group_keys)
+
+    if args.fid_only or (has_casda and config...fid.compute):
+        fid_results = run_fid_evaluation(...)
+    elif not has_casda:
+        logging.info("Skipping FID evaluation (no CASDA groups selected)")
+
+
+3.3 --epochs CLI 옵션 누락 (Low)
+----------------------------------
+  위치: scripts/run_benchmark.py, 363~380번 줄
+  증상: 벤치마크 테스트 실행 시 YAML config의 epochs(100)를 수동 편집해야 함
+  영향: 빠른 검증(10 epochs)을 위해 매번 YAML 수정 → 원본 값 복구 필요
+  수정: `--epochs N` 옵션 추가, 지정 시 모든 모델의 epochs를 오버라이드
+
+  추가 코드 (363~364번 줄):
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Override epochs for all models (for quick testing)')
+
+  적용 로직 (376~380번 줄):
+    if args.epochs is not None:
+        for model_key in config.get('models', {}):
+            config['models'][model_key]['training']['epochs'] = args.epochs
+        print(f"[INFO] Epochs overridden to {args.epochs} for all models")
+
+
+4. 설정 변경
+================================================================================
+
+4.1 Colab num_workers 조정
+---------------------------
+  파일: configs/benchmark_experiment.yaml, 9번 줄
+  변경: num_workers: 4 → 2
+  근거: Colab T4 인스턴스는 vCPU 2개 제공, num_workers > 2는
+        프로세스 경합으로 인한 성능 저하 또는 메모리 오류 발생 가능
+
+
+5. 기타 발견 사항 (미수정)
+================================================================================
+
+5.1 CASDASyntheticDataset idx 미전달 (Low Priority)
+----------------------------------------------------
+  위치: src/training/dataset.py
+  증상: _get_detection_item()과 _get_segmentation_item() 내부에서
+        fallback 경로에 `idx` 변수를 사용하나, 메서드 매개변수로 전달되지 않음
+  영향: 실제 도달 가능성 낮음 (try-except의 except 블록 내부)
+  판단: CASDA 데이터 생성 후 해당 경로 테스트 시 수정 예정
+
+5.2 train.csv 포맷 호환성 확인
+-------------------------------
+  실제 데이터: ImageId, ClassId 칼럼이 분리되어 있음 (ImageId_ClassId 결합 아님)
+  코드 대응: dataset.py에서 두 가지 포맷을 조건문으로 분기 처리 → 호환 OK
+
+
+6. Colab 실행 계획
+================================================================================
+
+6.1 심볼릭 링크 설정
+--------------------
+  Severstal 데이터가 Google Drive에 위치하므로, 프로젝트 루트에 심볼릭 링크 생성.
+  YAML config의 상대 경로(train_images, train.csv)를 수정하지 않고 사용.
+
+    cd /content/severstal-steel-defect-detection
+    ln -sf /content/drive/MyDrive/data/Severstal/train_images train_images
+    ln -sf /content/drive/MyDrive/data/Severstal/train.csv train.csv
+
+6.2 테스트 실행 (YOLO-MFD, 10 epochs)
+---------------------------------------
+  단일 모델 × 단일 그룹으로 파이프라인 전체 동작 검증.
+
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --models yolo_mfd \
+        --groups baseline_raw \
+        --epochs 10
+
+  확인 항목:
+    - CSV 파싱 및 데이터 로드 정상 여부
+    - 모델 생성 및 GPU 메모리 적합성
+    - 학습 루프 (train → validate → checkpoint)
+    - 메트릭 계산 (mAP@0.5)
+    - 결과 저장 (JSON, 로그)
+
+6.3 전체 Baseline 실행 (3 models × 2 groups, 100 epochs)
+---------------------------------------------------------
+  테스트 통과 후 baseline_raw + baseline_trad 그룹에 대해 전체 실행.
+
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups baseline_raw baseline_trad
+
+  예상 소요: T4 GPU 기준 모델당 약 30~60분 × 6 runs = 3~6시간
+
+
+7. 문법 검증
+================================================================================
+  ast.parse(scripts/run_benchmark.py)               → OK
+  yaml.safe_load(configs/benchmark_experiment.yaml)  → OK

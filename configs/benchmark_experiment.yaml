@@ -6,7 +6,7 @@
 experiment:
   name: "casda_benchmark_v1"
   seed: 42
-  num_workers: 4
+  num_workers: 2
   device: "cuda"
   output_dir: "outputs/benchmark_results"
   log_dir: "outputs/benchmark_logs"

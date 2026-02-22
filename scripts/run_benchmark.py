@@ -33,6 +33,7 @@ import torch
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+from typing import Dict
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -359,6 +360,8 @@ Examples:
                         help='Random seed (overrides config)')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Output directory (overrides config)')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Override epochs for all models (for quick testing)')
     args = parser.parse_args()
 
     # Load config
@@ -369,6 +372,12 @@ Examples:
 
     with open(config_path) as f:
         config = yaml.safe_load(f)
+
+    # Override epochs if specified (for quick testing)
+    if args.epochs is not None:
+        for model_key in config.get('models', {}):
+            config['models'][model_key]['training']['epochs'] = args.epochs
+        print(f"[INFO] Epochs overridden to {args.epochs} for all models")
 
     # Setup
     seed = args.seed or config['experiment'].get('seed', 42)
@@ -420,8 +429,14 @@ Examples:
     reporter = BenchmarkReporter(str(experiment_dir))
 
     # ====== FID Evaluation ======
-    if args.fid_only or config.get('evaluation', {}).get('fid', {}).get('compute', True):
+    # FID는 CASDA 합성 이미지가 있을 때만 의미 있음
+    casda_groups = {'casda_full', 'casda_pruning'}
+    has_casda = any(g in casda_groups for g in group_keys)
+
+    if args.fid_only or (has_casda and config.get('evaluation', {}).get('fid', {}).get('compute', True)):
         fid_results = run_fid_evaluation(config, experiment_dir, device)
+    elif not has_casda:
+        logging.info("Skipping FID evaluation (no CASDA groups selected)")
 
     if args.fid_only:
         logging.info("FID-only mode complete.")
@@ -484,9 +499,6 @@ Examples:
     logging.info(f"\nAll results saved to: {experiment_dir}")
     logging.info("Benchmark experiment complete!")
 
-
-# Type hint import for function signature
-from typing import Dict
 
 if __name__ == "__main__":
     main()
