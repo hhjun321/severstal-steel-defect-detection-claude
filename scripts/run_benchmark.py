@@ -20,6 +20,7 @@ Usage:
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --models yolo_mfd eb_yolov8
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --groups baseline_raw casda_pruning
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --fid-only
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume outputs/benchmark_results/20260223_143000
 """
 
 import os
@@ -33,7 +34,7 @@ import torch
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Dict
+# Note: use built-in dict (Python 3.9+) instead of typing.Dict
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -56,7 +57,7 @@ from src.training.metrics import (
 # Model Factory
 # ============================================================================
 
-def create_model(model_key: str, model_config: Dict, num_classes: int = 4):
+def create_model(model_key: str, model_config: dict, num_classes: int = 4):
     """
     Create a benchmark model from config.
     
@@ -90,10 +91,11 @@ def create_model(model_key: str, model_config: Dict, num_classes: int = 4):
 def run_single_experiment(
     model_key: str,
     dataset_group: str,
-    config: Dict,
+    config: dict,
     experiment_dir: Path,
     device: str = 'cuda',
-) -> Dict:
+    resume: bool = False,
+) -> dict:
     """
     Run a single training experiment.
     
@@ -103,6 +105,7 @@ def run_single_experiment(
         config: Full experiment config
         experiment_dir: Output directory for this run
         device: Training device
+        resume: If True, skip training when completed checkpoint exists
     
     Returns:
         Test metrics dict
@@ -113,14 +116,38 @@ def run_single_experiment(
     group_name = config['dataset_groups'][dataset_group]['name']
     num_classes = config['dataset']['num_classes']
 
-    logging.info(f"\n{'#'*70}")
-    logging.info(f"# Experiment: {model_name} + {group_name}")
-    logging.info(f"# Type: {model_type}")
-    logging.info(f"{'#'*70}")
-
     # Create output directory
     run_dir = experiment_dir / f"{model_key}_{dataset_group}"
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Resume: check if this run is already completed ----
+    checkpoint_dir = run_dir / "checkpoints"
+    best_path = checkpoint_dir / f"{model_key}_{dataset_group}_best.pth"
+    meta_path = run_dir / "experiment_meta.json"
+
+    if resume and best_path.exists() and meta_path.exists():
+        logging.info(f"\n{'#'*70}")
+        logging.info(f"# SKIP (completed): {model_name} + {group_name}")
+        logging.info(f"# Loading existing results from: {meta_path}")
+        logging.info(f"{'#'*70}")
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+        return meta.get('test_metrics', {})
+
+    # ---- Resume: check if training was interrupted (latest.pth exists, no best.pth or incomplete) ----
+    latest_path = checkpoint_dir / f"{model_key}_{dataset_group}_latest.pth"
+    resume_checkpoint = None
+    if resume and latest_path.exists() and not best_path.exists():
+        logging.info(f"Found interrupted checkpoint: {latest_path}")
+        resume_checkpoint = str(latest_path)
+
+    logging.info(f"\n{'#'*70}")
+    logging.info(f"# Experiment: {model_name} + {group_name}")
+    logging.info(f"# Type: {model_type}")
+    if resume_checkpoint:
+        logging.info(f"# Resuming from: {resume_checkpoint}")
+    logging.info(f"{'#'*70}")
 
     # Create model
     model = create_model(model_key, model_config, num_classes)
@@ -159,6 +186,7 @@ def run_single_experiment(
         config=training_config,
         output_dir=str(run_dir),
         device=device,
+        resume_from=resume_checkpoint,
     )
 
     # Train and evaluate
@@ -186,12 +214,12 @@ def run_single_experiment(
 # FID Evaluation
 # ============================================================================
 
-def run_fid_evaluation(config: Dict, experiment_dir: Path, device: str = 'cuda') -> Dict:
+def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda') -> dict:
     """
     Compute FID scores between real and CASDA-generated images.
     
     Returns:
-        Dict with overall and per-class FID scores
+        dict with overall and per-class FID scores
     """
     logging.info(f"\n{'#'*70}")
     logging.info(f"# FID Score Evaluation")
@@ -248,7 +276,7 @@ def run_fid_evaluation(config: Dict, experiment_dir: Path, device: str = 'cuda')
 # Hypothesis Testing
 # ============================================================================
 
-def run_hypothesis_tests(reporter: BenchmarkReporter, config: Dict) -> Dict:
+def run_hypothesis_tests(reporter: BenchmarkReporter, config: dict) -> dict:
     """
     Evaluate the 5 hypotheses defined in experiment.md.
     """
@@ -344,6 +372,9 @@ Examples:
 
   # Use CPU instead of GPU
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --device cpu
+
+  # Resume: add CASDA runs to existing baseline experiment (skips completed runs)
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume outputs/benchmark_results/20260223_143000
         """,
     )
     parser.add_argument('--config', type=str, default='configs/benchmark_experiment.yaml',
@@ -360,6 +391,10 @@ Examples:
                         help='Random seed (overrides config)')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Output directory (overrides config)')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from existing experiment directory. '
+                             'Skips already-completed runs (those with best.pth). '
+                             'Example: --resume outputs/benchmark_results/20260223_143000')
     parser.add_argument('--epochs', type=int, default=None,
                         help='Override epochs for all models (for quick testing)')
     args = parser.parse_args()
@@ -391,10 +426,18 @@ Examples:
         logging.warning("CUDA not available, falling back to CPU")
         device = 'cpu'
 
-    output_dir = Path(args.output_dir or config['experiment'].get('output_dir', 'outputs/benchmark_results'))
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    experiment_dir = output_dir / timestamp
-    experiment_dir.mkdir(parents=True, exist_ok=True)
+    # Determine experiment directory
+    if args.resume:
+        experiment_dir = Path(args.resume)
+        if not experiment_dir.exists():
+            print(f"Error: Resume directory not found: {experiment_dir}")
+            sys.exit(1)
+        print(f"[INFO] Resuming experiment from: {experiment_dir}")
+    else:
+        output_dir = Path(args.output_dir or config['experiment'].get('output_dir', 'outputs/benchmark_results'))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        experiment_dir = output_dir / timestamp
+        experiment_dir.mkdir(parents=True, exist_ok=True)
 
     # Setup logging
     log_path = experiment_dir / "benchmark.log"
@@ -461,6 +504,7 @@ Examples:
                     config=config,
                     experiment_dir=experiment_dir,
                     device=device,
+                    resume=bool(args.resume),
                 )
 
                 model_name = config['models'][model_key]['name']

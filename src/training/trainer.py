@@ -86,6 +86,7 @@ class BenchmarkTrainer:
         config: Dict,
         output_dir: str,
         device: str = 'cuda',
+        resume_from: Optional[str] = None,
     ):
         self.model = model.to(device)
         self.model_name = model_name
@@ -180,6 +181,33 @@ class BenchmarkTrainer:
             'best_epoch': 0,
             'best_metric': 0.0,
         }
+
+        # Resume from checkpoint if specified
+        self.start_epoch = 0
+        if resume_from and os.path.exists(resume_from):
+            self._load_checkpoint(resume_from)
+
+    def _load_checkpoint(self, checkpoint_path: str):
+        """Load checkpoint to resume training."""
+        logger.info(f"Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.start_epoch = checkpoint.get('epoch', 0) + 1
+
+        # Restore history
+        saved_history = checkpoint.get('history', {})
+        if saved_history:
+            self.history = saved_history
+
+        # Advance scheduler to correct position
+        for _ in range(self.start_epoch):
+            if self.start_epoch > self.warmup_epochs:
+                self.scheduler.step()
+
+        logger.info(f"Resumed from epoch {self.start_epoch} "
+                     f"(best metric: {self.history.get('best_metric', 0.0):.4f})")
 
     def _warmup_lr(self, epoch: int, batch_idx: int, num_batches: int):
         """Linear warmup learning rate."""
@@ -314,12 +342,14 @@ class BenchmarkTrainer:
         logger.info(f"Epochs: {self.epochs}, LR: {self.lr}, Device: {self.device}")
         logger.info(f"Train samples: {len(self.train_loader.dataset)}, "
                      f"Val samples: {len(self.val_loader.dataset)}")
+        if self.start_epoch > 0:
+            logger.info(f"Resuming from epoch {self.start_epoch}")
         logger.info(f"{'='*60}")
 
-        best_metric = 0.0
+        best_metric = self.history.get('best_metric', 0.0)
         start_time = time.time()
 
-        for epoch in range(self.epochs):
+        for epoch in range(self.start_epoch, self.epochs):
             epoch_start = time.time()
 
             # Train

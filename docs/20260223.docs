@@ -1,4 +1,4 @@
-20260223 작업 일지 #1 - 벤치마크 실행 준비 (버그 수정 및 Colab 최적화)
+20260223 작업 일지 #1 - 벤치마크 실행 준비 (버그 수정, Resume 기능, Colab 최적화)
 ================================================================================
 
 1. 작업 목표
@@ -8,6 +8,7 @@
 
   - 코드 정적 분석 중 발견된 버그 3건 수정
   - Colab T4 GPU 환경에 맞춘 설정 조정
+  - --resume 기능 구현 (완료된 run 재학습 방지, 중단된 학습 재개)
   - Baseline-only 실행 전략 수립 (CASDA 데이터 미생성 상태)
   - 실행 명령어 준비
 
@@ -15,16 +16,85 @@
 2. 변경 파일
 ================================================================================
 
-  | 파일                              | 상태 | 변경 내용                                      |
-  |-----------------------------------|------|-------------------------------------------------|
-  | scripts/run_benchmark.py          | 수정 | 버그 3건 수정 (typing import, FID skip, --epochs)|
-  | configs/benchmark_experiment.yaml | 수정 | num_workers 4→2 (Colab 호환)                    |
+  | 파일                              | 상태 | 라인  | 변경 내용                                    |
+  |-----------------------------------|------|-------|----------------------------------------------|
+  | scripts/run_benchmark.py          | 수정 | 548   | 버그 3건 + --resume 기능 + skip/재개 로직    |
+  | src/training/trainer.py           | 수정 | 428   | resume_from 매개변수 + 체크포인트 로드 로직  |
+  | configs/benchmark_experiment.yaml | 수정 | 197   | num_workers 4→2 (Colab 호환)                 |
 
 
-3. 버그 수정 상세
+3. 핵심 기능: --resume (재학습 방지)
 ================================================================================
 
-3.1 typing import 위치 오류 (Critical)
+3.1 문제
+---------
+기존 코드는 실행할 때마다 timestamp 기반 새 디렉토리를 생성하고
+모든 model×group 조합을 처음부터 학습한다.
+
+  experiment_dir = output_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
+
+따라서:
+  (1) baseline 6 runs를 완료한 뒤 CASDA 6 runs를 추가하면 baseline을 또 학습함
+  (2) 학습 도중 Colab 세션이 끊기면 처음부터 재시작해야 함
+
+3.2 해결: --resume 옵션
+------------------------
+  python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --resume outputs/benchmark_results/20260223_143000
+
+  동작:
+  (1) 기존 experiment_dir을 그대로 재사용 (새 timestamp 디렉토리 생성 안 함)
+  (2) 각 model+group 조합에 대해 best.pth + experiment_meta.json 존재 여부 확인
+  (3) 둘 다 존재 → SKIP: 기존 메트릭을 JSON에서 로드하여 reporter에 전달
+  (4) latest.pth만 존재 → RESUME: 중단 지점부터 학습 재개
+  (5) 둘 다 없음 → 새로 학습
+
+3.3 변경 위치: scripts/run_benchmark.py
+-----------------------------------------
+
+  CLI 옵션 (370~373번 줄):
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from existing experiment directory.')
+
+  experiment_dir 생성 로직 (401~410번 줄):
+    if args.resume:
+        experiment_dir = Path(args.resume)
+        if not experiment_dir.exists():
+            sys.exit(1)
+    else:
+        # 기존 timestamp 생성 로직
+
+  run_single_experiment() 함수 (91~150번 줄):
+    - resume 매개변수 추가 (기본값 False)
+    - 완료 확인: best_path.exists() and meta_path.exists() → JSON에서 메트릭 로드, return
+    - 중단 확인: latest_path.exists() and not best_path.exists() → resume_checkpoint 설정
+    - resume_checkpoint를 BenchmarkTrainer에 resume_from으로 전달
+
+  main() 호출부 (504번 줄):
+    resume=bool(args.resume) 전달
+
+3.4 변경 위치: src/training/trainer.py
+---------------------------------------
+
+  __init__() 매개변수 추가 (89번 줄):
+    resume_from: Optional[str] = None
+
+  _load_checkpoint() 메서드 신규 (190~210번 줄):
+    - model_state_dict, optimizer_state_dict 복원
+    - start_epoch = checkpoint['epoch'] + 1
+    - history 복원
+    - scheduler를 start_epoch까지 advance
+
+  train() 메서드 수정 (352번 줄):
+    - for epoch in range(self.start_epoch, self.epochs)
+    - best_metric = self.history.get('best_metric', 0.0) (0.0 대신 복원값 사용)
+
+
+4. 버그 수정 상세
+================================================================================
+
+4.1 typing import 위치 오류 (Critical)
 ---------------------------------------
   위치: scripts/run_benchmark.py
   증상: `from typing import Dict`가 파일 489번 줄(하단)에 위치
@@ -32,55 +102,33 @@
         모듈 로드 시 NameError 발생 (Dict가 아직 import되지 않은 상태)
   수정: 36번 줄(상단 import 블록)으로 이동
 
-  변경 전:
-    # (파일 489번 줄 부근)
-    from typing import Dict
-
-  변경 후:
-    # (파일 36번 줄, import 블록 최하단)
-    from typing import Dict
-
-
-3.2 FID 무조건 실행 오류 (Medium)
+4.2 FID 무조건 실행 오류 (Medium)
 ----------------------------------
-  위치: scripts/run_benchmark.py, 431~439번 줄
+  위치: scripts/run_benchmark.py, 474~482번 줄
   증상: FID 평가가 --groups 필터링과 무관하게 항상 실행됨
   영향: baseline_raw/baseline_trad만 실행할 때도 InceptionV3 로드 시도,
         CASDA 디렉토리가 존재하지 않으면 FileNotFoundError 발생
   수정: CASDA 그룹 포함 여부를 확인하는 조건문 추가
 
-  변경 후 로직 (431~439번 줄):
+  변경 후 로직:
     casda_groups = {'casda_full', 'casda_pruning'}
     has_casda = any(g in casda_groups for g in group_keys)
-
     if args.fid_only or (has_casda and config...fid.compute):
         fid_results = run_fid_evaluation(...)
     elif not has_casda:
         logging.info("Skipping FID evaluation (no CASDA groups selected)")
 
-
-3.3 --epochs CLI 옵션 누락 (Low)
+4.3 --epochs CLI 옵션 누락 (Low)
 ----------------------------------
-  위치: scripts/run_benchmark.py, 363~380번 줄
-  증상: 벤치마크 테스트 실행 시 YAML config의 epochs(100)를 수동 편집해야 함
-  영향: 빠른 검증(10 epochs)을 위해 매번 YAML 수정 → 원본 값 복구 필요
+  위치: scripts/run_benchmark.py
   수정: `--epochs N` 옵션 추가, 지정 시 모든 모델의 epochs를 오버라이드
-
-  추가 코드 (363~364번 줄):
-    parser.add_argument('--epochs', type=int, default=None,
-                        help='Override epochs for all models (for quick testing)')
-
-  적용 로직 (376~380번 줄):
-    if args.epochs is not None:
-        for model_key in config.get('models', {}):
-            config['models'][model_key]['training']['epochs'] = args.epochs
-        print(f"[INFO] Epochs overridden to {args.epochs} for all models")
+  용도: 빠른 검증 (예: --epochs 10)
 
 
-4. 설정 변경
+5. 설정 변경
 ================================================================================
 
-4.1 Colab num_workers 조정
+5.1 Colab num_workers 조정
 ---------------------------
   파일: configs/benchmark_experiment.yaml, 9번 줄
   변경: num_workers: 4 → 2
@@ -88,10 +136,10 @@
         프로세스 경합으로 인한 성능 저하 또는 메모리 오류 발생 가능
 
 
-5. 기타 발견 사항 (미수정)
+6. 기타 발견 사항 (미수정)
 ================================================================================
 
-5.1 CASDASyntheticDataset idx 미전달 (Low Priority)
+6.1 CASDASyntheticDataset idx 미전달 (Low Priority)
 ----------------------------------------------------
   위치: src/training/dataset.py
   증상: _get_detection_item()과 _get_segmentation_item() 내부에서
@@ -99,16 +147,16 @@
   영향: 실제 도달 가능성 낮음 (try-except의 except 블록 내부)
   판단: CASDA 데이터 생성 후 해당 경로 테스트 시 수정 예정
 
-5.2 train.csv 포맷 호환성 확인
+6.2 train.csv 포맷 호환성 확인
 -------------------------------
   실제 데이터: ImageId, ClassId 칼럼이 분리되어 있음 (ImageId_ClassId 결합 아님)
   코드 대응: dataset.py에서 두 가지 포맷을 조건문으로 분기 처리 → 호환 OK
 
 
-6. Colab 실행 계획
+7. Colab 실행 계획
 ================================================================================
 
-6.1 심볼릭 링크 설정
+7.1 심볼릭 링크 설정
 --------------------
   Severstal 데이터가 Google Drive에 위치하므로, 프로젝트 루트에 심볼릭 링크 생성.
   YAML config의 상대 경로(train_images, train.csv)를 수정하지 않고 사용.
@@ -117,7 +165,7 @@
     ln -sf /content/drive/MyDrive/data/Severstal/train_images train_images
     ln -sf /content/drive/MyDrive/data/Severstal/train.csv train.csv
 
-6.2 테스트 실행 (YOLO-MFD, 10 epochs)
+7.2 테스트 실행 (YOLO-MFD, 10 epochs)
 ---------------------------------------
   단일 모델 × 단일 그룹으로 파이프라인 전체 동작 검증.
 
@@ -134,7 +182,7 @@
     - 메트릭 계산 (mAP@0.5)
     - 결과 저장 (JSON, 로그)
 
-6.3 전체 Baseline 실행 (3 models × 2 groups, 100 epochs)
+7.3 전체 Baseline 실행 (3 models × 2 groups, 100 epochs)
 ---------------------------------------------------------
   테스트 통과 후 baseline_raw + baseline_trad 그룹에 대해 전체 실행.
 
@@ -144,8 +192,21 @@
 
   예상 소요: T4 GPU 기준 모델당 약 30~60분 × 6 runs = 3~6시간
 
+7.4 이후 CASDA 그룹 추가 시 (--resume 활용)
+--------------------------------------------
+  CASDA 합성 이미지 생성 완료 후, 기존 baseline 결과 디렉토리에 추가 실행.
+  baseline 6 runs는 자동 SKIP되고 CASDA 6 runs만 새로 학습.
 
-7. 문법 검증
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --resume outputs/benchmark_results/<baseline_실행_timestamp>
+
+  이렇게 하면 12 runs 전체가 하나의 experiment_dir에 모이며,
+  가설 검증(H1~H5) 시 baseline과 CASDA 결과를 직접 비교 가능.
+
+
+8. 문법 검증
 ================================================================================
   ast.parse(scripts/run_benchmark.py)               → OK
+  ast.parse(src/training/trainer.py)                 → OK
   yaml.safe_load(configs/benchmark_experiment.yaml)  → OK
