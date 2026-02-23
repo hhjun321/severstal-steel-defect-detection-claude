@@ -621,10 +621,17 @@ def create_data_loaders(
     ds_config = config['dataset']
     group_config = config['dataset_groups'][dataset_group]
 
-    # Resolve data paths relative to project root
+    # Resolve data paths relative to project root (skip if already absolute)
     project_root = Path(__file__).resolve().parent.parent.parent
-    annotation_csv = str(project_root / ds_config['annotation_csv'])
-    image_dir = str(project_root / ds_config['image_dir'])
+    raw_csv = ds_config['annotation_csv']
+    raw_img = ds_config['image_dir']
+    annotation_csv = raw_csv if os.path.isabs(raw_csv) else str(project_root / raw_csv)
+    image_dir = raw_img if os.path.isabs(raw_img) else str(project_root / raw_img)
+
+    import logging
+    logging.info(f"[DATA] project_root: {project_root}")
+    logging.info(f"[DATA] annotation_csv: {annotation_csv} (exists={os.path.exists(annotation_csv)})")
+    logging.info(f"[DATA] image_dir: {image_dir} (exists={os.path.isdir(image_dir)})")
 
     # Get image IDs and split
     image_ids, image_classes = get_image_ids_with_defects(annotation_csv)
@@ -677,7 +684,8 @@ def create_data_loaders(
     if casda_data is not None:
         casda_config = ds_config.get('casda', {})
         if casda_data == "full":
-            casda_dir = str(project_root / casda_config.get('full_dir', 'data/augmented/casda_full'))
+            raw_casda = casda_config.get('full_dir', 'data/augmented/casda_full')
+            casda_dir = raw_casda if os.path.isabs(raw_casda) else str(project_root / raw_casda)
             casda_dataset = CASDASyntheticDataset(
                 data_dir=casda_dir,
                 mode=model_type,
@@ -686,7 +694,8 @@ def create_data_loaders(
                 transform=train_transform,
             )
         elif casda_data == "pruning":
-            casda_dir = str(project_root / casda_config.get('pruning_dir', 'data/augmented/casda_pruning'))
+            raw_casda = casda_config.get('pruning_dir', 'data/augmented/casda_pruning')
+            casda_dir = raw_casda if os.path.isabs(raw_casda) else str(project_root / raw_casda)
             casda_dataset = CASDASyntheticDataset(
                 data_dir=casda_dir,
                 mode=model_type,

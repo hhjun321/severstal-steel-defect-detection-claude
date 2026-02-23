@@ -230,7 +230,8 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
     casda_config = ds_config.get('casda', {})
 
     # Collect real image paths (resolve relative to project root)
-    image_dir = PROJECT_ROOT / ds_config['image_dir']
+    raw_image_dir = ds_config['image_dir']
+    image_dir = Path(raw_image_dir) if os.path.isabs(raw_image_dir) else PROJECT_ROOT / raw_image_dir
     real_images = sorted(image_dir.glob("*.jpg")) + sorted(image_dir.glob("*.png"))
     real_images = [str(p) for p in real_images]
 
@@ -239,7 +240,8 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
         return {'fid_overall': float('inf')}
 
     # Collect CASDA-Full images
-    casda_full_dir = PROJECT_ROOT / casda_config.get('full_dir', 'data/augmented/casda_full')
+    raw_casda_dir = casda_config.get('full_dir', 'data/augmented/casda_full')
+    casda_full_dir = Path(raw_casda_dir) if os.path.isabs(raw_casda_dir) else PROJECT_ROOT / raw_casda_dir
     casda_images = []
     if casda_full_dir.exists():
         for subdir in [casda_full_dir, casda_full_dir / "images"]:
