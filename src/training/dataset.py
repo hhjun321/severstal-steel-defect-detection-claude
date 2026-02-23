@@ -603,7 +603,7 @@ def create_data_loaders(
     input_size: Tuple[int, int],
     batch_size: int,
     num_workers: int = 4,
-) -> Tuple[DataLoader, DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader, DataLoader, dict]:
     """
     Create train/val/test DataLoaders for a given dataset group and model type.
     
@@ -616,7 +616,8 @@ def create_data_loaders(
         num_workers: Number of data loading workers
     
     Returns:
-        train_loader, val_loader, test_loader
+        train_loader, val_loader, test_loader, split_info
+        split_info contains train_ids, val_ids, test_ids, and split config for reproducibility verification.
     """
     ds_config = config['dataset']
     group_config = config['dataset_groups'][dataset_group]
@@ -735,4 +736,19 @@ def create_data_loaders(
         num_workers=num_workers, collate_fn=collate_fn, pin_memory=True,
     )
 
-    return train_loader, val_loader, test_loader
+    split_info = {
+        'train_ids': train_ids,
+        'val_ids': val_ids,
+        'test_ids': test_ids,
+        'split_config': {
+            'train_ratio': ds_config['split']['train_ratio'],
+            'val_ratio': ds_config['split']['val_ratio'],
+            'test_ratio': ds_config['split']['test_ratio'],
+            'seed': ds_config['split']['seed'],
+        },
+        'num_train': len(train_ids),
+        'num_val': len(val_ids),
+        'num_test': len(test_ids),
+    }
+
+    return train_loader, val_loader, test_loader, split_info

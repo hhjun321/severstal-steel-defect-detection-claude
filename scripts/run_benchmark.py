@@ -160,7 +160,7 @@ def run_single_experiment(
     batch_size = model_config['training'].get('batch_size', 16)
     num_workers = config['experiment'].get('num_workers', 4)
 
-    train_loader, val_loader, test_loader = create_data_loaders(
+    train_loader, val_loader, test_loader, split_info = create_data_loaders(
         config=config,
         dataset_group=dataset_group,
         model_type=model_type,
@@ -171,6 +171,13 @@ def run_single_experiment(
 
     logging.info(f"Data loaded - Train: {len(train_loader.dataset)}, "
                  f"Val: {len(val_loader.dataset)}, Test: {len(test_loader.dataset)}")
+
+    # Save split info once per experiment directory (shared across all runs)
+    split_path = experiment_dir / "dataset_split.json"
+    if not split_path.exists():
+        with open(split_path, 'w') as f:
+            json.dump(split_info, f, indent=2)
+        logging.info(f"Saved dataset split info: {split_path}")
 
     # Create trainer
     # Merge model-level num_classes into training config
@@ -192,7 +199,7 @@ def run_single_experiment(
     # Train and evaluate
     test_metrics = trainer.train()
 
-    # Save experiment metadata
+    # Save experiment metadata (lightweight — history is in separate _history.json)
     meta = {
         'model': model_name,
         'model_key': model_key,
@@ -201,7 +208,14 @@ def run_single_experiment(
         'dataset_group_key': dataset_group,
         'num_params': total_params,
         'test_metrics': test_metrics,
-        'training_history': trainer.history,
+        'best_epoch': trainer.history.get('best_epoch', 0),
+        'best_metric': trainer.history.get('best_metric', 0.0),
+        'total_epochs_trained': len(trainer.history.get('train_loss', [])),
+        'early_stopped': trainer.history.get('early_stopped', False),
+        'stopped_epoch': trainer.history.get('stopped_epoch', 0),
+        'max_epochs': trainer.history.get('max_epochs', 0),
+        'total_time_seconds': trainer.history.get('total_time_seconds', 0.0),
+        'use_amp': trainer.history.get('use_amp', False),
         'timestamp': datetime.now().isoformat(),
     }
     with open(run_dir / "experiment_meta.json", 'w') as f:

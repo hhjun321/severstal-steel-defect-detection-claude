@@ -3,6 +3,7 @@ Unified Trainer for CASDA Benchmark Experiments
 
 Supports both detection (YOLO-MFD, EB-YOLOv8) and segmentation (DeepLabV3+)
 models with common training loop, logging, early stopping, and evaluation.
+Includes AMP (Automatic Mixed Precision) for T4 GPU Tensor Core acceleration.
 """
 
 import os
@@ -15,6 +16,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
+from torch.cuda.amp import GradScaler, autocast
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable
 
@@ -67,10 +69,10 @@ class BenchmarkTrainer:
     Unified trainer for detection and segmentation benchmark models.
     
     Handles:
-      - Training loop with gradient accumulation
-      - Learning rate scheduling (cosine, poly)
-      - Early stopping
-      - Best model checkpointing
+      - Training loop with AMP (Mixed Precision)
+      - Learning rate scheduling (cosine, poly) with warmup
+      - Early stopping with patience tracking
+      - Best model checkpointing (slim format)
       - TensorBoard logging
       - Evaluation metric computation
     """
@@ -104,11 +106,17 @@ class BenchmarkTrainer:
 
         # Training config
         train_cfg = config.get('training', {})
-        self.epochs = train_cfg.get('epochs', 100)
+        self.epochs = train_cfg.get('epochs', 300)
         self.lr = train_cfg.get('learning_rate', 0.001)
         self.weight_decay = train_cfg.get('weight_decay', 0.0005)
-        self.warmup_epochs = train_cfg.get('warmup_epochs', 5)
-        self.patience = train_cfg.get('early_stopping_patience', 15)
+        self.warmup_epochs = train_cfg.get('warmup_epochs', 10)
+        self.patience = train_cfg.get('early_stopping_patience', 30)
+
+        # AMP (Automatic Mixed Precision)
+        self.use_amp = train_cfg.get('use_amp', True) and device == 'cuda'
+        self.scaler = GradScaler(enabled=self.use_amp)
+        if self.use_amp:
+            logger.info("AMP (Mixed Precision) enabled — using FP16 Tensor Cores")
 
         # Optimizer
         optimizer_name = train_cfg.get('optimizer', 'AdamW')
@@ -196,6 +204,10 @@ class BenchmarkTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.start_epoch = checkpoint.get('epoch', 0) + 1
 
+        # Restore AMP scaler state if available
+        if self.use_amp and 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
         # Restore history
         saved_history = checkpoint.get('history', {})
         if saved_history:
@@ -218,7 +230,7 @@ class BenchmarkTrainer:
                 param_group['lr'] = lr
 
     def train_one_epoch(self, epoch: int) -> float:
-        """Train for one epoch."""
+        """Train for one epoch with AMP."""
         self.model.train()
         total_loss = 0.0
         num_batches = len(self.train_loader)
@@ -228,26 +240,31 @@ class BenchmarkTrainer:
 
             images = batch['image'].to(self.device)
 
-            if self.model_type == "detection":
-                targets = batch['labels']  # List of tensors
-                targets = [t.to(self.device) for t in targets]
+            # Forward pass with AMP autocast
+            with autocast(enabled=self.use_amp):
+                if self.model_type == "detection":
+                    targets = batch['labels']
+                    targets = [t.to(self.device) for t in targets]
+                    predictions = self.model(images)
+                    loss_dict = self.model.compute_loss(predictions, targets)
+                    loss = loss_dict['total']
+                else:
+                    masks = batch['mask'].to(self.device)
+                    predictions = self.model(images)
+                    loss_dict = self.model.compute_loss(predictions, masks)
+                    loss = loss_dict['total']
 
-                predictions = self.model(images)
-                loss_dict = self.model.compute_loss(predictions, targets)
-                loss = loss_dict['total']
-            else:
-                masks = batch['mask'].to(self.device)
-                predictions = self.model(images)
-                loss_dict = self.model.compute_loss(predictions, masks)
-                loss = loss_dict['total']
-
+            # Backward pass with AMP scaler
             self.optimizer.zero_grad()
-            loss.backward()
+            self.scaler.scale(loss).backward()
 
-            # Gradient clipping
+            # Gradient clipping (unscale first for correct norm)
+            self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
 
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
             total_loss += loss.item()
 
             # Logging
@@ -263,7 +280,7 @@ class BenchmarkTrainer:
     @torch.no_grad()
     def validate(self, loader: DataLoader = None) -> Tuple[float, Dict]:
         """
-        Validate on given loader.
+        Validate on given loader with AMP inference.
         
         Returns:
             val_loss, metrics_dict
@@ -279,25 +296,26 @@ class BenchmarkTrainer:
         for batch in loader:
             images = batch['image'].to(self.device)
 
-            if self.model_type == "detection":
-                targets = batch['labels']
-                targets_device = [t.to(self.device) for t in targets]
+            with autocast(enabled=self.use_amp):
+                if self.model_type == "detection":
+                    targets = batch['labels']
+                    targets_device = [t.to(self.device) for t in targets]
 
-                predictions_raw = self.model(images)
-                loss_dict = self.model.compute_loss(predictions_raw, targets_device)
-                total_loss += loss_dict['total'].item()
+                    predictions_raw = self.model(images)
+                    loss_dict = self.model.compute_loss(predictions_raw, targets_device)
+                    total_loss += loss_dict['total'].item()
 
-                # Get NMS predictions for evaluation
-                conf_thresh = self.config.get('training', {}).get('conf_threshold', 0.25)
-                iou_thresh = self.config.get('training', {}).get('iou_threshold', 0.5)
-                pred_results = self.model.predict(images, conf_thresh, iou_thresh)
-                self.evaluator.update(pred_results, targets)
-            else:
-                masks = batch['mask'].to(self.device)
-                predictions = self.model(images)
-                loss_dict = self.model.compute_loss(predictions, masks)
-                total_loss += loss_dict['total'].item()
-                self.evaluator.update(predictions, masks)
+                    # Get NMS predictions for evaluation
+                    conf_thresh = self.config.get('training', {}).get('conf_threshold', 0.25)
+                    iou_thresh = self.config.get('training', {}).get('iou_threshold', 0.5)
+                    pred_results = self.model.predict(images, conf_thresh, iou_thresh)
+                    self.evaluator.update(pred_results, targets)
+                else:
+                    masks = batch['mask'].to(self.device)
+                    predictions = self.model(images)
+                    loss_dict = self.model.compute_loss(predictions, masks)
+                    total_loss += loss_dict['total'].item()
+                    self.evaluator.update(predictions, masks)
 
         avg_loss = total_loss / max(num_batches, 1)
         metrics = self.evaluator.compute_metrics()
@@ -319,6 +337,9 @@ class BenchmarkTrainer:
             'metrics': metrics,
             'history': self.history,
         }
+        # Save AMP scaler state for resume
+        if self.use_amp:
+            state['scaler_state_dict'] = self.scaler.state_dict()
 
         # Save latest
         path = self.checkpoint_dir / f"{self.model_name}_latest.pth"
@@ -332,14 +353,17 @@ class BenchmarkTrainer:
 
     def train(self) -> Dict:
         """
-        Run full training loop.
+        Run full training loop with AMP and early stopping tracking.
         
         Returns:
-            Final test metrics dict
+            Final test metrics dict with early stopping metadata.
         """
+        metric_name = 'mAP@0.5' if self.model_type == 'detection' else 'Dice'
+
         logger.info(f"\n{'='*60}")
         logger.info(f"Training {self.model_name} ({self.model_type})")
         logger.info(f"Epochs: {self.epochs}, LR: {self.lr}, Device: {self.device}")
+        logger.info(f"AMP: {self.use_amp}, Patience: {self.patience}")
         logger.info(f"Train samples: {len(self.train_loader.dataset)}, "
                      f"Val samples: {len(self.val_loader.dataset)}")
         if self.start_epoch > 0:
@@ -348,6 +372,8 @@ class BenchmarkTrainer:
 
         best_metric = self.history.get('best_metric', 0.0)
         start_time = time.time()
+        early_stopped = False
+        stopped_epoch = self.epochs  # default: ran all epochs
 
         for epoch in range(self.start_epoch, self.epochs):
             epoch_start = time.time()
@@ -373,7 +399,6 @@ class BenchmarkTrainer:
             self.history['learning_rate'].append(current_lr)
 
             epoch_time = time.time() - epoch_start
-            metric_name = 'mAP@0.5' if self.model_type == 'detection' else 'Dice'
             logger.info(
                 f"Epoch [{epoch+1}/{self.epochs}] "
                 f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
@@ -398,12 +423,23 @@ class BenchmarkTrainer:
 
             # Early stopping
             if self.early_stopping(primary_metric):
-                logger.info(f"Early stopping triggered at epoch {epoch+1}")
+                logger.info(f"Early stopping triggered at epoch {epoch+1} "
+                            f"(no improvement for {self.patience} epochs)")
+                early_stopped = True
+                stopped_epoch = epoch + 1
                 break
 
         total_time = time.time() - start_time
+
+        if not early_stopped:
+            stopped_epoch = self.epochs
+
         logger.info(f"\nTraining completed in {total_time:.1f}s")
         logger.info(f"Best {metric_name}: {best_metric:.4f} at epoch {self.history['best_epoch']+1}")
+        if early_stopped:
+            logger.info(f"Early stopped at epoch {stopped_epoch}/{self.epochs}")
+        else:
+            logger.info(f"Ran full {self.epochs} epochs (no early stopping)")
 
         # Load best model and evaluate on test set
         best_path = self.checkpoint_dir / f"{self.model_name}_best.pth"
@@ -416,10 +452,34 @@ class BenchmarkTrainer:
         test_primary = self._get_primary_metric(test_metrics)
         logger.info(f"\nTest {metric_name}: {test_primary:.4f}")
 
+        # Record early stopping info in history
+        self.history['early_stopped'] = early_stopped
+        self.history['stopped_epoch'] = stopped_epoch
+        self.history['max_epochs'] = self.epochs
+        self.history['total_time_seconds'] = round(total_time, 1)
+        self.history['use_amp'] = self.use_amp
+
         # Save training history
         history_path = self.output_dir / f"{self.model_name}_history.json"
         with open(history_path, 'w') as f:
             json.dump(self.history, f, indent=2)
+
+        # Slim down best checkpoint: remove optimizer state (not needed for inference)
+        if best_path.exists():
+            checkpoint = torch.load(best_path, map_location='cpu')
+            slim_state = {
+                'epoch': checkpoint['epoch'],
+                'model_state_dict': checkpoint['model_state_dict'],
+                'metrics': checkpoint['metrics'],
+            }
+            torch.save(slim_state, best_path)
+            logger.info("Saved slim best checkpoint (optimizer state removed)")
+
+        # Remove latest checkpoint (only needed during training for resume)
+        latest_path = self.checkpoint_dir / f"{self.model_name}_latest.pth"
+        if latest_path.exists():
+            os.remove(latest_path)
+            logger.info("Removed latest checkpoint (training complete)")
 
         # Close TensorBoard
         if self.writer:

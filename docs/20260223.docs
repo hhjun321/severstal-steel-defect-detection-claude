@@ -303,9 +303,163 @@
   맞게 조정 필요. 위 경로는 예시.
 
 
-10. 문법 검증
+10. 추가 변경: test_ids 저장 및 결과 파일 경량화
+================================================================================
+
+10.1 배경
+---------
+  벤치마크 실험의 4개 데이터셋 그룹(baseline_raw, baseline_trad, casda_full,
+  casda_pruning)은 동일한 seed=42 기반 stratified split을 사용하므로
+  test set이 동일하다. 이를 명시적으로 기록하여 사후 검증 가능하게 한다.
+  또한 학습 완료 후 불필요한 대용량 파일을 정리하여 저장 공간을 절약한다.
+
+10.2 변경 사항
+---------------
+
+  (A) dataset_split.json 저장 (run_benchmark.py)
+      - create_data_loaders()가 split_info dict를 추가 반환
+        (train_ids, val_ids, test_ids, split_config, 각 set 크기)
+      - experiment_dir에 dataset_split.json으로 1회만 저장
+        (이미 존재하면 재저장하지 않음)
+      - 모든 run이 동일한 split을 사용함을 JSON으로 증명 가능
+
+  (B) experiment_meta.json 경량화 (run_benchmark.py)
+      - 기존: training_history 전체를 중복 저장 (에포크별 loss/metric 배열)
+      - 변경: best_epoch, best_metric, total_epochs_trained만 요약 저장
+      - training_history는 별도 {name}_history.json에만 존재 (중복 제거)
+
+  (C) best.pth 경량화 (trainer.py)
+      - 학습 완료 후 best.pth에서 optimizer_state_dict, history 제거
+      - 추론에 필요한 model_state_dict, epoch, metrics만 유지
+      - 예상 크기 절감: 모델에 따라 40~60% 감소
+
+  (D) latest.pth 자동 삭제 (trainer.py)
+      - latest.pth는 학습 중 resume 전용 체크포인트
+      - 학습 정상 완료 후 자동 삭제 (os.remove)
+      - 중단된 경우에만 latest.pth가 남아 --resume으로 활용 가능
+
+10.3 변경 위치
+---------------
+
+  src/training/dataset.py:
+    - create_data_loaders() 반환형: Tuple[..., DataLoader] → Tuple[..., DataLoader, dict]
+    - 함수 끝에서 split_info dict 생성 및 반환
+
+  scripts/run_benchmark.py:
+    - create_data_loaders() 호출부: split_info 수신
+    - dataset_split.json 저장 로직 추가
+    - experiment_meta.json에서 training_history 제거, 요약 필드로 대체
+
+  src/training/trainer.py:
+    - train() 종료 시: best.pth slim down (optimizer 제거)
+    - train() 종료 시: latest.pth 삭제
+
+10.4 실험 출력 디렉토리 구조 (변경 후)
+---------------------------------------
+
+  experiment_dir/
+    dataset_split.json                    ← NEW: test_ids 등 split 정보 (1회)
+    yolo_mfd_baseline_raw/
+      experiment_meta.json                ← 경량화 (history 제거)
+      yolo_mfd_baseline_raw_history.json  ← 학습 이력 (기존과 동일)
+      checkpoints/
+        yolo_mfd_baseline_raw_best.pth    ← 경량화 (optimizer 제거)
+                                             latest.pth는 학습 완료 시 삭제됨
+      tensorboard/                        ← TensorBoard 로그
+    yolo_mfd_baseline_trad/
+      ...
+    eb_yolov8_baseline_raw/
+      ...
+
+
+11. 추가 변경: 300 epoch 골든 스탠다드 + AMP + Early Stopping 기록
+================================================================================
+
+11.1 배경
+---------
+  데이터 증강(CASDA)의 효과를 객관적으로 입증하려면 모델의 성능을 충분히
+  끌어낸 상태에서 비교해야 한다. 300 epoch를 학습 상한선으로 설정하고,
+  Early Stopping 결과를 함께 제시하는 것이 골든 스탠다드 설정이다.
+  AMP(Automatic Mixed Precision)를 적용하여 T4 GPU Tensor Core를 활용,
+  학습 시간을 1.5~2배 단축한다.
+
+11.2 YAML config 변경 (benchmark_experiment.yaml)
+--------------------------------------------------
+
+  | 모델          | 항목                     | 변경 전 | 변경 후 |
+  |---------------|--------------------------|---------|---------|
+  | YOLO-MFD      | epochs                   | 100     | 300     |
+  |               | warmup_epochs            | 5       | 10      |
+  |               | early_stopping_patience  | 15      | 30      |
+  |               | use_amp                  | (없음)  | true    |
+  | EB-YOLOv8     | epochs                   | 100     | 300     |
+  |               | warmup_epochs            | 5       | 10      |
+  |               | early_stopping_patience  | 15      | 30      |
+  |               | use_amp                  | (없음)  | true    |
+  | DeepLabV3+    | epochs                   | 100     | 300     |
+  |               | warmup_epochs            | 3       | 5       |
+  |               | early_stopping_patience  | 20      | 40      |
+  |               | use_amp                  | (없음)  | true    |
+
+  patience 근거: epoch 상한의 ~10%로 설정하여, 일시적 plateau에서
+  조기 종료를 방지하면서도 수렴 후 불필요한 학습을 막음.
+
+11.3 AMP 적용 (trainer.py)
+---------------------------
+  torch.cuda.amp.GradScaler + autocast 적용.
+
+  변경 위치:
+    __init__():
+      - self.use_amp = config에서 읽음 (기본 True, CPU면 False)
+      - self.scaler = GradScaler(enabled=self.use_amp)
+
+    train_one_epoch():
+      - forward pass: with autocast(enabled=self.use_amp)
+      - backward: scaler.scale(loss).backward()
+      - gradient clip: scaler.unscale_() 후 clip_grad_norm_
+      - optimizer step: scaler.step() + scaler.update()
+
+    validate():
+      - inference: with autocast(enabled=self.use_amp)
+
+    _save_checkpoint():
+      - scaler_state_dict 저장 (resume 시 복원용)
+
+    _load_checkpoint():
+      - scaler_state_dict 복원
+
+11.4 Early Stopping 기록 (trainer.py + run_benchmark.py)
+---------------------------------------------------------
+  trainer.py — train() 종료 시 history에 기록:
+    - early_stopped: bool (early stopping 발생 여부)
+    - stopped_epoch: 실제 학습 종료 에포크
+    - max_epochs: 설정된 상한 (300)
+    - total_time_seconds: 총 학습 시간 (초)
+    - use_amp: AMP 사용 여부
+
+  run_benchmark.py — experiment_meta.json에 추가 필드:
+    - early_stopped, stopped_epoch, max_epochs
+    - total_time_seconds, use_amp
+
+  논문 제시 형태 예시:
+    "YOLO-MFD: 300 epoch 상한, patience=30, 실제 187 epoch에서 수렴
+     (early stopping), best mAP@0.5 = 0.XXX at epoch 152"
+
+11.5 변경 파일 테이블 (갱신)
+----------------------------
+
+  | 파일                              | 상태 | 변경 내용                                    |
+  |-----------------------------------|------|----------------------------------------------|
+  | configs/benchmark_experiment.yaml | 수정 | epochs 300, patience 30/40, warmup 조정,     |
+  |                                   |      | use_amp: true 추가                           |
+  | src/training/trainer.py           | 수정 | AMP(GradScaler+autocast), early stop 기록,   |
+  |                                   |      | scaler state 저장/복원                       |
+  | scripts/run_benchmark.py          | 수정 | meta.json에 early stop + AMP 정보 추가       |
+
+
+12. 문법 검증
 ================================================================================
   py_compile(scripts/run_benchmark.py)               → OK
   py_compile(src/training/dataset.py)                 → OK
   py_compile(src/training/trainer.py)                 → OK
-  yaml.safe_load(configs/benchmark_experiment.yaml)   → OK (이전 검증 유지)
+  yaml.safe_load(configs/benchmark_experiment.yaml)   → OK
