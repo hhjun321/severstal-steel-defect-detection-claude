@@ -981,3 +981,60 @@
 19.4 문법 검증
 --------------
   ast.parse(src/training/dataset.py)  → OK
+
+
+20. --epochs CLI 오버라이드 미작동 버그 수정 (trainer.py)
+================================================================================
+
+20.1 문제
+---------
+  run_benchmark.py에서 --epochs 10 을 지정했으나 실제 학습은 300 에포크로 실행됨.
+  로그: "Epochs: 300, LR: 0.001, Device: cuda"
+
+20.2 원인 분석
+--------------
+  run_benchmark.py L184:
+    training_config = {**model_config['training'], 'num_classes': num_classes}
+    → config를 flatten하여 전달: {'epochs': 10, 'lr': 0.001, ...}
+
+  trainer.py L108:
+    train_cfg = config.get('training', {})
+    → config에 'training' 키가 없음 → 빈 dict {} 반환
+    → {}.get('epochs', 300) = 300  ← 기본값 사용
+
+  즉 run_benchmark.py는 training 설정을 풀어서(flatten) 전달하는데,
+  trainer.py는 중첩(nested) 구조를 기대하여 항상 기본값 300을 사용.
+
+20.3 수정 내용
+--------------
+  파일: src/training/trainer.py
+
+  ■ train_cfg 추출 로직 변경 (L108)
+    변경 전:
+      train_cfg = config.get('training', {})
+
+    변경 후:
+      # config는 run_benchmark.py에서 model_config['training']을 flatten하여 전달
+      # 'training' 키가 중첩된 경우와 직접 전달된 경우 모두 지원
+      train_cfg = config.get('training', config) if isinstance(config.get('training'), dict) else config
+
+    동작 방식:
+      - config = {'epochs': 10, ...} (flatten)  → train_cfg = config 자체
+      - config = {'training': {'epochs': 50}} (nested) → train_cfg = config['training']
+      - config = {} (빈 dict)                   → train_cfg = {} → 기본값 300
+
+20.4 변경 파일 테이블
+---------------------
+  | 파일                      | 상태 | 변경 내용                                     |
+  |---------------------------|------|------------------------------------------------|
+  | src/training/trainer.py   | 수정 | train_cfg 추출 로직: flatten/nested 모두 지원  |
+
+20.5 단위 테스트 결과
+---------------------
+  Test 1 (flatten config):  epochs=10  → OK
+  Test 2 (nested config):   epochs=50  → OK
+  Test 3 (empty config):    epochs=300 → OK (기본값)
+
+20.6 문법 검증
+--------------
+  ast.parse(src/training/trainer.py)  → OK

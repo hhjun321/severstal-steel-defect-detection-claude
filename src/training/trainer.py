@@ -105,7 +105,9 @@ class BenchmarkTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Training config
-        train_cfg = config.get('training', {})
+        # config는 run_benchmark.py에서 model_config['training']을 flatten하여 전달
+        # 'training' 키가 중첩된 경우와 직접 전달된 경우 모두 지원
+        train_cfg = config.get('training', config) if isinstance(config.get('training'), dict) else config
         self.epochs = train_cfg.get('epochs', 300)
         self.lr = train_cfg.get('learning_rate', 0.001)
         self.weight_decay = train_cfg.get('weight_decay', 0.0005)
