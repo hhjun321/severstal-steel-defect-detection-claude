@@ -20,7 +20,7 @@ Usage:
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --models yolo_mfd eb_yolov8
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --groups baseline_raw casda_pruning
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --fid-only
-  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume outputs/benchmark_results/20260223_143000
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume --output-dir outputs/benchmark_results/20260223_143000
 """
 
 import os
@@ -392,7 +392,7 @@ Examples:
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --groups baseline_raw casda_pruning
 
   # Resume: add CASDA runs to existing baseline experiment (skips completed runs)
-  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume outputs/benchmark_results/20260223_143000
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume --output-dir outputs/benchmark_results/20260223_143000
         """,
     )
     parser.add_argument('--config', type=str, default='configs/benchmark_experiment.yaml',
@@ -413,10 +413,11 @@ Examples:
                         help='Random seed (overrides config)')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Output directory (overrides config)')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Resume from existing experiment directory. '
-                             'Skips already-completed runs (those with best.pth). '
-                             'Example: --resume outputs/benchmark_results/20260223_143000')
+    parser.add_argument('--resume', action='store_true', default=False,
+                        help='Resume from existing experiment directory (specified by --output-dir). '
+                             'Skips already-completed runs (those with best.pth), '
+                             'resumes interrupted runs from latest.pth. '
+                             'Example: --resume --output-dir outputs/benchmark_results/20260223_143000')
     parser.add_argument('--epochs', type=int, default=None,
                         help='Override epochs for all models (for quick testing)')
     args = parser.parse_args()
@@ -457,14 +458,17 @@ Examples:
         device = 'cpu'
 
     # Determine experiment directory
+    output_dir = Path(args.output_dir or config['experiment'].get('output_dir', 'outputs/benchmark_results'))
+
     if args.resume:
-        experiment_dir = Path(args.resume)
+        # Resume mode: use output_dir directly (no new timestamp subdirectory)
+        experiment_dir = output_dir
         if not experiment_dir.exists():
             print(f"Error: Resume directory not found: {experiment_dir}")
             sys.exit(1)
         print(f"[INFO] Resuming experiment from: {experiment_dir}")
     else:
-        output_dir = Path(args.output_dir or config['experiment'].get('output_dir', 'outputs/benchmark_results'))
+        # New experiment: create timestamped subdirectory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         experiment_dir = output_dir / timestamp
         experiment_dir.mkdir(parents=True, exist_ok=True)
@@ -534,7 +538,7 @@ Examples:
                     config=config,
                     experiment_dir=experiment_dir,
                     device=device,
-                    resume=bool(args.resume),
+                    resume=args.resume,
                 )
 
                 model_name = config['models'][model_key]['name']

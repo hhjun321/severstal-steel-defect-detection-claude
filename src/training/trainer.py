@@ -204,6 +204,16 @@ class BenchmarkTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.start_epoch = checkpoint.get('epoch', 0) + 1
 
+        # Restore scheduler state
+        if 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        else:
+            # Fallback for old checkpoints without scheduler state:
+            # step scheduler for each epoch past warmup
+            for ep in range(self.start_epoch):
+                if ep >= self.warmup_epochs:
+                    self.scheduler.step()
+
         # Restore AMP scaler state if available
         if self.use_amp and 'scaler_state_dict' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
@@ -213,13 +223,13 @@ class BenchmarkTrainer:
         if saved_history:
             self.history = saved_history
 
-        # Advance scheduler to correct position
-        for _ in range(self.start_epoch):
-            if self.start_epoch > self.warmup_epochs:
-                self.scheduler.step()
+        # Restore early stopping best score from history
+        best_metric = self.history.get('best_metric', 0.0)
+        if best_metric > 0:
+            self.early_stopping.best_score = best_metric
 
         logger.info(f"Resumed from epoch {self.start_epoch} "
-                     f"(best metric: {self.history.get('best_metric', 0.0):.4f})")
+                     f"(best metric: {best_metric:.4f})")
 
     def _warmup_lr(self, epoch: int, batch_idx: int, num_batches: int):
         """Linear warmup learning rate."""
@@ -334,6 +344,7 @@ class BenchmarkTrainer:
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
             'metrics': metrics,
             'history': self.history,
         }

@@ -581,11 +581,94 @@
   | scripts/generate_augmented_data.py | 수정 | torch.load에 weights_only=False 추가 (1곳)|
 
 
-14. 문법 검증
+14. Resume 체크포인트 복원 버그 수정
 ================================================================================
-  py_compile(scripts/run_benchmark.py)               → OK
-  py_compile(src/training/dataset.py)                 → OK
-  py_compile(src/training/trainer.py)                 → OK
-  py_compile(scripts/package_casda_data.py)           → OK (ast.parse)
-  py_compile(scripts/generate_augmented_data.py)      → OK
-  yaml.safe_load(configs/benchmark_experiment.yaml)   → OK
+
+14.1 문제 (3건)
+---------------
+  (A) EarlyStopping 상태 미복원
+      _load_checkpoint() 에서 history는 복원하지만, EarlyStopping 객체의
+      best_score가 초기값(None)으로 남아 있음.
+      → resume 후 patience 카운터가 0부터 재시작됨.
+
+  (B) Scheduler 상태 미복원 + step 루프 버그
+      기존 코드:
+        for _ in range(self.start_epoch):
+            if self.start_epoch > self.warmup_epochs:
+                self.scheduler.step()
+      → 조건이 루프 변수(_)가 아닌 self.start_epoch 기준이므로,
+        warmup 이전 epoch에 대해서도 step이 호출됨.
+      → scheduler_state_dict를 저장/복원하는 것이 정확한 방법.
+
+  (C) --resume 파라미터 혼란
+      CLI 정의: --resume type=str (경로를 받음)
+      호출부:   resume=bool(args.resume) → bool로 변환
+      → 경로를 받는 파라미터를 boolean으로 변환하는 혼란스러운 설계.
+      → 실제로 경로는 experiment_dir로만 사용, resume는 bool만 필요.
+
+14.2 수정 내용
+--------------
+  (A) EarlyStopping best_score 복원 (trainer.py _load_checkpoint)
+      history에서 best_metric을 읽어 early_stopping.best_score에 설정.
+      counter는 0에서 재시작 (resume 직후 새로 카운팅하는 것이 합리적).
+
+      추가 코드:
+        best_metric = self.history.get('best_metric', 0.0)
+        if best_metric > 0:
+            self.early_stopping.best_score = best_metric
+
+  (B) Scheduler state 저장/복원 (trainer.py)
+      _save_checkpoint():
+        state dict에 'scheduler_state_dict' 추가.
+
+      _load_checkpoint():
+        'scheduler_state_dict'가 있으면 load_state_dict()로 복원.
+        없으면 (구버전 체크포인트) fallback으로 epoch별 step 호출.
+        fallback에서 버그 수정: 조건을 루프 변수(ep) 기준으로 변경.
+
+      기존 (버그):
+        for _ in range(self.start_epoch):
+            if self.start_epoch > self.warmup_epochs:
+                self.scheduler.step()
+
+      수정 후 (fallback):
+        for ep in range(self.start_epoch):
+            if ep >= self.warmup_epochs:
+                self.scheduler.step()
+
+  (C) --resume 파라미터 리팩터링 (run_benchmark.py)
+      변경 전:
+        --resume type=str → 경로를 받음
+        experiment_dir = Path(args.resume)
+        resume=bool(args.resume)
+
+      변경 후:
+        --resume action='store_true' → 플래그만
+        --output-dir → 기존 실험 디렉토리 경로 지정
+        resume 모드: output_dir을 직접 experiment_dir로 사용 (timestamp 미생성)
+        일반 모드: output_dir/timestamp 하위 디렉토리 생성
+
+      사용법 변경:
+        전: --resume /path/to/experiment
+        후: --resume --output-dir /path/to/experiment
+
+14.3 변경 파일 테이블
+---------------------
+  | 파일                      | 상태 | 변경 내용                                    |
+  |---------------------------|------|----------------------------------------------|
+  | src/training/trainer.py   | 수정 | _save: scheduler_state_dict 저장             |
+  |                           |      | _load: scheduler/EarlyStopping 복원,          |
+  |                           |      |        step 루프 fallback 버그 수정           |
+  | scripts/run_benchmark.py  | 수정 | --resume: type=str → store_true              |
+  |                           |      | experiment_dir 결정 로직 리팩터링             |
+  |                           |      | docstring 사용 예시 갱신                      |
+
+
+15. 문법 검증
+================================================================================
+  ast.parse(scripts/run_benchmark.py)               → OK
+  ast.parse(src/training/trainer.py)                 → OK
+  ast.parse(src/training/dataset.py)                 → OK
+  ast.parse(scripts/package_casda_data.py)           → OK
+  ast.parse(scripts/generate_augmented_data.py)      → OK
+  yaml.safe_load(configs/benchmark_experiment.yaml)  → OK
