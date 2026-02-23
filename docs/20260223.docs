@@ -664,7 +664,51 @@
   |                           |      | docstring 사용 예시 갱신                      |
 
 
-15. 문법 검증
+15. --casda-dir CLI 인수 추가 (run_benchmark.py)
+================================================================================
+
+15.1 문제
+---------
+  YAML config의 casda.full_dir/pruning_dir이 상대경로("data/augmented/casda_full")로
+  설정되어 있어, Colab에서 package_casda_data.py로 생성한 casda_full/의 실제 절대경로와
+  불일치. --data-dir, --csv처럼 CLI에서 오버라이드할 수단이 없었음.
+
+15.2 수정 내용
+--------------
+  (A) argparse 인수 추가
+      --casda-dir: casda_full/ 과 casda_pruning/의 부모 디렉토리 경로.
+      지정 시 config의 dataset.casda.full_dir, pruning_dir을 자동 오버라이드.
+
+  (B) main()에서 config 오버라이드 로직
+      if args.casda_dir:
+          config['dataset']['casda']['full_dir'] = os.path.join(casda_base, 'casda_full')
+          config['dataset']['casda']['pruning_dir'] = os.path.join(casda_base, 'casda_pruning')
+
+  (C) docstring 사용 예시 추가
+      --casda-dir 사용 예시 1건 추가.
+
+15.3 Colab 실행 명령어
+----------------------
+  # CASDA-Full 테스트 (10 epoch)
+  python /content/severstal-steel-defect-detection/scripts/run_benchmark.py \
+      --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+      --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+      --csv /content/drive/MyDrive/data/Severstal/train.csv \
+      --casda-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \
+      --output-dir /content/drive/MyDrive/outputs/benchmark_results \
+      --models yolo_mfd \
+      --groups casda_full \
+      --epochs 10
+
+15.4 변경 파일 테이블
+---------------------
+  | 파일                      | 상태 | 변경 내용                               |
+  |---------------------------|------|-----------------------------------------|
+  | scripts/run_benchmark.py  | 수정 | --casda-dir 인수 추가, config 오버라이드 |
+  |                           |      | docstring 예시 갱신                      |
+
+
+16. 문법 검증
 ================================================================================
   ast.parse(scripts/run_benchmark.py)               → OK
   ast.parse(src/training/trainer.py)                 → OK

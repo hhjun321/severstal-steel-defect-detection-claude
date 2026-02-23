@@ -391,6 +391,11 @@ Examples:
   # Run specific dataset groups only
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --groups baseline_raw casda_pruning
 
+  # Run CASDA groups with custom casda data path
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml \\
+      --casda-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \\
+      --groups casda_full
+
   # Resume: add CASDA runs to existing baseline experiment (skips completed runs)
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume --output-dir outputs/benchmark_results/20260223_143000
         """,
@@ -420,6 +425,9 @@ Examples:
                              'Example: --resume --output-dir outputs/benchmark_results/20260223_143000')
     parser.add_argument('--epochs', type=int, default=None,
                         help='Override epochs for all models (for quick testing)')
+    parser.add_argument('--casda-dir', type=str, default=None,
+                        help='Parent dir containing casda_full/ and casda_pruning/ '
+                             '(overrides config dataset.casda paths)')
     args = parser.parse_args()
 
     # Load config
@@ -438,6 +446,13 @@ Examples:
     if args.csv:
         config['dataset']['annotation_csv'] = args.csv
         print(f"[INFO] annotation_csv overridden to: {args.csv}")
+    if args.casda_dir:
+        casda_base = args.casda_dir
+        if 'casda' not in config['dataset']:
+            config['dataset']['casda'] = {}
+        config['dataset']['casda']['full_dir'] = os.path.join(casda_base, 'casda_full')
+        config['dataset']['casda']['pruning_dir'] = os.path.join(casda_base, 'casda_pruning')
+        print(f"[INFO] casda paths overridden: {casda_base}/casda_full, {casda_base}/casda_pruning")
 
     # Override epochs if specified (for quick testing)
     if args.epochs is not None:
