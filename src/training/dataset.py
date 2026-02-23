@@ -621,8 +621,13 @@ def create_data_loaders(
     ds_config = config['dataset']
     group_config = config['dataset_groups'][dataset_group]
 
+    # Resolve data paths relative to project root
+    project_root = Path(__file__).resolve().parent.parent.parent
+    annotation_csv = str(project_root / ds_config['annotation_csv'])
+    image_dir = str(project_root / ds_config['image_dir'])
+
     # Get image IDs and split
-    image_ids, image_classes = get_image_ids_with_defects(ds_config['annotation_csv'])
+    image_ids, image_classes = get_image_ids_with_defects(annotation_csv)
     train_ids, val_ids, test_ids = split_dataset(
         image_ids, image_classes,
         train_ratio=ds_config['split']['train_ratio'],
@@ -643,24 +648,24 @@ def create_data_loaders(
     DatasetClass = SeverstalDetectionDataset if model_type == "detection" else SeverstalSegmentationDataset
 
     train_dataset = DatasetClass(
-        image_dir=ds_config['image_dir'],
-        annotation_csv=ds_config['annotation_csv'],
+        image_dir=image_dir,
+        annotation_csv=annotation_csv,
         image_ids=train_ids,
         input_size=input_size,
         transform=train_transform,
         is_training=True,
     )
     val_dataset = DatasetClass(
-        image_dir=ds_config['image_dir'],
-        annotation_csv=ds_config['annotation_csv'],
+        image_dir=image_dir,
+        annotation_csv=annotation_csv,
         image_ids=val_ids,
         input_size=input_size,
         transform=eval_transform,
         is_training=False,
     )
     test_dataset = DatasetClass(
-        image_dir=ds_config['image_dir'],
-        annotation_csv=ds_config['annotation_csv'],
+        image_dir=image_dir,
+        annotation_csv=annotation_csv,
         image_ids=test_ids,
         input_size=input_size,
         transform=eval_transform,
@@ -672,7 +677,7 @@ def create_data_loaders(
     if casda_data is not None:
         casda_config = ds_config.get('casda', {})
         if casda_data == "full":
-            casda_dir = casda_config.get('full_dir', 'data/augmented/casda_full')
+            casda_dir = str(project_root / casda_config.get('full_dir', 'data/augmented/casda_full'))
             casda_dataset = CASDASyntheticDataset(
                 data_dir=casda_dir,
                 mode=model_type,
@@ -681,7 +686,7 @@ def create_data_loaders(
                 transform=train_transform,
             )
         elif casda_data == "pruning":
-            casda_dir = casda_config.get('pruning_dir', 'data/augmented/casda_pruning')
+            casda_dir = str(project_root / casda_config.get('pruning_dir', 'data/augmented/casda_pruning'))
             casda_dataset = CASDASyntheticDataset(
                 data_dir=casda_dir,
                 mode=model_type,
