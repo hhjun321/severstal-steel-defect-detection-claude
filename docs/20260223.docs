@@ -541,10 +541,51 @@
   | configs/benchmark_experiment.yaml  | 수정 | 이미지 수량 주석 갱신 (~967)            |
 
 
-13. 문법 검증
+13. torch.load weights_only 호환성 수정
+================================================================================
+
+13.1 문제
+---------
+  Colab 환경 PyTorch 2.6에서 벤치마크 실행 시 에러 발생:
+    _pickle.UnpicklingError: Weights only load failed.
+    Unsupported global: GLOBAL numpy._core.multiarray.scalar
+
+  원인: PyTorch 2.6부터 torch.load()의 기본값이 weights_only=True로 변경됨.
+  체크포인트에 저장된 numpy scalar (metrics 값 등)가 safe allowlist에 없어 거부됨.
+
+  에러 발생 위치:
+    src/training/trainer.py:447 — train() 종료 후 best 모델 로드 시점
+
+13.2 수정 내용
+--------------
+  모든 torch.load() 호출에 weights_only=False 명시적 추가.
+  자체 생성 체크포인트만 로드하므로 보안 위험 없음.
+
+  수정 위치 (총 4곳):
+
+  | 파일                               | 라인 | 함수/컨텍스트                      |
+  |------------------------------------|------|------------------------------------|
+  | src/training/trainer.py            | 201  | _load_checkpoint() — 학습 재개     |
+  | src/training/trainer.py            | 447  | train() — best 모델 테스트 평가    |
+  | src/training/trainer.py            | 469  | train() — best 체크포인트 경량화   |
+  | scripts/generate_augmented_data.py | 91   | load_model() — ControlNet 모델 로드|
+
+  변경 전: torch.load(path, map_location=device)
+  변경 후: torch.load(path, map_location=device, weights_only=False)
+
+13.3 변경 파일 테이블
+---------------------
+  | 파일                               | 상태 | 변경 내용                                |
+  |------------------------------------|------|------------------------------------------|
+  | src/training/trainer.py            | 수정 | torch.load에 weights_only=False 추가 (3곳)|
+  | scripts/generate_augmented_data.py | 수정 | torch.load에 weights_only=False 추가 (1곳)|
+
+
+14. 문법 검증
 ================================================================================
   py_compile(scripts/run_benchmark.py)               → OK
   py_compile(src/training/dataset.py)                 → OK
   py_compile(src/training/trainer.py)                 → OK
   py_compile(scripts/package_casda_data.py)           → OK (ast.parse)
+  py_compile(scripts/generate_augmented_data.py)      → OK
   yaml.safe_load(configs/benchmark_experiment.yaml)   → OK

@@ -198,7 +198,7 @@ class BenchmarkTrainer:
     def _load_checkpoint(self, checkpoint_path: str):
         """Load checkpoint to resume training."""
         logger.info(f"Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -444,7 +444,7 @@ class BenchmarkTrainer:
         # Load best model and evaluate on test set
         best_path = self.checkpoint_dir / f"{self.model_name}_best.pth"
         if best_path.exists():
-            checkpoint = torch.load(best_path, map_location=self.device)
+            checkpoint = torch.load(best_path, map_location=self.device, weights_only=False)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             logger.info("Loaded best model for test evaluation")
 
@@ -466,7 +466,7 @@ class BenchmarkTrainer:
 
         # Slim down best checkpoint: remove optimizer state (not needed for inference)
         if best_path.exists():
-            checkpoint = torch.load(best_path, map_location='cpu')
+            checkpoint = torch.load(best_path, map_location='cpu', weights_only=False)
             slim_state = {
                 'epoch': checkpoint['epoch'],
                 'model_state_dict': checkpoint['model_state_dict'],

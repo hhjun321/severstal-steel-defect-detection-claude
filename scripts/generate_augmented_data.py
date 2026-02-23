@@ -88,7 +88,7 @@ class AugmentationGenerator:
         model = SimpleControlNet(in_channels=3, out_channels=3, hint_channels=3)
         
         # Load checkpoint
-        checkpoint = torch.load(model_path, map_location=self.device)
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         
         # Handle different checkpoint formats
         if 'model_state_dict' in checkpoint:
