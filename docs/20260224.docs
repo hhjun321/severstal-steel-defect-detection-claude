@@ -1,0 +1,231 @@
+20260224 작업 일지 #1 - 독립 데이터셋 분할 CSV 생성 스크립트
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+벤치마크 실험(3 모델 x 4 데이터셋 그룹 = 12 runs)에서 모든 실험이 동일한
+train/val/test 분할을 사용하도록, 사전 생성된 분할 CSV 파일 기반 참조 시스템을
+구축한다.
+
+  - 독립 분할 CSV 생성 스크립트 (scripts/create_dataset_split.py) 신규 생성
+  - dataset.py의 create_data_loaders()에 split_csv 옵션 추가
+  - run_benchmark.py에 --split-csv CLI 인자 추가
+  - 이미지 파일을 복사/분할하지 않고 CSV 참조만으로 분할 관리 (디스크 중복 없음)
+
+
+2. 변경 파일
+================================================================================
+
+  | 파일                              | 상태   | 변경 내용                                          |
+  |-----------------------------------|--------|----------------------------------------------------|
+  | scripts/create_dataset_split.py   | 신규   | 독립 분할 CSV 생성 스크립트                         |
+  | src/training/dataset.py           | 수정   | split_csv 옵션 추가 (L633-654), logging import 추가 |
+  | scripts/run_benchmark.py          | 수정   | --split-csv CLI 인자 + config 주입                  |
+  | splits/split_70_15_15_seed42.csv  | 신규   | 기본 분할 CSV (70/15/15, seed=42)                   |
+
+
+3. scripts/create_dataset_split.py (신규 생성)
+================================================================================
+
+3.1 설계 원칙
+--------------
+  - 디스크 중복 없음: 이미지 파일을 복사하지 않고 CSV 참조만 생성
+  - 경량 의존성: pandas + scikit-learn만 사용 (cv2, torch 불필요)
+    → dataset.py를 import하면 cv2/torch 의존성이 따라오므로,
+      get_image_ids_with_defects()와 split_dataset()를 독립 구현
+  - dataset.py의 동일 함수와 완전히 같은 로직 → 동일 시드/비율 = 동일 결과
+  - CSV 상단에 # 주석으로 메타데이터 기록
+
+3.2 출력 CSV 형식
+------------------
+    # Severstal Dataset Split
+    # Created: 2026-02-24T08:54:26.635457
+    # Source CSV: train.csv
+    # Ratios: train=0.7, val=0.15, test=0.15
+    # Seed: 42
+    # Total: 6666, Train: 4666, Val: 1000, Test: 1000
+    #
+    ImageId,Split,PrimaryClass
+    0002cc93b.jpg,train,1
+    0007a71bf.jpg,train,3
+    ...
+
+3.3 CLI 사용법
+---------------
+    # 기본 70/15/15 분할
+    python scripts/create_dataset_split.py \
+        --csv train.csv \
+        --output splits/split_70_15_15_seed42.csv
+
+    # 80/10/10 분할 (다른 시드)
+    python scripts/create_dataset_split.py \
+        --csv train.csv \
+        --output splits/split_80_10_10.csv \
+        --train-ratio 0.8 --val-ratio 0.1 --test-ratio 0.1 --seed 123
+
+    # Colab 실행
+    python /content/severstal-steel-defect-detection/scripts/create_dataset_split.py \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --output /content/drive/MyDrive/data/Severstal/casda/splits/split_70_15_15_seed42.csv
+
+3.4 테스트 결과
+----------------
+    총 결함 이미지: 6,666장
+    train: 4,666장 (70.0%) - Class1: 628, Class2: 147, Class3: 3530, Class4: 361
+    val  : 1,000장 (15.0%) - Class1: 134, Class2:  32, Class3:  756, Class4:  78
+    test : 1,000장 (15.0%) - Class1: 135, Class2:  31, Class3:  757, Class4:  77
+
+    재현성 검증: 동일 인자로 2회 실행 → Identical: True
+
+
+4. src/training/dataset.py 수정
+================================================================================
+
+4.1 변경 내용
+--------------
+  (1) logging import 추가 (L13)
+  (2) create_data_loaders() 내 분할 로직에 split_csv 분기 추가 (L633-654)
+
+4.2 코드 diff — logging import 추가
+
+  변경 전:
+    import os
+    import json
+    import numpy as np
+    import pandas as pd
+
+  변경 후:
+    import os
+    import json
+    import logging
+    import numpy as np
+    import pandas as pd
+
+4.3 코드 diff — split_csv 분기 추가
+
+  변경 전 (L632-640):
+    # Get image IDs and split
+    image_ids, image_classes = get_image_ids_with_defects(annotation_csv)
+    train_ids, val_ids, test_ids = split_dataset(
+        image_ids, image_classes,
+        train_ratio=ds_config['split']['train_ratio'],
+        val_ratio=ds_config['split']['val_ratio'],
+        test_ratio=ds_config['split']['test_ratio'],
+        seed=ds_config['split']['seed'],
+    )
+
+  변경 후 (L633-654):
+    # Get image IDs and split
+    # split_csv가 지정되면 사전 생성된 분할 CSV에서 로드 (동적 분할 건너뜀)
+    split_csv = ds_config.get('split_csv', None)
+    if split_csv is not None and os.path.exists(split_csv):
+        split_df = pd.read_csv(split_csv, comment='#')
+        train_ids = split_df[split_df['Split'] == 'train']['ImageId'].tolist()
+        val_ids = split_df[split_df['Split'] == 'val']['ImageId'].tolist()
+        test_ids = split_df[split_df['Split'] == 'test']['ImageId'].tolist()
+        # image_classes는 split_info 통계용으로 여전히 필요
+        _, image_classes = get_image_ids_with_defects(annotation_csv)
+        logging.info(f"Loaded pre-defined split from {split_csv}: "
+                     f"train={len(train_ids)}, val={len(val_ids)}, test={len(test_ids)}")
+    else:
+        image_ids, image_classes = get_image_ids_with_defects(annotation_csv)
+        train_ids, val_ids, test_ids = split_dataset(
+            image_ids, image_classes,
+            train_ratio=ds_config['split']['train_ratio'],
+            val_ratio=ds_config['split']['val_ratio'],
+            test_ratio=ds_config['split']['test_ratio'],
+            seed=ds_config['split']['seed'],
+        )
+        if split_csv is not None:
+            logging.warning(f"Split CSV not found: {split_csv} -- falling back to dynamic split")
+
+4.4 동작 방식
+--------------
+  - split_csv가 config에 없거나 None → 기존 동적 분할 (하위 호환성 유지)
+  - split_csv가 지정되고 파일 존재 → CSV에서 분할 로드
+  - split_csv가 지정되었으나 파일 미존재 → 경고 후 동적 분할 fallback
+
+
+5. scripts/run_benchmark.py 수정
+================================================================================
+
+5.1 변경 내용
+--------------
+  (1) --split-csv CLI 인자 추가
+  (2) config['dataset']['split_csv']에 절대 경로로 주입
+
+5.2 코드 diff — argparse 인자 추가
+
+  변경 전:
+    parser.add_argument('--casda-dir', type=str, default=None,
+                        help='Parent dir containing casda_full/ and casda_pruning/ '
+                             '(overrides config dataset.casda paths)')
+    args = parser.parse_args()
+
+  변경 후:
+    parser.add_argument('--casda-dir', type=str, default=None,
+                        help='Parent dir containing casda_full/ and casda_pruning/ '
+                             '(overrides config dataset.casda paths)')
+    parser.add_argument('--split-csv', type=str, default=None,
+                        help='사전 생성된 분할 CSV 파일 경로 '
+                             '(scripts/create_dataset_split.py로 생성). '
+                             '지정 시 동적 분할 대신 이 파일의 분할을 사용')
+    args = parser.parse_args()
+
+5.3 코드 diff — config 주입
+
+  변경 전:
+    print(f"[INFO] casda paths overridden: ...")
+
+    # Override epochs if specified (for quick testing)
+
+  변경 후:
+    print(f"[INFO] casda paths overridden: ...")
+
+    # Override split CSV if specified
+    if args.split_csv:
+        split_csv_path = os.path.abspath(args.split_csv)
+        config['dataset']['split_csv'] = split_csv_path
+        print(f"[INFO] split_csv overridden to: {split_csv_path}")
+
+    # Override epochs if specified (for quick testing)
+
+5.4 벤치마크 실행 명령어 (Colab)
+----------------------------------
+    python /content/severstal-steel-defect-detection/scripts/run_benchmark.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --casda-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \
+        --split-csv /content/drive/MyDrive/data/Severstal/casda/splits/split_70_15_15_seed42.csv \
+        --output-dir /content/drive/MyDrive/data/Severstal/casda/benchmark_results \
+        --models yolo_mfd \
+        --groups baseline_raw \
+        --epochs 300 \
+        --resume
+
+
+6. 구문 검증
+================================================================================
+
+  6.1 scripts/create_dataset_split.py
+    - 실행: python scripts/create_dataset_split.py --csv train.csv --output splits/test.csv
+    - 결과: 정상 실행, 6,666장 분할 완료
+    - 재현성: 동일 인자 2회 실행 → 동일 결과 (Identical: True)
+    - CSV 읽기: pd.read_csv(comment='#') → 6,666행 정상 로드
+
+  6.2 src/training/dataset.py
+    - logging import 추가 확인
+    - split_csv 분기 로직: 3가지 경로 (CSV 존재/미존재/미지정) 모두 처리
+    - 하위 호환성: split_csv 미지정 시 기존 동적 분할 동작 유지
+
+  6.3 scripts/run_benchmark.py
+    - --split-csv 인자: os.path.abspath()로 절대 경로 변환
+    - config 주입: config['dataset']['split_csv']에 저장
+
+
+7. 향후 작업
+================================================================================
+  - [ ] mAP ≈ 0 문제 조사 (평가 파이프라인 디버깅)
+  - [ ] Colab에서 분할 CSV 생성 후 벤치마크 재실행
+  - [ ] package_casda_data.py 품질 점수 수정 후 재실행

@@ -428,6 +428,10 @@ Examples:
     parser.add_argument('--casda-dir', type=str, default=None,
                         help='Parent dir containing casda_full/ and casda_pruning/ '
                              '(overrides config dataset.casda paths)')
+    parser.add_argument('--split-csv', type=str, default=None,
+                        help='사전 생성된 분할 CSV 파일 경로 '
+                             '(scripts/create_dataset_split.py로 생성). '
+                             '지정 시 동적 분할 대신 이 파일의 분할을 사용')
     args = parser.parse_args()
 
     # Load config
@@ -453,6 +457,12 @@ Examples:
         config['dataset']['casda']['full_dir'] = os.path.join(casda_base, 'casda_full')
         config['dataset']['casda']['pruning_dir'] = os.path.join(casda_base, 'casda_pruning')
         print(f"[INFO] casda paths overridden: {casda_base}/casda_full, {casda_base}/casda_pruning")
+
+    # Override split CSV if specified
+    if args.split_csv:
+        split_csv_path = os.path.abspath(args.split_csv)
+        config['dataset']['split_csv'] = split_csv_path
+        print(f"[INFO] split_csv overridden to: {split_csv_path}")
 
     # Override epochs if specified (for quick testing)
     if args.epochs is not None:

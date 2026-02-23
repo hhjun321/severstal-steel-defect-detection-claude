@@ -11,6 +11,7 @@ supporting 4 dataset groups:
 
 import os
 import json
+import logging
 import numpy as np
 import pandas as pd
 import cv2
@@ -630,14 +631,28 @@ def create_data_loaders(
     image_dir = raw_img if os.path.isabs(raw_img) else str(project_root / raw_img)
 
     # Get image IDs and split
-    image_ids, image_classes = get_image_ids_with_defects(annotation_csv)
-    train_ids, val_ids, test_ids = split_dataset(
-        image_ids, image_classes,
-        train_ratio=ds_config['split']['train_ratio'],
-        val_ratio=ds_config['split']['val_ratio'],
-        test_ratio=ds_config['split']['test_ratio'],
-        seed=ds_config['split']['seed'],
-    )
+    # split_csv가 지정되면 사전 생성된 분할 CSV에서 로드 (동적 분할 건너뜀)
+    split_csv = ds_config.get('split_csv', None)
+    if split_csv is not None and os.path.exists(split_csv):
+        split_df = pd.read_csv(split_csv, comment='#')
+        train_ids = split_df[split_df['Split'] == 'train']['ImageId'].tolist()
+        val_ids = split_df[split_df['Split'] == 'val']['ImageId'].tolist()
+        test_ids = split_df[split_df['Split'] == 'test']['ImageId'].tolist()
+        # image_classes는 split_info 통계용으로 여전히 필요
+        _, image_classes = get_image_ids_with_defects(annotation_csv)
+        logging.info(f"Loaded pre-defined split from {split_csv}: "
+                     f"train={len(train_ids)}, val={len(val_ids)}, test={len(test_ids)}")
+    else:
+        image_ids, image_classes = get_image_ids_with_defects(annotation_csv)
+        train_ids, val_ids, test_ids = split_dataset(
+            image_ids, image_classes,
+            train_ratio=ds_config['split']['train_ratio'],
+            val_ratio=ds_config['split']['val_ratio'],
+            test_ratio=ds_config['split']['test_ratio'],
+            seed=ds_config['split']['seed'],
+        )
+        if split_csv is not None:
+            logging.warning(f"Split CSV not found: {split_csv} — falling back to dynamic split")
 
     # Determine augmentation
     augmentation = group_config.get('augmentation', 'none')
