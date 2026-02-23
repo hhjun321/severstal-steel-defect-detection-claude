@@ -23,6 +23,16 @@ Usage (Colab example):
       --output-dir /content/drive/MyDrive/data/Severstal/data/augmented \
       --suitability-threshold 0.7 \
       --pruning-top-k 2000
+
+  # With separate quality scores from local evaluation:
+  python scripts/package_casda_data.py \
+      --generated-dir /content/drive/MyDrive/data/Severstal/augmented_images_v4/generated \
+      --summary-json /content/drive/MyDrive/data/Severstal/augmented_images_v4/generation_summary.json \
+      --quality-json /content/drive/MyDrive/data/Severstal/quality_scores.json \
+      --hint-dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/hints \
+      --output-dir /content/drive/MyDrive/data/Severstal/data/augmented \
+      --suitability-threshold 0.7 \
+      --pruning-top-k 2000
 """
 
 import argparse
@@ -74,22 +84,97 @@ def extract_mask_from_hint(hint_path: str, threshold: int = 127) -> Optional[np.
     return binary_mask
 
 
-def build_quality_map(summary: dict) -> dict:
+def build_quality_map(summary: dict, quality_json_path: Optional[Path] = None) -> dict:
     """
-    Build filename → quality_score mapping from generation_summary.json.
+    Build filename → quality_score mapping from quality data.
     
-    The quality section contains sample_scores with per-image quality metrics.
+    Sources (in priority order):
+      1. Separate --quality-json file (if provided)
+      2. quality.sample_scores[] in the main summary JSON
+    
+    Also builds sample_name → score mapping for multi-generation fallback.
+    When a file like foo_gen1.png has no direct score, we try foo_gen0.png's score
+    (same sample, different generation pass).
+    
+    Returns:
+        dict mapping filename → quality_score
     """
+    sample_scores = []
+    
+    # Source 1: Separate quality JSON file
+    if quality_json_path and quality_json_path.exists():
+        print(f"Loading quality scores from: {quality_json_path}")
+        with open(quality_json_path) as f:
+            quality_data = json.load(f)
+        # Support both formats: direct list or nested under "quality"
+        if isinstance(quality_data, list):
+            sample_scores = quality_data
+        elif isinstance(quality_data, dict):
+            quality_section = quality_data.get("quality", quality_data)
+            sample_scores = quality_section.get("sample_scores", [])
+    
+    # Source 2: quality section in summary JSON
+    if not sample_scores:
+        quality_section = summary.get("quality", {})
+        sample_scores = quality_section.get("sample_scores", [])
+    
+    if not sample_scores:
+        print("WARNING: No quality scores found in any source.")
+        print("  All images will use default score 1.0 (included in both full and pruning).")
+        return {}
+    
+    # Build exact filename → score mapping
     quality_map = {}
-    quality_section = summary.get("quality", {})
-    sample_scores = quality_section.get("sample_scores", [])
-    
     for entry in sample_scores:
         fname = entry.get("filename", "")
         score = entry.get("quality_score", 0.0)
         quality_map[fname] = score
     
+    # Build sample_name → score mapping for multi-generation fallback
+    # e.g., if we have score for foo_gen0.png, also apply it to foo_gen1.png, foo_gen2.png
+    sample_name_scores = {}
+    for fname, score in quality_map.items():
+        sname = filename_to_sample_name(fname)
+        # Keep the first (gen0) score per sample_name
+        if sname not in sample_name_scores:
+            sample_name_scores[sname] = score
+    
+    # Expand: for any filename not in quality_map, try sample_name fallback
+    # (This will be done at lookup time via get_quality_score helper)
+    quality_map["__sample_name_fallback__"] = sample_name_scores
+    
+    print(f"Quality scores loaded: {len(quality_map) - 1} direct entries, "
+          f"{len(sample_name_scores)} sample-name groups")
+    
     return quality_map
+
+
+def get_quality_score(quality_map: dict, filename: str, default: float = 1.0) -> float:
+    """
+    Look up quality score for a generated image filename.
+    
+    Lookup order:
+      1. Exact filename match
+      2. Sample-name fallback (strip _genN suffix, use gen0's score)
+      3. Default value (1.0 — include by default when no scores available)
+    
+    Args:
+        quality_map: Map from build_quality_map()
+        filename: Generated image filename
+        default: Default score when no match found (1.0 = always included)
+    """
+    # Direct match
+    if filename in quality_map:
+        return quality_map[filename]
+    
+    # Sample-name fallback (for multi-generation: gen1/gen2 use gen0's score)
+    sample_name_scores = quality_map.get("__sample_name_fallback__", {})
+    if sample_name_scores:
+        sname = filename_to_sample_name(filename)
+        if sname in sample_name_scores:
+            return sample_name_scores[sname]
+    
+    return default
 
 
 def build_sample_name_to_result(summary: dict) -> dict:
@@ -124,9 +209,11 @@ def package_data(
     summary_json: Path,
     hint_dir: Path,
     output_dir: Path,
-    suitability_threshold: float = 0.7,
+    quality_json: Optional[Path] = None,
+    suitability_threshold: float = 0.63,
     pruning_top_k: int = 2000,
     mask_threshold: int = 127,
+    default_score: float = 1.0,
 ) -> None:
     """Main packaging logic."""
     
@@ -139,11 +226,15 @@ def package_data(
     print(f"Total samples in summary: {total_samples}")
     
     # Build lookup maps
-    quality_map = build_quality_map(summary)
+    quality_map = build_quality_map(summary, quality_json_path=quality_json)
     sample_name_map = build_sample_name_to_result(summary)
     
-    print(f"Quality scores available for {len(quality_map)} images")
+    # Count real quality entries (exclude the fallback key)
+    real_quality_count = len([k for k in quality_map if k != "__sample_name_fallback__"])
+    print(f"Quality scores available for {real_quality_count} images")
     print(f"Result entries for {len(sample_name_map)} samples")
+    if real_quality_count == 0:
+        print(f"NOTE: Default score {default_score} will be used for all images")
     
     # Discover generated images
     generated_images = sorted(generated_dir.glob("*.png"))
@@ -182,8 +273,8 @@ def package_data(
             skipped_class_parse += 1
             continue
         
-        # Get quality score
-        suitability_score = quality_map.get(filename, 0.0)
+        # Get quality score (with sample-name fallback for multi-generation)
+        suitability_score = get_quality_score(quality_map, filename, default=default_score)
         
         # Find hint image for mask extraction
         # Try from results[] first (has exact hint_path), then construct from sample_name
@@ -320,6 +411,8 @@ def package_data(
             "generated_dir": str(generated_dir),
             "summary_json": str(summary_json),
             "hint_dir": str(hint_dir),
+            "quality_json": str(quality_json) if quality_json else None,
+            "default_score": default_score,
         },
         "casda_full": {
             "total_images": len(all_metadata),
@@ -387,10 +480,26 @@ def main():
         help="Output directory (will create casda_full/ and casda_pruning/ inside)",
     )
     parser.add_argument(
+        "--quality-json",
+        type=str,
+        default=None,
+        help="Optional separate JSON file containing quality scores. "
+             "Can be a generation_summary.json from a different run that has "
+             "the quality section populated, or a standalone JSON list of "
+             "{filename, quality_score} objects.",
+    )
+    parser.add_argument(
+        "--default-score",
+        type=float,
+        default=1.0,
+        help="Default quality score when no scores are available (default: 1.0). "
+             "Set to 1.0 to include all images; set to 0.0 to exclude unscored images.",
+    )
+    parser.add_argument(
         "--suitability-threshold",
         type=float,
-        default=0.7,
-        help="Minimum quality score for pruning (default: 0.7)",
+        default=0.63,
+        help="Minimum quality score for pruning (default: 0.63, approx P50 of v4 scores)",
     )
     parser.add_argument(
         "--pruning-top-k",
@@ -412,9 +521,11 @@ def main():
         summary_json=Path(args.summary_json),
         hint_dir=Path(args.hint_dir),
         output_dir=Path(args.output_dir),
+        quality_json=Path(args.quality_json) if args.quality_json else None,
         suitability_threshold=args.suitability_threshold,
         pruning_top_k=args.pruning_top_k,
         mask_threshold=args.mask_threshold,
+        default_score=args.default_score,
     )
 
 

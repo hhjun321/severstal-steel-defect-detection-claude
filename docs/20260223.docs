@@ -716,3 +716,215 @@
   ast.parse(scripts/package_casda_data.py)           → OK
   ast.parse(scripts/generate_augmented_data.py)      → OK
   yaml.safe_load(configs/benchmark_experiment.yaml)  → OK
+
+
+17. 품질 점수 문제 수정 (package_casda_data.py)
+================================================================================
+
+17.1 문제 진단
+--------------
+  Colab에서 package_casda_data.py 실행 결과, casda_pruning 디렉터리에 이미지 0개
+  문제:
+    1) generation_summary.json의 quality 섹션이 비어있음 (생성 시 품질 평가 미실행)
+    2) 2,901개 생성 이미지 vs 967개 summary 항목 (num_images_per_prompt=3)
+    3) build_quality_map()이 빈 dict 반환 → quality_map.get(filename, 0.0) = 0.0
+    4) 0.7 임계값으로 필터링 → 전부 탈락
+
+  로컬 품질 점수 분석 (outputs/test_results_v4/phase1_basic/generation_summary.json):
+    - 967개 이미지 (gen0만), 점수 범위 [0.5417, 0.6938], 평균 0.6254
+    - 0.7 이상: 0개 (0%) ← 임계값 자체가 도달 불가능
+    - P50: 0.6264, P75: 0.6425, P90: 0.6562
+
+17.2 수정 내용
+--------------
+  파일: scripts/package_casda_data.py
+
+  (1) --quality-json 인수 추가 (선택)
+      - 별도의 품질 점수 JSON 파일 지정 가능
+      - 형식: generation_summary.json (quality.sample_scores[]) 또는 직접 list
+      - Colab의 summary에 품질 섹션이 없을 때, 로컬에서 평가한 파일 활용
+
+  (2) 기본 점수 0.0 → 1.0 변경
+      - 품질 점수가 없는 이미지에 대해 기본값 1.0 부여 (포함, 배제 아님)
+      - --default-score 인수로 사용자 제어 가능
+      - 이전: quality_map.get(filename, 0.0) → 무조건 탈락
+      - 이후: get_quality_score(quality_map, filename, default=1.0) → 포함
+
+  (3) 다중 생성 filename 매칭 개선
+      - gen0만 품질 점수가 있을 때 gen1/gen2도 동일 점수 부여
+      - 매칭 순서: ① 정확한 filename → ② sample_name 폴백 (_genN 제거)
+      - build_quality_map()에 __sample_name_fallback__ 키로 sample_name→score 맵 내장
+      - get_quality_score() 헬퍼 함수 신규 추가
+
+  (4) 임계값 0.7 → 0.63 변경
+      - v4 품질 점수 분포 분석 결과 최대값 0.6938, 0.7 도달 불가
+      - 0.63 ≈ P50, 약 484개 sample × 3 gen = ~1,452개 pruning 대상
+      - package_casda_data.py 기본값, benchmark_experiment.yaml 모두 갱신
+
+17.3 변경 파일 테이블
+---------------------
+  | 파일                              | 상태 | 변경 내용                                       |
+  |-----------------------------------|------|-------------------------------------------------|
+  | scripts/package_casda_data.py     | 수정 | --quality-json, --default-score 인수 추가       |
+  |                                   |      | get_quality_score() 함수 추가 (폴백 매칭)       |
+  |                                   |      | build_quality_map() 다중 소스 + 폴백 지원       |
+  |                                   |      | 기본 점수 0.0→1.0, 임계값 0.7→0.63              |
+  | configs/benchmark_experiment.yaml | 수정 | suitability_threshold: 0.7→0.63                 |
+  |                                   |      | casda_full 설명 ~967→~2,901, pruning 설명 갱신  |
+  | src/training/dataset.py           | 수정 | 기본 suitability_threshold 폴백 0.7→0.63 (L700) |
+
+17.4 수정 이력 (코드 diff)
+---------------------------
+
+  [scripts/package_casda_data.py]
+
+  ■ build_quality_map() 함수 리팩터링 (L87-149)
+    변경 전:
+      def build_quality_map(summary: dict) -> dict:
+          quality_map = {}
+          quality_section = summary.get("quality", {})
+          sample_scores = quality_section.get("sample_scores", [])
+          for entry in sample_scores:
+              fname = entry.get("filename", "")
+              score = entry.get("quality_score", 0.0)
+              quality_map[fname] = score
+          return quality_map
+
+    변경 후:
+      def build_quality_map(summary: dict, quality_json_path=None) -> dict:
+          sample_scores = []
+          # 소스 1: 별도 --quality-json 파일 (우선)
+          if quality_json_path and quality_json_path.exists():
+              with open(quality_json_path) as f:
+                  quality_data = json.load(f)
+              if isinstance(quality_data, list):
+                  sample_scores = quality_data
+              elif isinstance(quality_data, dict):
+                  quality_section = quality_data.get("quality", quality_data)
+                  sample_scores = quality_section.get("sample_scores", [])
+          # 소스 2: 메인 summary JSON의 quality 섹션
+          if not sample_scores:
+              quality_section = summary.get("quality", {})
+              sample_scores = quality_section.get("sample_scores", [])
+          if not sample_scores:
+              print("WARNING: 품질 점수 소스 없음. 기본값 1.0 사용")
+              return {}
+          # 직접 매칭 맵 구축
+          quality_map = {e["filename"]: e["quality_score"] for e in sample_scores}
+          # sample_name 폴백 맵 구축 (gen0 점수를 gen1/gen2에 적용)
+          sample_name_scores = {}
+          for fname, score in quality_map.items():
+              sname = filename_to_sample_name(fname)
+              if sname not in sample_name_scores:
+                  sample_name_scores[sname] = score
+          quality_map["__sample_name_fallback__"] = sample_name_scores
+          return quality_map
+
+    변경 사유: 품질 점수 소스가 비어있을 때 빈 dict 반환하여 기본값(1.0) 사용.
+              별도 파일 지원. 다중 생성 폴백.
+
+  ■ get_quality_score() 함수 신규 추가 (L152-177)
+    def get_quality_score(quality_map, filename, default=1.0) -> float:
+        # 1순위: 정확한 filename 매칭
+        if filename in quality_map:
+            return quality_map[filename]
+        # 2순위: sample_name 폴백 (_genN 제거 후 매칭)
+        sample_name_scores = quality_map.get("__sample_name_fallback__", {})
+        if sample_name_scores:
+            sname = filename_to_sample_name(filename)
+            if sname in sample_name_scores:
+                return sample_name_scores[sname]
+        # 3순위: 기본값 (1.0)
+        return default
+
+    추가 사유: 기존 quality_map.get(filename, 0.0)을 대체.
+              3단계 폴백으로 다중 생성 + 품질 점수 부재 상황 처리.
+
+  ■ 점수 조회 부분 변경 (package_data 함수 내, L277)
+    변경 전: suitability_score = quality_map.get(filename, 0.0)
+    변경 후: suitability_score = get_quality_score(quality_map, filename, default=default_score)
+
+  ■ package_data() 시그니처 변경 (L207-217)
+    추가된 매개변수:
+      quality_json: Optional[Path] = None     # 별도 품질 점수 파일
+      default_score: float = 1.0              # 품질 점수 없을 때 기본값
+
+  ■ CLI 인수 추가 (L482-497)
+    --quality-json: 별도 품질 점수 JSON 경로 (선택)
+    --default-score: 점수 없는 이미지의 기본값 (기본: 1.0)
+
+  ■ 임계값 기본값 변경
+    --suitability-threshold: 0.7 → 0.63
+    package_data() 시그니처: suitability_threshold=0.7 → 0.63
+
+  [configs/benchmark_experiment.yaml]
+
+  ■ L35-38: CASDA 설정 변경
+    변경 전:
+      full_dir: "data/augmented/casda_full"        # ~967 synthetic images (ControlNet v4)
+      pruning_dir: "data/augmented/casda_pruning"  # top-K by suitability (threshold >= 0.7)
+      suitability_threshold: 0.7
+    변경 후:
+      full_dir: "data/augmented/casda_full"        # ~2,901 synthetic images (ControlNet v4, 3 gens/sample)
+      pruning_dir: "data/augmented/casda_pruning"  # top-K by suitability (threshold >= 0.63, ~P50)
+      suitability_threshold: 0.63
+
+  ■ L66-67: casda_full 설명 갱신
+    변경 전: description: "Original + all ~967 CASDA synthetic images"
+    변경 후: description: "Original + all ~2,901 CASDA synthetic images (3 gens × 967 samples)"
+
+  ■ L73-74: casda_pruning 설명 갱신
+    변경 전: description: "Original + top CASDA images by suitability score (threshold >= 0.7)"
+    변경 후: description: "Original + top CASDA images by suitability score (threshold >= 0.63, ~P50)"
+
+  [src/training/dataset.py]
+
+  ■ L700: 기본 임계값 폴백 변경
+    변경 전: suitability_threshold=casda_config.get('suitability_threshold', 0.7),
+    변경 후: suitability_threshold=casda_config.get('suitability_threshold', 0.63),
+
+17.5 Colab 재실행 명령어
+------------------------
+  # 방법 A: 품질 점수 없이 (기본값 1.0, pruning = 전체 2,901개)
+  python /content/severstal-steel-defect-detection/scripts/package_casda_data.py \
+      --generated-dir /content/drive/MyDrive/data/Severstal/augmented_images_v4/generated \
+      --summary-json /content/drive/MyDrive/data/Severstal/augmented_images_v4/generation_summary.json \
+      --hint-dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/hints \
+      --output-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \
+      --suitability-threshold 0.63 \
+      --pruning-top-k 2000
+
+  # 방법 B: 로컬 품질 점수 파일 업로드 후 사용 (권장)
+  # 먼저 outputs/test_results_v4/phase1_basic/generation_summary.json을
+  # Colab Drive에 업로드 후:
+  python /content/severstal-steel-defect-detection/scripts/package_casda_data.py \
+      --generated-dir /content/drive/MyDrive/data/Severstal/augmented_images_v4/generated \
+      --summary-json /content/drive/MyDrive/data/Severstal/augmented_images_v4/generation_summary.json \
+      --quality-json /content/drive/MyDrive/data/Severstal/quality_scores.json \
+      --hint-dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/hints \
+      --output-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \
+      --suitability-threshold 0.63 \
+      --pruning-top-k 2000
+
+17.6 예상 결과
+--------------
+  방법 A (품질 점수 없음):
+    - casda_full: 2,901개 (기본 점수 1.0)
+    - casda_pruning: 2,000개 (전부 1.0 ≥ 0.63, top_k=2000으로 제한)
+
+  방법 B (로컬 품질 점수 사용):
+    - casda_full: 2,901개 (gen0: 실제 점수, gen1/gen2: gen0 점수 폴백)
+    - casda_pruning: ~1,452개 (0.63 이상 ~484 samples × 3 gens, top_k 미적용)
+
+17.7 단위 테스트 결과
+---------------------
+  filename_to_sample_name: OK
+  get_quality_score: OK (직접 매칭, sample_name 폴백, 기본값 모두 검증)
+  실제 데이터 테스트: OK (967 direct, gen1 fallback 작동)
+
+
+18. 문법 검증 (섹션 17 이후)
+================================================================================
+  ast.parse(scripts/package_casda_data.py)           → OK
+  ast.parse(src/training/dataset.py)                 → OK
+  yaml.safe_load(configs/benchmark_experiment.yaml)  → OK

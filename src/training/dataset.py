@@ -697,7 +697,7 @@ def create_data_loaders(
                 mode=model_type,
                 input_size=input_size,
                 num_classes=ds_config.get('num_classes', 4),
-                suitability_threshold=casda_config.get('suitability_threshold', 0.7),
+                suitability_threshold=casda_config.get('suitability_threshold', 0.63),
                 max_samples=casda_config.get('pruning_top_k', 2000),
                 transform=train_transform,
             )
