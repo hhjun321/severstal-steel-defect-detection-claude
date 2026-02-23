@@ -378,11 +378,11 @@ class CASDASyntheticDataset(Dataset):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         if self.mode == "detection":
-            return self._get_detection_item(image, sample)
+            return self._get_detection_item(image, sample, idx)
         else:
-            return self._get_segmentation_item(image, sample)
+            return self._get_segmentation_item(image, sample, idx)
 
-    def _get_detection_item(self, image: np.ndarray, sample: Dict) -> Dict:
+    def _get_detection_item(self, image: np.ndarray, sample: Dict, idx: int) -> Dict:
         """Return detection-format item."""
         orig_h, orig_w = image.shape[:2]
 
@@ -438,7 +438,7 @@ class CASDASyntheticDataset(Dataset):
             'image_id': Path(sample.get('image_path', f'synthetic_{idx}')).stem,
         }
 
-    def _get_segmentation_item(self, image: np.ndarray, sample: Dict) -> Dict:
+    def _get_segmentation_item(self, image: np.ndarray, sample: Dict, idx: int) -> Dict:
         """Return segmentation-format item."""
         orig_h, orig_w = image.shape[:2]
 

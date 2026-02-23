@@ -928,3 +928,56 @@
   ast.parse(scripts/package_casda_data.py)           → OK
   ast.parse(src/training/dataset.py)                 → OK
   yaml.safe_load(configs/benchmark_experiment.yaml)  → OK
+
+
+19. CASDA 데이터셋 idx 미정의 버그 수정 (dataset.py)
+================================================================================
+
+19.1 문제
+---------
+  Colab에서 yolo_mfd + casda_full 학습 시 DataLoader 워커에서 NameError 발생:
+    NameError: name 'idx' is not defined. Did you mean: 'id'?
+
+  에러 위치: src/training/dataset.py L438 (_get_detection_item)
+  동일 버그: src/training/dataset.py L476 (_get_segmentation_item)
+
+  원인:
+    __getitem__(self, idx) 에서 idx를 받지만,
+    _get_detection_item(self, image, sample) 호출 시 idx를 전달하지 않음.
+    메서드 내부에서 f'synthetic_{idx}' 로 idx 참조 → NameError.
+
+19.2 수정 내용
+--------------
+  파일: src/training/dataset.py
+
+  (1) __getitem__ 내 호출부 변경 (L380-383)
+      변경 전:
+        if self.mode == "detection":
+            return self._get_detection_item(image, sample)
+        else:
+            return self._get_segmentation_item(image, sample)
+      변경 후:
+        if self.mode == "detection":
+            return self._get_detection_item(image, sample, idx)
+        else:
+            return self._get_segmentation_item(image, sample, idx)
+
+  (2) _get_detection_item 시그니처 변경 (L385)
+      변경 전: def _get_detection_item(self, image: np.ndarray, sample: Dict) -> Dict:
+      변경 후: def _get_detection_item(self, image: np.ndarray, sample: Dict, idx: int) -> Dict:
+
+  (3) _get_segmentation_item 시그니처 변경 (L441)
+      변경 전: def _get_segmentation_item(self, image: np.ndarray, sample: Dict) -> Dict:
+      변경 후: def _get_segmentation_item(self, image: np.ndarray, sample: Dict, idx: int) -> Dict:
+
+19.3 변경 파일 테이블
+---------------------
+  | 파일                    | 상태 | 변경 내용                                         |
+  |-------------------------|------|----------------------------------------------------|
+  | src/training/dataset.py | 수정 | __getitem__에서 idx를 하위 메서드에 전달 (L380-383) |
+  |                         |      | _get_detection_item 시그니처에 idx 추가 (L385)     |
+  |                         |      | _get_segmentation_item 시그니처에 idx 추가 (L441)  |
+
+19.4 문법 검증
+--------------
+  ast.parse(src/training/dataset.py)  → OK
