@@ -457,9 +457,94 @@
   | scripts/run_benchmark.py          | 수정 | meta.json에 early stop + AMP 정보 추가       |
 
 
-12. 문법 검증
+12. CASDA 데이터 패키징 스크립트 (package_casda_data.py)
+================================================================================
+
+12.1 목적
+---------
+  ControlNet v4 출력물을 CASDASyntheticDataset이 기대하는 벤치마크 형식으로 변환.
+
+  입력:
+    - augmented_images_v4/generated/*.png (생성 이미지 ~967장)
+    - augmented_images_v4/generation_summary.json (메타데이터 + 품질 점수)
+    - controlnet_dataset_v4/hints/*_hint.png (힌트 이미지, Red채널 = 결함 마스크)
+
+  출력:
+    - casda_full/images/, casda_full/masks/, casda_full/metadata.json
+    - casda_pruning/images/, casda_pruning/masks/, casda_pruning/metadata.json
+    - packaging_report.json (패키징 통계)
+
+12.2 5가지 갭 해결 방법
+-----------------------
+  | 갭                          | 해결 방법                                       |
+  |-----------------------------|------------------------------------------------|
+  | metadata.json 부재          | generation_summary.json 파싱 → 생성             |
+  | 마스크 부재                  | 힌트 Red채널 추출, threshold(>127) → 이진 마스크 |
+  | suitability_score 부재       | quality_score를 그대로 사용                     |
+  | 디렉토리 구조 불일치         | generated/ → images/, 마스크 → masks/           |
+  | class_id 인코딩 (1-indexed) | 파일명에서 class{N} 파싱 → N-1 (0-indexed)      |
+
+12.3 핵심 함수
+--------------
+  parse_class_id_from_filename(filename)
+    - 정규식 _class(\d+)_ 로 추출, 1-indexed → 0-indexed 변환
+
+  extract_mask_from_hint(hint_path, threshold=127)
+    - OpenCV BGR 로드 → channel[2] (Red) 추출 → cv2.threshold → 이진 마스크
+
+  build_quality_map(summary)
+    - quality.sample_scores[] → {filename: quality_score} 매핑
+
+  filename_to_sample_name(filename)
+    - "xxx_gen0.png" → "xxx" (sample_name으로 역변환)
+
+  package_data(...)
+    - 메인 로직: 전체 처리 + casda_full 생성 + casda_pruning 필터링
+
+12.4 pruning 로직
+-----------------
+  1. suitability_score >= threshold (기본 0.7) 필터
+  2. score 내림차순 정렬
+  3. top_k (기본 2000) 제한
+  → ~967개 중 threshold 통과분만 casda_pruning에 포함
+
+12.5 CLI 인수
+-------------
+  --generated-dir     생성 이미지 디렉토리
+  --summary-json      generation_summary.json 경로
+  --hint-dir          힌트 이미지 디렉토리
+  --output-dir        출력 디렉토리 (casda_full/, casda_pruning/ 생성)
+  --suitability-threshold  pruning 임계값 (기본: 0.7)
+  --pruning-top-k     pruning 최대 개수 (기본: 2000)
+  --mask-threshold    Red 채널 이진화 임계값 (기본: 127)
+
+12.6 Colab 실행 예시
+--------------------
+  python scripts/package_casda_data.py \
+      --generated-dir /content/drive/MyDrive/data/Severstal/augmented_images_v4/generated \
+      --summary-json /content/drive/MyDrive/data/Severstal/augmented_images_v4/generation_summary.json \
+      --hint-dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/hints \
+      --output-dir /content/drive/MyDrive/data/Severstal/data/augmented
+
+12.7 YAML config 주석 갱신
+--------------------------
+  - "5,000 synthetic images" → "~967 synthetic images (ControlNet v4)"
+  - "top 2,000 by suitability" → "top-K by suitability (threshold >= 0.7)"
+  - casda_full description: "all ~967 CASDA synthetic images"
+  - casda_pruning description: "threshold >= 0.7"
+
+12.8 변경 파일 테이블
+---------------------
+  | 파일                               | 상태 | 변경 내용                               |
+  |------------------------------------|------|-----------------------------------------|
+  | scripts/package_casda_data.py      | 신규 | ControlNet v4 출력 → 벤치마크 형식 변환  |
+  | configs/benchmark_experiment.yaml  | 수정 | 이미지 수량 주석 갱신 (~967)            |
+
+
+13. 문법 검증
 ================================================================================
   py_compile(scripts/run_benchmark.py)               → OK
   py_compile(src/training/dataset.py)                 → OK
   py_compile(src/training/trainer.py)                 → OK
+  py_compile(scripts/package_casda_data.py)           → OK (ast.parse)
   yaml.safe_load(configs/benchmark_experiment.yaml)   → OK
