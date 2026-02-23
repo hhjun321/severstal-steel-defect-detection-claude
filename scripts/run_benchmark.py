@@ -363,17 +363,19 @@ Examples:
   # Run full benchmark (all 12 experiments)
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml
 
+  # Colab: specify data paths and output directory explicitly
+  python scripts/run_benchmark.py \\
+      --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \\
+      --data-dir /content/drive/MyDrive/data/Severstal/train_images \\
+      --csv /content/drive/MyDrive/data/Severstal/train.csv \\
+      --output-dir /content/drive/MyDrive/outputs/benchmark_results \\
+      --models yolo_mfd --groups baseline_raw --epochs 10
+
   # Run specific models only
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --models yolo_mfd deeplabv3plus
 
   # Run specific dataset groups only
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --groups baseline_raw casda_pruning
-
-  # Run FID evaluation only
-  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --fid-only
-
-  # Use CPU instead of GPU
-  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --device cpu
 
   # Resume: add CASDA runs to existing baseline experiment (skips completed runs)
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume outputs/benchmark_results/20260223_143000
@@ -381,6 +383,10 @@ Examples:
     )
     parser.add_argument('--config', type=str, default='configs/benchmark_experiment.yaml',
                         help='Path to experiment config YAML')
+    parser.add_argument('--data-dir', type=str, default=None,
+                        help='Path to image directory (overrides config dataset.image_dir)')
+    parser.add_argument('--csv', type=str, default=None,
+                        help='Path to annotation CSV (overrides config dataset.annotation_csv)')
     parser.add_argument('--models', nargs='+', default=None,
                         help='Subset of models to run (e.g., yolo_mfd eb_yolov8)')
     parser.add_argument('--groups', nargs='+', default=None,
@@ -409,6 +415,14 @@ Examples:
 
     with open(config_path) as f:
         config = yaml.safe_load(f)
+
+    # Override data paths if specified via CLI
+    if args.data_dir:
+        config['dataset']['image_dir'] = args.data_dir
+        print(f"[INFO] image_dir overridden to: {args.data_dir}")
+    if args.csv:
+        config['dataset']['annotation_csv'] = args.csv
+        print(f"[INFO] annotation_csv overridden to: {args.csv}")
 
     # Override epochs if specified (for quick testing)
     if args.epochs is not None:

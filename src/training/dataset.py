@@ -628,11 +628,6 @@ def create_data_loaders(
     annotation_csv = raw_csv if os.path.isabs(raw_csv) else str(project_root / raw_csv)
     image_dir = raw_img if os.path.isabs(raw_img) else str(project_root / raw_img)
 
-    import logging
-    logging.info(f"[DATA] project_root: {project_root}")
-    logging.info(f"[DATA] annotation_csv: {annotation_csv} (exists={os.path.exists(annotation_csv)})")
-    logging.info(f"[DATA] image_dir: {image_dir} (exists={os.path.isdir(image_dir)})")
-
     # Get image IDs and split
     image_ids, image_classes = get_image_ids_with_defects(annotation_csv)
     train_ids, val_ids, test_ids = split_dataset(

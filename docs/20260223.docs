@@ -205,8 +205,107 @@
   가설 검증(H1~H5) 시 baseline과 CASDA 결과를 직접 비교 가능.
 
 
-8. 문법 검증
+8. 추가 변경: --data-dir / --csv CLI 옵션 및 경로 해석 수정
 ================================================================================
-  ast.parse(scripts/run_benchmark.py)               → OK
-  ast.parse(src/training/trainer.py)                 → OK
-  yaml.safe_load(configs/benchmark_experiment.yaml)  → OK
+
+8.1 문제
+---------
+  Colab에서 실행 시, CWD(현재 작업 디렉토리)와 프로젝트 루트가 다를 수 있음.
+  기존 코드는 config YAML의 상대 경로(예: "train_images", "train.csv")를
+  CWD 기준으로 해석 → 경로 불일치 시 FileNotFoundError 발생.
+
+  또한 Google Drive의 실제 데이터 위치가 config에 하드코딩된 상대 경로와
+  다를 수 있어, 절대 경로를 CLI에서 직접 지정할 수 있어야 함.
+
+8.2 해결
+---------
+  (1) CLI 옵션 추가 (scripts/run_benchmark.py):
+      --data-dir : 이미지 디렉토리 절대 경로 (config의 image_dir 오버라이드)
+      --csv      : 어노테이션 CSV 절대 경로 (config의 annotation_csv 오버라이드)
+      --output-dir : 출력 디렉토리 절대 경로 (config의 output_dir 오버라이드)
+
+  (2) 경로 해석 로직 (src/training/dataset.py):
+      project_root = Path(__file__).resolve().parents[2]
+      - 절대 경로 → 그대로 사용
+      - 상대 경로 → project_root 기준으로 resolve
+
+  (3) run_fid_evaluation() 내부에서도 동일한 경로 오버라이드 적용
+
+8.3 변경 위치 상세
+-------------------
+
+  scripts/run_benchmark.py:
+    - CLI 옵션 추가: --data-dir, --csv, --output-dir (argparse)
+    - main() 내 config 오버라이드 로직:
+        if args.data_dir:
+            config['dataset']['image_dir'] = args.data_dir
+        if args.csv:
+            config['dataset']['annotation_csv'] = args.csv
+        if args.output_dir:
+            config['output']['base_dir'] = args.output_dir
+    - run_fid_evaluation()에서 image_dir 경로 해석 시 동일 로직 적용
+    - epilog 및 examples 텍스트 업데이트
+
+  src/training/dataset.py:
+    - 모듈 상단에 project_root 정의
+    - SteelDefectDataset.__init__(): annotation_csv, image_dir 경로 해석
+    - CASDASyntheticDataset.__init__(): casda_dir 경로 해석
+    - 디버그 로깅 제거 (임시 출력이었음)
+
+8.4 변경 파일 테이블 (갱신)
+----------------------------
+
+  | 파일                              | 상태 | 라인  | 변경 내용                                                   |
+  |-----------------------------------|------|-------|-------------------------------------------------------------|
+  | scripts/run_benchmark.py          | 수정 | ~555  | Dict→dict, --resume, --epochs, --data-dir, --csv,           |
+  |                                   |      |       | --output-dir, FID skip, 경로 해석, epilog 갱신              |
+  | src/training/trainer.py           | 수정 | ~428  | resume_from 매개변수 + 체크포인트 로드 로직                 |
+  | src/training/dataset.py           | 수정 | ~737  | project_root 경로 해석, 절대/상대 경로 분기,                |
+  |                                   |      |       | 디버그 로깅 제거                                            |
+  | configs/benchmark_experiment.yaml | 수정 | 197   | num_workers 4→2                                             |
+
+
+9. Colab 실행 명령어 (갱신)
+================================================================================
+
+  심볼릭 링크 방식 대신, CLI 인자로 절대 경로를 직접 지정하는 방식으로 변경.
+  (심볼릭 링크 방식도 여전히 사용 가능하나, CLI 인자 방식이 더 명시적.)
+
+9.1 테스트 실행 (YOLO-MFD, 10 epochs)
+--------------------------------------
+    python /content/severstal-steel-defect-detection/scripts/run_benchmark.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --output-dir /content/drive/MyDrive/outputs/benchmark_results \
+        --models yolo_mfd \
+        --groups baseline_raw \
+        --epochs 10
+
+9.2 전체 Baseline 실행 (3 models × 2 groups, 100 epochs)
+---------------------------------------------------------
+    python /content/severstal-steel-defect-detection/scripts/run_benchmark.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --output-dir /content/drive/MyDrive/outputs/benchmark_results \
+        --groups baseline_raw baseline_trad
+
+9.3 이후 CASDA 그룹 추가 시 (--resume 활용)
+--------------------------------------------
+    python /content/severstal-steel-defect-detection/scripts/run_benchmark.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --resume /content/drive/MyDrive/outputs/benchmark_results/<baseline_timestamp>
+
+  주의: --data-dir, --csv, --output-dir 경로는 사용자의 실제 Google Drive 구조에
+  맞게 조정 필요. 위 경로는 예시.
+
+
+10. 문법 검증
+================================================================================
+  py_compile(scripts/run_benchmark.py)               → OK
+  py_compile(src/training/dataset.py)                 → OK
+  py_compile(src/training/trainer.py)                 → OK
+  yaml.safe_load(configs/benchmark_experiment.yaml)   → OK (이전 검증 유지)
