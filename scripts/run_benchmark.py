@@ -5,15 +5,15 @@ CASDA Benchmark Experiment Runner
 Orchestrates the full benchmark experiment: 3 models x 4 dataset groups = 12 training runs.
 
 Models:
-  - YOLO-MFD (Multi-scale Edge Feature Enhancement)
-  - EB-YOLOv8 (BiFPN-based Enhanced Backbone)
-  - DeepLabV3+ (Standard Segmentation Baseline)
+  - YOLO-MFD (Multi-scale Edge Feature Enhancement) — ultralytics native training
+  - EB-YOLOv8 (BiFPN-based Enhanced Backbone) — ultralytics native training
+  - DeepLabV3+ (Standard Segmentation Baseline) — BenchmarkTrainer
 
 Dataset Groups:
   - Baseline (Raw): Severstal original only
   - Baseline (Trad): Original + traditional geometric augmentations
-  - CASDA-Full: Original + 5,000 CASDA synthetic images
-  - CASDA-Pruning: Original + top 2,000 CASDA images by suitability
+  - CASDA-Full: Original + all ~2,901 CASDA synthetic images
+  - CASDA-Pruning: Original + top CASDA images by suitability
 
 Usage:
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml
@@ -32,19 +32,22 @@ import json
 import yaml
 import torch
 import numpy as np
+import pandas as pd
 from pathlib import Path
 from datetime import datetime
-# Note: use built-in dict (Python 3.9+) instead of typing.Dict
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.yolo_mfd import YOLOMFD
-from src.models.eb_yolov8 import EBYOLOv8
 from src.models.deeplabv3plus import DeepLabV3Plus
-from src.training.dataset import create_data_loaders
+from src.training.dataset import (
+    create_data_loaders,
+    get_image_ids_with_defects,
+    split_dataset,
+)
 from src.training.trainer import BenchmarkTrainer
+from src.training.ultralytics_trainer import UltralyticsTrainer
 from src.training.metrics import (
     DetectionEvaluator,
     SegmentationEvaluator,
@@ -54,26 +57,61 @@ from src.training.metrics import (
 
 
 # ============================================================================
-# Model Factory
+# Detection Model Set (uses ultralytics)
+# ============================================================================
+ULTRALYTICS_MODELS = {"yolo_mfd", "eb_yolov8"}
+
+
+# ============================================================================
+# Split ID Resolution (shared by both detection and segmentation paths)
 # ============================================================================
 
-def create_model(model_key: str, model_config: dict, num_classes: int = 4):
+def get_split_ids(config: dict) -> tuple:
     """
-    Create a benchmark model from config.
+    Get train/val/test image ID lists from config.
     
-    Args:
-        model_key: Model identifier (yolo_mfd, eb_yolov8, deeplabv3plus)
-        model_config: Model-specific configuration
-        num_classes: Number of defect classes
+    Supports two modes:
+      1. Pre-generated split CSV (config['dataset']['split_csv'])
+      2. Dynamic split from annotation CSV
     
     Returns:
-        Model instance
+        (train_ids, val_ids, test_ids)
     """
-    if model_key == "yolo_mfd":
-        return YOLOMFD(num_classes=num_classes, variant='s')
-    elif model_key == "eb_yolov8":
-        return EBYOLOv8(num_classes=num_classes)
-    elif model_key == "deeplabv3plus":
+    ds_config = config['dataset']
+    raw_csv = ds_config['annotation_csv']
+    annotation_csv = raw_csv if os.path.isabs(raw_csv) else str(PROJECT_ROOT / raw_csv)
+
+    split_csv = ds_config.get('split_csv', None)
+
+    if split_csv is not None and os.path.exists(split_csv):
+        split_df = pd.read_csv(split_csv, comment='#')
+        train_ids = split_df[split_df['Split'] == 'train']['ImageId'].tolist()
+        val_ids = split_df[split_df['Split'] == 'val']['ImageId'].tolist()
+        test_ids = split_df[split_df['Split'] == 'test']['ImageId'].tolist()
+        logging.info(f"Loaded split from CSV: train={len(train_ids)}, "
+                     f"val={len(val_ids)}, test={len(test_ids)}")
+    else:
+        image_ids, image_classes = get_image_ids_with_defects(annotation_csv)
+        train_ids, val_ids, test_ids = split_dataset(
+            image_ids, image_classes,
+            train_ratio=ds_config['split']['train_ratio'],
+            val_ratio=ds_config['split']['val_ratio'],
+            test_ratio=ds_config['split']['test_ratio'],
+            seed=ds_config['split']['seed'],
+        )
+        if split_csv is not None:
+            logging.warning(f"Split CSV not found: {split_csv} — using dynamic split")
+
+    return train_ids, val_ids, test_ids
+
+
+# ============================================================================
+# Segmentation Model Factory
+# ============================================================================
+
+def create_segmentation_model(model_key: str, model_config: dict, num_classes: int = 4):
+    """Create a segmentation model."""
+    if model_key == "deeplabv3plus":
         return DeepLabV3Plus(
             num_classes=num_classes,
             backbone=model_config.get('backbone', 'resnet101'),
@@ -81,7 +119,7 @@ def create_model(model_key: str, model_config: dict, num_classes: int = 4):
             output_stride=model_config.get('output_stride', 16),
         )
     else:
-        raise ValueError(f"Unknown model: {model_key}")
+        raise ValueError(f"Unknown segmentation model: {model_key}")
 
 
 # ============================================================================
@@ -99,21 +137,14 @@ def run_single_experiment(
     """
     Run a single training experiment.
     
-    Args:
-        model_key: Model identifier
-        dataset_group: Dataset group key
-        config: Full experiment config
-        experiment_dir: Output directory for this run
-        device: Training device
-        resume: If True, skip training when completed checkpoint exists
-    
-    Returns:
-        Test metrics dict
+    Routes to UltralyticsTrainer for detection models (YOLO-MFD, EB-YOLOv8)
+    and BenchmarkTrainer for segmentation models (DeepLabV3+).
     """
     model_config = config['models'][model_key]
     model_name = model_config['name']
     model_type = model_config['type']  # "detection" or "segmentation"
     group_name = config['dataset_groups'][dataset_group]['name']
+    group_config = config['dataset_groups'][dataset_group]
     num_classes = config['dataset']['num_classes']
 
     # Create output directory
@@ -121,101 +152,129 @@ def run_single_experiment(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Resume: check if this run is already completed ----
-    checkpoint_dir = run_dir / "checkpoints"
-    best_path = checkpoint_dir / f"{model_key}_{dataset_group}_best.pth"
     meta_path = run_dir / "experiment_meta.json"
 
-    if resume and best_path.exists() and meta_path.exists():
-        logging.info(f"\n{'#'*70}")
-        logging.info(f"# SKIP (completed): {model_name} + {group_name}")
-        logging.info(f"# Loading existing results from: {meta_path}")
-        logging.info(f"{'#'*70}")
-
+    if resume and meta_path.exists():
+        # Check for completion marker
         with open(meta_path) as f:
             meta = json.load(f)
-        return meta.get('test_metrics', {})
-
-    # ---- Resume: check if training was interrupted (latest.pth exists, no best.pth or incomplete) ----
-    latest_path = checkpoint_dir / f"{model_key}_{dataset_group}_latest.pth"
-    resume_checkpoint = None
-    if resume and latest_path.exists() and not best_path.exists():
-        logging.info(f"Found interrupted checkpoint: {latest_path}")
-        resume_checkpoint = str(latest_path)
+        if meta.get('test_metrics'):
+            logging.info(f"\n{'#'*70}")
+            logging.info(f"# SKIP (completed): {model_name} + {group_name}")
+            logging.info(f"# Loading existing results from: {meta_path}")
+            logging.info(f"{'#'*70}")
+            return meta['test_metrics']
 
     logging.info(f"\n{'#'*70}")
     logging.info(f"# Experiment: {model_name} + {group_name}")
     logging.info(f"# Type: {model_type}")
-    if resume_checkpoint:
-        logging.info(f"# Resuming from: {resume_checkpoint}")
     logging.info(f"{'#'*70}")
 
-    # Create model
-    model = create_model(model_key, model_config, num_classes)
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logging.info(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    # Get split IDs
+    train_ids, val_ids, test_ids = get_split_ids(config)
 
-    # Create data loaders
-    input_size = tuple(model_config.get('input_size', [640, 640]))
-    batch_size = model_config['training'].get('batch_size', 16)
-    num_workers = config['experiment'].get('num_workers', 4)
-
-    train_loader, val_loader, test_loader, split_info = create_data_loaders(
-        config=config,
-        dataset_group=dataset_group,
-        model_type=model_type,
-        input_size=input_size,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
-
-    logging.info(f"Data loaded - Train: {len(train_loader.dataset)}, "
-                 f"Val: {len(val_loader.dataset)}, Test: {len(test_loader.dataset)}")
-
-    # Save split info once per experiment directory (shared across all runs)
+    # Save split info once per experiment directory
     split_path = experiment_dir / "dataset_split.json"
     if not split_path.exists():
+        split_info = {
+            'num_train': len(train_ids),
+            'num_val': len(val_ids),
+            'num_test': len(test_ids),
+            'split_config': config['dataset']['split'],
+        }
         with open(split_path, 'w') as f:
             json.dump(split_info, f, indent=2)
-        logging.info(f"Saved dataset split info: {split_path}")
 
-    # Create trainer
-    # Merge model-level num_classes into training config
-    training_config = {**model_config['training'], 'num_classes': num_classes}
+    # ====================================================================
+    # Detection models: use UltralyticsTrainer (native ultralytics .train())
+    # ====================================================================
+    if model_type == "detection" and model_key in ULTRALYTICS_MODELS:
+        trainer = UltralyticsTrainer(
+            model_key=model_key,
+            model_config=model_config,
+            dataset_config=config['dataset'],
+            group_config=group_config,
+            dataset_group=dataset_group,
+            train_ids=train_ids,
+            val_ids=val_ids,
+            test_ids=test_ids,
+            output_dir=str(run_dir),
+            device=device,
+            resume=resume,
+        )
 
-    trainer = BenchmarkTrainer(
-        model=model,
-        model_name=f"{model_key}_{dataset_group}",
-        model_type=model_type,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        test_loader=test_loader,
-        config=training_config,
-        output_dir=str(run_dir),
-        device=device,
-        resume_from=resume_checkpoint,
-    )
+        test_metrics = trainer.train()
+        history = getattr(trainer, 'history', {})
 
-    # Train and evaluate
-    test_metrics = trainer.train()
+    # ====================================================================
+    # Segmentation models: use BenchmarkTrainer (existing training loop)
+    # ====================================================================
+    else:
+        model = create_segmentation_model(model_key, model_config, num_classes)
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logging.info(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
 
-    # Save experiment metadata (lightweight — history is in separate _history.json)
+        # Create data loaders (segmentation uses existing dataset.py pipeline)
+        input_size = tuple(model_config.get('input_size', [256, 512]))
+        batch_size = model_config['training'].get('batch_size', 8)
+        num_workers = config['experiment'].get('num_workers', 4)
+
+        train_loader, val_loader, test_loader, split_info_ds = create_data_loaders(
+            config=config,
+            dataset_group=dataset_group,
+            model_type=model_type,
+            input_size=input_size,
+            batch_size=batch_size,
+            num_workers=num_workers,
+        )
+
+        logging.info(f"Data loaded - Train: {len(train_loader.dataset)}, "
+                     f"Val: {len(val_loader.dataset)}, Test: {len(test_loader.dataset)}")
+
+        # Resume checkpoint for segmentation
+        resume_checkpoint = None
+        if resume:
+            checkpoint_dir = run_dir / "checkpoints"
+            latest_path = checkpoint_dir / f"{model_key}_{dataset_group}_latest.pth"
+            if latest_path.exists():
+                resume_checkpoint = str(latest_path)
+                logging.info(f"Resuming from: {resume_checkpoint}")
+
+        training_config = {**model_config['training'], 'num_classes': num_classes}
+        seg_trainer = BenchmarkTrainer(
+            model=model,
+            model_name=f"{model_key}_{dataset_group}",
+            model_type=model_type,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            config=training_config,
+            output_dir=str(run_dir),
+            device=device,
+            resume_from=resume_checkpoint,
+        )
+
+        test_metrics = seg_trainer.train()
+        history = seg_trainer.history
+
+    # Save experiment metadata
     meta = {
         'model': model_name,
         'model_key': model_key,
         'model_type': model_type,
         'dataset_group': group_name,
         'dataset_group_key': dataset_group,
-        'num_params': total_params,
         'test_metrics': test_metrics,
-        'best_epoch': trainer.history.get('best_epoch', 0),
-        'best_metric': trainer.history.get('best_metric', 0.0),
-        'total_epochs_trained': len(trainer.history.get('train_loss', [])),
-        'early_stopped': trainer.history.get('early_stopped', False),
-        'stopped_epoch': trainer.history.get('stopped_epoch', 0),
-        'max_epochs': trainer.history.get('max_epochs', 0),
-        'total_time_seconds': trainer.history.get('total_time_seconds', 0.0),
-        'use_amp': trainer.history.get('use_amp', False),
+        'best_epoch': history.get('best_epoch', 0),
+        'best_metric': history.get('best_metric', 0.0),
+        'total_epochs_trained': len(history.get('train_loss', [])) or len(history.get('val_metric', [])),
+        'early_stopped': history.get('early_stopped', False),
+        'stopped_epoch': history.get('stopped_epoch', 0),
+        'max_epochs': history.get('max_epochs', 0),
+        'total_time_seconds': history.get('total_time_seconds', 0.0),
+        'use_amp': history.get('use_amp', False),
+        'training_pipeline': 'ultralytics' if model_key in ULTRALYTICS_MODELS else 'benchmark_trainer',
         'timestamp': datetime.now().isoformat(),
     }
     with open(run_dir / "experiment_meta.json", 'w') as f:
@@ -229,12 +288,7 @@ def run_single_experiment(
 # ============================================================================
 
 def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda') -> dict:
-    """
-    Compute FID scores between real and CASDA-generated images.
-    
-    Returns:
-        dict with overall and per-class FID scores
-    """
+    """Compute FID scores between real and CASDA-generated images."""
     logging.info(f"\n{'#'*70}")
     logging.info(f"# FID Score Evaluation")
     logging.info(f"{'#'*70}")
@@ -243,7 +297,6 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
     ds_config = config['dataset']
     casda_config = ds_config.get('casda', {})
 
-    # Collect real image paths (resolve relative to project root)
     raw_image_dir = ds_config['image_dir']
     image_dir = Path(raw_image_dir) if os.path.isabs(raw_image_dir) else PROJECT_ROOT / raw_image_dir
     real_images = sorted(image_dir.glob("*.jpg")) + sorted(image_dir.glob("*.png"))
@@ -253,7 +306,6 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
         logging.warning("No real images found for FID computation")
         return {'fid_overall': float('inf')}
 
-    # Collect CASDA-Full images
     raw_casda_dir = casda_config.get('full_dir', 'data/augmented/casda_full')
     casda_full_dir = Path(raw_casda_dir) if os.path.isabs(raw_casda_dir) else PROJECT_ROOT / raw_casda_dir
     casda_images = []
@@ -265,11 +317,10 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
     casda_images = [str(p) for p in casda_images]
 
     results = {}
-
     if casda_images:
         logging.info(f"Computing FID: {len(real_images)} real vs {len(casda_images)} synthetic")
         overall_fid = fid_calc.compute_fid(
-            real_images[:1000],  # Cap for speed
+            real_images[:1000],
             casda_images[:1000],
             batch_size=config.get('evaluation', {}).get('fid', {}).get('batch_size', 64),
         )
@@ -279,7 +330,6 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
         logging.warning("No CASDA images found for FID computation")
         results['fid_overall'] = float('inf')
 
-    # Save FID results
     fid_path = experiment_dir / "fid_results.json"
     with open(fid_path, 'w') as f:
         json.dump(results, f, indent=2, default=str)
@@ -293,9 +343,7 @@ def run_fid_evaluation(config: dict, experiment_dir: Path, device: str = 'cuda')
 # ============================================================================
 
 def run_hypothesis_tests(reporter: BenchmarkReporter, config: dict) -> dict:
-    """
-    Evaluate the 5 hypotheses defined in experiment.md.
-    """
+    """Evaluate the 5 hypotheses defined in experiment.md."""
     logging.info(f"\n{'#'*70}")
     logging.info(f"# Hypothesis Testing")
     logging.info(f"{'#'*70}")
@@ -311,7 +359,6 @@ def run_hypothesis_tests(reporter: BenchmarkReporter, config: dict) -> dict:
         logging.info(f"\n{h_name}: {h_desc}")
 
         if h_name == "H5":
-            # FID-based, handled separately
             hypotheses_results[h_name] = {'description': h_desc, 'status': 'see FID results'}
             continue
 
@@ -320,9 +367,7 @@ def run_hypothesis_tests(reporter: BenchmarkReporter, config: dict) -> dict:
             continue
 
         group_a, group_b = compare[0], compare[1]
-        across_models = h_config.get('across_models', False)
 
-        # Collect metric values
         a_values = []
         b_values = []
 
@@ -331,7 +376,6 @@ def run_hypothesis_tests(reporter: BenchmarkReporter, config: dict) -> dict:
             metrics = result['metrics']
 
             if h_name == "H4":
-                # Focus on specific classes
                 focus_classes = h_config.get('focus_classes', [3, 4])
                 class_ap = metrics.get('class_ap', {})
                 val = np.mean([class_ap.get(f"Class{c}", 0.0) for c in focus_classes])
@@ -382,7 +426,9 @@ Examples:
       --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \\
       --data-dir /content/drive/MyDrive/data/Severstal/train_images \\
       --csv /content/drive/MyDrive/data/Severstal/train.csv \\
-      --output-dir /content/drive/MyDrive/outputs/benchmark_results \\
+      --casda-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \\
+      --split-csv /content/drive/MyDrive/data/Severstal/casda/splits/split_70_15_15_seed42.csv \\
+      --output-dir /content/drive/MyDrive/data/Severstal/casda/benchmark_results \\
       --models yolo_mfd --groups baseline_raw --epochs 10
 
   # Run specific models only
@@ -391,12 +437,7 @@ Examples:
   # Run specific dataset groups only
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --groups baseline_raw casda_pruning
 
-  # Run CASDA groups with custom casda data path
-  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml \\
-      --casda-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \\
-      --groups casda_full
-
-  # Resume: add CASDA runs to existing baseline experiment (skips completed runs)
+  # Resume: add CASDA runs to existing experiment (skips completed runs)
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume --output-dir outputs/benchmark_results/20260223_143000
         """,
     )
@@ -420,9 +461,8 @@ Examples:
                         help='Output directory (overrides config)')
     parser.add_argument('--resume', action='store_true', default=False,
                         help='Resume from existing experiment directory (specified by --output-dir). '
-                             'Skips already-completed runs (those with best.pth), '
-                             'resumes interrupted runs from latest.pth. '
-                             'Example: --resume --output-dir outputs/benchmark_results/20260223_143000')
+                             'Skips already-completed runs (those with experiment_meta.json), '
+                             'resumes interrupted runs from last.pt/latest.pth.')
     parser.add_argument('--epochs', type=int, default=None,
                         help='Override epochs for all models (for quick testing)')
     parser.add_argument('--casda-dir', type=str, default=None,
@@ -486,14 +526,12 @@ Examples:
     output_dir = Path(args.output_dir or config['experiment'].get('output_dir', 'outputs/benchmark_results'))
 
     if args.resume:
-        # Resume mode: use output_dir directly (no new timestamp subdirectory)
         experiment_dir = output_dir
         if not experiment_dir.exists():
             print(f"Error: Resume directory not found: {experiment_dir}")
             sys.exit(1)
         print(f"[INFO] Resuming experiment from: {experiment_dir}")
     else:
-        # New experiment: create timestamped subdirectory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         experiment_dir = output_dir / timestamp
         experiment_dir.mkdir(parents=True, exist_ok=True)
@@ -527,11 +565,15 @@ Examples:
     logging.info(f"Dataset groups: {group_keys}")
     logging.info(f"Total experiments: {len(model_keys) * len(group_keys)}")
 
+    # Log training pipeline info
+    for mk in model_keys:
+        pipeline = "ultralytics" if mk in ULTRALYTICS_MODELS else "BenchmarkTrainer"
+        logging.info(f"  {mk}: {pipeline}")
+
     # Initialize reporter
     reporter = BenchmarkReporter(str(experiment_dir))
 
     # ====== FID Evaluation ======
-    # FID는 CASDA 합성 이미지가 있을 때만 의미 있음
     casda_groups = {'casda_full', 'casda_pruning'}
     has_casda = any(g in casda_groups for g in group_keys)
 

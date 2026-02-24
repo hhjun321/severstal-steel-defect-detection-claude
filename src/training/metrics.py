@@ -61,9 +61,11 @@ class DetectionEvaluator:
     then computes metrics on the full dataset.
     """
 
-    def __init__(self, num_classes: int = 4, iou_threshold: float = 0.5):
+    def __init__(self, num_classes: int = 4, iou_threshold: float = 0.5,
+                 image_size: Tuple[int, int] = (640, 640)):
         self.num_classes = num_classes
         self.iou_threshold = iou_threshold
+        self.image_size = image_size  # (width, height) for GT denormalization
         self.reset()
 
     def reset(self):
@@ -76,6 +78,7 @@ class DetectionEvaluator:
         self,
         predictions: List[Dict],
         targets: List[torch.Tensor],
+        image_size: Optional[Tuple[int, int]] = None,
     ):
         """
         Accumulate batch predictions and ground truths.
@@ -83,26 +86,27 @@ class DetectionEvaluator:
         Args:
             predictions: List of dicts per image with 'boxes', 'scores', 'labels'
             targets: List of [N, 5] tensors (class, cx, cy, w, h) in YOLO format
+            image_size: Optional (width, height) override; defaults to self.image_size
         """
+        img_w, img_h = image_size if image_size is not None else self.image_size
+
         for pred, target in zip(predictions, targets):
             pred_boxes = pred['boxes'].cpu().numpy() if isinstance(pred['boxes'], torch.Tensor) else np.array(pred['boxes'])
             pred_scores = pred['scores'].cpu().numpy() if isinstance(pred['scores'], torch.Tensor) else np.array(pred['scores'])
             pred_labels = pred['labels'].cpu().numpy() if isinstance(pred['labels'], torch.Tensor) else np.array(pred['labels'])
 
-            # Convert YOLO target to xyxy pixel coords (assume 640x640 image)
+            # Convert YOLO target (normalized cxcywh) to xyxy pixel coords
             target_np = target.cpu().numpy() if isinstance(target, torch.Tensor) else np.array(target)
             gt_boxes = []
             gt_labels = []
             for t in target_np:
                 cls_id = int(t[0])
                 cx, cy, bw, bh = t[1], t[2], t[3], t[4]
-                # We need image size context; use normalized coords * reference
-                # Predictions are already in pixel coords from model.predict()
-                # Ground truth needs matching scale
-                x1 = (cx - bw / 2) * 640
-                y1 = (cy - bh / 2) * 640
-                x2 = (cx + bw / 2) * 640
-                y2 = (cy + bh / 2) * 640
+                # Denormalize using image dimensions
+                x1 = (cx - bw / 2) * img_w
+                y1 = (cy - bh / 2) * img_h
+                x2 = (cx + bw / 2) * img_w
+                y2 = (cy + bh / 2) * img_h
                 gt_boxes.append([x1, y1, x2, y2])
                 gt_labels.append(cls_id)
                 self.num_gt_per_class[cls_id] += 1

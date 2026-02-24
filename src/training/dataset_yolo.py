@@ -1,0 +1,344 @@
+"""
+YOLO Format Dataset Converter for Ultralytics
+
+Converts Severstal Steel Defect Detection data (CSV + images) into the
+ultralytics YOLO directory format:
+
+    yolo_dataset/
+      images/
+        train/  val/  test/
+      labels/
+        train/  val/  test/
+      dataset.yaml
+
+Each .txt label file contains one line per object:
+    <class_id> <x_center> <y_center> <width> <height>
+(all values normalized to [0,1])
+
+Also supports adding CASDA synthetic data to the training set.
+"""
+
+import os
+import shutil
+import logging
+import numpy as np
+import pandas as pd
+import cv2
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from src.utils.rle_utils import rle_decode
+
+logger = logging.getLogger(__name__)
+
+
+def _rle_to_bboxes(rle_string: str, shape: Tuple[int, int] = (256, 1600)) -> List[List[float]]:
+    """
+    Convert RLE mask to list of bounding boxes in normalized YOLO format.
+    
+    Returns:
+        List of [x_center, y_center, width, height] normalized to [0,1]
+    """
+    mask = rle_decode(rle_string, shape)
+    if mask.sum() == 0:
+        return []
+
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    bboxes = []
+    h, w = shape
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw * bh < 16:  # skip tiny artifacts
+            continue
+        cx = (x + bw / 2.0) / w
+        cy = (y + bh / 2.0) / h
+        nw = bw / w
+        nh = bh / h
+        bboxes.append([cx, cy, nw, nh])
+
+    return bboxes
+
+
+def prepare_yolo_dataset(
+    image_dir: str,
+    annotation_csv: str,
+    train_ids: List[str],
+    val_ids: List[str],
+    test_ids: List[str],
+    output_dir: str,
+    dataset_group: str = "baseline_raw",
+    casda_dir: Optional[str] = None,
+    casda_mode: Optional[str] = None,
+    casda_config: Optional[Dict] = None,
+    num_classes: int = 4,
+    class_names: Optional[List[str]] = None,
+) -> str:
+    """
+    Prepare a YOLO-format dataset directory for ultralytics training.
+    
+    This creates symlinks (or copies) of images and generates label .txt files.
+    For CASDA groups, synthetic images are added to the training set.
+    
+    Args:
+        image_dir: Path to Severstal train_images/
+        annotation_csv: Path to train.csv
+        train_ids, val_ids, test_ids: Image ID lists per split
+        output_dir: Where to create the yolo_dataset/ structure
+        dataset_group: Group name for logging
+        casda_dir: Path to CASDA data directory (for casda_full/casda_pruning)
+        casda_mode: "full" or "pruning" or None
+        casda_config: CASDA config dict (threshold, top_k, etc.)
+        num_classes: Number of defect classes
+        class_names: Class name list
+    
+    Returns:
+        Path to the generated dataset.yaml file
+    """
+    if class_names is None:
+        class_names = [f"Class{i+1}" for i in range(num_classes)]
+
+    output_path = Path(output_dir)
+    images_dir = output_path / "images"
+    labels_dir = output_path / "labels"
+
+    # Build annotation lookup: ImageId -> list of (class_id, bboxes)
+    logger.info(f"Parsing annotations from {annotation_csv}")
+    df = pd.read_csv(annotation_csv)
+    if 'ImageId_ClassId' in df.columns:
+        df[['ImageId', 'ClassId']] = df['ImageId_ClassId'].str.rsplit('_', n=1, expand=True)
+        df['ClassId'] = df['ClassId'].astype(int)
+
+    # Group annotations by ImageId
+    annotations = {}
+    defect_rows = df[df['EncodedPixels'].notna()]
+    for _, row in defect_rows.iterrows():
+        img_id = row['ImageId']
+        cls_id = int(row['ClassId']) - 1  # 0-indexed
+        rle = row['EncodedPixels']
+        bboxes = _rle_to_bboxes(rle)
+        if img_id not in annotations:
+            annotations[img_id] = []
+        for bbox in bboxes:
+            annotations[img_id].append((cls_id, bbox))
+
+    # Process each split
+    splits = {'train': train_ids, 'val': val_ids, 'test': test_ids}
+    stats = {}
+
+    for split_name, ids in splits.items():
+        img_split_dir = images_dir / split_name
+        lbl_split_dir = labels_dir / split_name
+        img_split_dir.mkdir(parents=True, exist_ok=True)
+        lbl_split_dir.mkdir(parents=True, exist_ok=True)
+
+        num_images = 0
+        num_labels = 0
+
+        for img_id in ids:
+            src_path = Path(image_dir) / img_id
+            if not src_path.exists():
+                continue
+
+            # Create symlink or copy for image
+            dst_img = img_split_dir / img_id
+            if not dst_img.exists():
+                try:
+                    os.symlink(src_path, dst_img)
+                except (OSError, NotImplementedError):
+                    shutil.copy2(str(src_path), str(dst_img))
+
+            # Write label file
+            label_name = Path(img_id).stem + ".txt"
+            dst_lbl = lbl_split_dir / label_name
+
+            annots = annotations.get(img_id, [])
+            with open(dst_lbl, 'w') as f:
+                for cls_id, bbox in annots:
+                    cx, cy, w, h = bbox
+                    f.write(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+                    num_labels += 1
+
+            num_images += 1
+
+        stats[split_name] = {'images': num_images, 'labels': num_labels}
+        logger.info(f"  {split_name}: {num_images} images, {num_labels} labels")
+
+    # Add CASDA synthetic data to training set
+    casda_count = 0
+    if casda_mode is not None and casda_dir is not None:
+        casda_count = _add_casda_to_training(
+            casda_dir=casda_dir,
+            casda_mode=casda_mode,
+            casda_config=casda_config or {},
+            images_train_dir=images_dir / "train",
+            labels_train_dir=labels_dir / "train",
+            num_classes=num_classes,
+        )
+        logger.info(f"  CASDA ({casda_mode}): added {casda_count} synthetic images to training")
+
+    # Generate dataset.yaml
+    yaml_path = output_path / "dataset.yaml"
+    yaml_content = (
+        f"# YOLO dataset config for {dataset_group}\n"
+        f"# Auto-generated by dataset_yolo.py\n"
+        f"path: {output_path.as_posix()}\n"
+        f"train: images/train\n"
+        f"val: images/val\n"
+        f"test: images/test\n"
+        f"\n"
+        f"nc: {num_classes}\n"
+        f"names: {class_names}\n"
+    )
+    with open(yaml_path, 'w') as f:
+        f.write(yaml_content)
+
+    logger.info(f"YOLO dataset prepared at {output_path}")
+    logger.info(f"  dataset.yaml: {yaml_path}")
+    total_train = stats['train']['images'] + casda_count
+    logger.info(f"  Total training images: {total_train} "
+                f"(original: {stats['train']['images']}, CASDA: {casda_count})")
+
+    return str(yaml_path)
+
+
+def _add_casda_to_training(
+    casda_dir: str,
+    casda_mode: str,
+    casda_config: Dict,
+    images_train_dir: Path,
+    labels_train_dir: Path,
+    num_classes: int,
+) -> int:
+    """
+    Add CASDA synthetic images and labels to the YOLO training split.
+    
+    Supports the same metadata formats as CASDASyntheticDataset:
+      - metadata.json
+      - annotations.csv
+      - Fallback: scan images/ for .png files, infer class from filename
+    
+    Returns:
+        Number of synthetic images added
+    """
+    import json
+
+    casda_path = Path(casda_dir)
+    if not casda_path.exists():
+        logger.warning(f"CASDA directory not found: {casda_dir}")
+        return 0
+
+    # Load metadata (same logic as CASDASyntheticDataset._load_metadata)
+    meta_path = casda_path / "metadata.json"
+    csv_path = casda_path / "annotations.csv"
+
+    if meta_path.exists():
+        with open(meta_path) as f:
+            all_samples = json.load(f)
+    elif csv_path.exists():
+        df = pd.read_csv(csv_path)
+        all_samples = df.to_dict('records')
+    else:
+        # Fallback: scan image directory
+        img_dir = casda_path / "images"
+        if not img_dir.exists():
+            img_dir = casda_path
+        all_samples = []
+        for img_path in sorted(img_dir.glob("*.png")):
+            fname = img_path.stem
+            class_id = 0
+            for i in range(1, 5):
+                if f"class{i}" in fname or f"class_{i}" in fname:
+                    class_id = i - 1
+                    break
+            all_samples.append({
+                'image_path': str(img_path),
+                'class_id': class_id,
+                'suitability_score': 1.0,
+            })
+
+    # Filter by suitability for pruning mode
+    if casda_mode == "pruning":
+        threshold = casda_config.get('suitability_threshold', 0.63)
+        top_k = casda_config.get('pruning_top_k', 2000)
+        all_samples = [
+            s for s in all_samples
+            if s.get('suitability_score', 1.0) >= threshold
+        ]
+        all_samples.sort(key=lambda x: x.get('suitability_score', 1.0), reverse=True)
+        all_samples = all_samples[:top_k]
+
+    count = 0
+    for idx, sample in enumerate(all_samples):
+        # Resolve image path
+        img_path = sample.get('image_path', '')
+        if not os.path.isabs(img_path):
+            img_path = str(casda_path / img_path)
+
+        if not os.path.exists(img_path):
+            continue
+
+        # Create a unique filename to avoid collisions
+        src = Path(img_path)
+        dst_name = f"casda_{idx:05d}_{src.name}"
+        dst_img = images_train_dir / dst_name
+
+        if not dst_img.exists():
+            try:
+                os.symlink(src.resolve(), dst_img)
+            except (OSError, NotImplementedError):
+                shutil.copy2(str(src), str(dst_img))
+
+        # Generate label file
+        label_name = Path(dst_name).stem + ".txt"
+        dst_lbl = labels_train_dir / label_name
+
+        cls_id = sample.get('class_id', 0)
+        bboxes = sample.get('bboxes', [])
+        labels = sample.get('labels', [])
+
+        with open(dst_lbl, 'w') as f:
+            if bboxes and labels:
+                # Use provided bboxes (assumed xyxy pixel coords)
+                for bbox, lbl in zip(bboxes, labels):
+                    # Read image dimensions for normalization
+                    img = cv2.imread(img_path)
+                    if img is None:
+                        continue
+                    h, w = img.shape[:2]
+                    x1, y1, x2, y2 = bbox
+                    cx = ((x1 + x2) / 2.0) / w
+                    cy = ((y1 + y2) / 2.0) / h
+                    bw = (x2 - x1) / w
+                    bh = (y2 - y1) / h
+                    f.write(f"{lbl} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+            elif 'mask_path' in sample:
+                # Derive bbox from mask
+                mask_path = sample['mask_path']
+                if not os.path.isabs(mask_path):
+                    mask_path = str(casda_path / mask_path)
+                mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                if mask is not None:
+                    h, w = mask.shape[:2]
+                    contours, _ = cv2.findContours(
+                        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                    )
+                    for cnt in contours:
+                        bx, by, bw, bh = cv2.boundingRect(cnt)
+                        if bw * bh >= 16:
+                            cx = (bx + bw / 2.0) / w
+                            cy = (by + bh / 2.0) / h
+                            nw = bw / w
+                            nh = bh / h
+                            f.write(f"{cls_id} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}\n")
+            else:
+                # Fallback: full-image bbox with class
+                f.write(f"{cls_id} 0.500000 0.500000 1.000000 1.000000\n")
+
+        count += 1
+
+    return count
