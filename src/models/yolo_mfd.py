@@ -135,43 +135,43 @@ class MEFE(nn.Module):
 # This YAML string is written to a file and loaded by ultralytics
 YOLO_MFD_YAML = """
 # YOLOv8s-MFD: YOLOv8s with Multi-scale Edge Feature Enhancement
-# nc will be overridden by ultralytics at runtime
+# Channel widths are pre-scaled for YOLOv8s (width=0.50, depth=0.33, max_ch=1024).
+# No 'scales' block — all values are final to ensure MEFE gets correct channel counts.
+# Depth: repeats already adjusted (3→1, 6→2).
 
 nc: 4
-scales:
-  s: [0.33, 0.50, 1024]  # YOLOv8s scale factors: depth, width, max_channels
 
 backbone:
   # [from, repeats, module, args]
-  - [-1, 1, Conv, [64, 3, 2]]          # 0: P1/2
-  - [-1, 1, Conv, [128, 3, 2]]         # 1: P2/4
-  - [-1, 3, C2f, [128, True]]          # 2
-  - [-1, 1, Conv, [256, 3, 2]]         # 3: P3/8
-  - [-1, 6, C2f, [256, True]]          # 4
-  - [-1, 1, MEFE, [256, 256]]            # 5: MEFE at P3 level ★
-  - [-1, 1, Conv, [512, 3, 2]]         # 6: P4/16
-  - [-1, 6, C2f, [512, True]]          # 7
-  - [-1, 1, MEFE, [512, 512]]            # 8: MEFE at P4 level ★
-  - [-1, 1, Conv, [1024, 3, 2]]        # 9: P5/32
-  - [-1, 3, C2f, [1024, True]]         # 10
-  - [-1, 1, SPPF, [1024, 5]]           # 11
+  - [-1, 1, Conv, [32, 3, 2]]           # 0: P1/2    (64*0.50=32)
+  - [-1, 1, Conv, [64, 3, 2]]           # 1: P2/4    (128*0.50=64)
+  - [-1, 1, C2f, [64, True]]            # 2          (128*0.50=64, repeats=ceil(3*0.33)=1)
+  - [-1, 1, Conv, [128, 3, 2]]          # 3: P3/8    (256*0.50=128)
+  - [-1, 2, C2f, [128, True]]           # 4          (256*0.50=128, repeats=ceil(6*0.33)=2)
+  - [-1, 1, MEFE, [128, 128]]           # 5: MEFE at P3 level ★ (in=128, out=128)
+  - [-1, 1, Conv, [256, 3, 2]]          # 6: P4/16   (512*0.50=256)
+  - [-1, 2, C2f, [256, True]]           # 7          (512*0.50=256, repeats=ceil(6*0.33)=2)
+  - [-1, 1, MEFE, [256, 256]]           # 8: MEFE at P4 level ★ (in=256, out=256)
+  - [-1, 1, Conv, [512, 3, 2]]          # 9: P5/32   (1024*0.50=512)
+  - [-1, 1, C2f, [512, True]]           # 10         (1024*0.50=512, repeats=ceil(3*0.33)=1)
+  - [-1, 1, SPPF, [512, 5]]            # 11         (1024*0.50=512)
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 12
-  - [[-1, 8], 1, Concat, [1]]                    # 13: cat P4-MEFE
-  - [-1, 3, C2f, [512]]                          # 14
+  - [[-1, 8], 1, Concat, [1]]                    # 13: cat P4-MEFE (512+256=768→C2f→256)
+  - [-1, 1, C2f, [256]]                          # 14
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 15
-  - [[-1, 5], 1, Concat, [1]]                    # 16: cat P3-MEFE
-  - [-1, 3, C2f, [256]]                          # 17 (P3/8-small)
+  - [[-1, 5], 1, Concat, [1]]                    # 16: cat P3-MEFE (256+128=384→C2f→128)
+  - [-1, 1, C2f, [128]]                          # 17 (P3/8-small)
 
-  - [-1, 1, Conv, [256, 3, 2]]                   # 18
-  - [[-1, 14], 1, Concat, [1]]                   # 19
-  - [-1, 3, C2f, [512]]                          # 20 (P4/16-medium)
+  - [-1, 1, Conv, [128, 3, 2]]                   # 18
+  - [[-1, 14], 1, Concat, [1]]                   # 19: (128+256=384→C2f→256)
+  - [-1, 1, C2f, [256]]                          # 20 (P4/16-medium)
 
-  - [-1, 1, Conv, [512, 3, 2]]                   # 21
-  - [[-1, 11], 1, Concat, [1]]                   # 22
-  - [-1, 3, C2f, [1024]]                         # 23 (P5/32-large)
+  - [-1, 1, Conv, [256, 3, 2]]                   # 21
+  - [[-1, 11], 1, Concat, [1]]                   # 22: (256+512=768→C2f→512)
+  - [-1, 1, C2f, [512]]                          # 23 (P5/32-large)
 
   - [[17, 20, 23], 1, Detect, [nc]]              # 24: Detect(P3, P4, P5)
 """
