@@ -60,8 +60,12 @@ class MEFE(nn.Module):
         c2: Output channels (typically == c1 for residual compatibility)
     """
 
-    def __init__(self, c1: int, c2: int):
+    def __init__(self, c1: int, c2: int = None):
         super().__init__()
+        if c2 is None:
+            c2 = c1  # ultralytics custom modules may receive only c1 from YAML args
+        self.c1 = c1
+        self.c2 = c2
         self.edge_extractor = SobelEdgeExtractor()
 
         # Multi-scale edge processing branches
@@ -144,10 +148,10 @@ backbone:
   - [-1, 3, C2f, [128, True]]          # 2
   - [-1, 1, Conv, [256, 3, 2]]         # 3: P3/8
   - [-1, 6, C2f, [256, True]]          # 4
-  - [-1, 1, MEFE, [256]]               # 5: MEFE at P3 level ★
+  - [-1, 1, MEFE, [256, 256]]            # 5: MEFE at P3 level ★
   - [-1, 1, Conv, [512, 3, 2]]         # 6: P4/16
   - [-1, 6, C2f, [512, True]]          # 7
-  - [-1, 1, MEFE, [512]]               # 8: MEFE at P4 level ★
+  - [-1, 1, MEFE, [512, 512]]            # 8: MEFE at P4 level ★
   - [-1, 1, Conv, [1024, 3, 2]]        # 9: P5/32
   - [-1, 3, C2f, [1024, True]]         # 10
   - [-1, 1, SPPF, [1024, 5]]           # 11
