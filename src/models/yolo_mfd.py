@@ -212,18 +212,18 @@ def create_yolo_mfd(num_classes: int = 4, pretrained: bool = True):
     """
     from ultralytics import YOLO
     import ultralytics.nn.modules as modules
+    import ultralytics.nn.tasks as tasks_module
 
-    # Register MEFE as a custom module so ultralytics can parse the YAML
+    # Register MEFE in ultralytics namespace.
+    # ultralytics parse_model() resolves custom modules via globals()[m]
+    # in ultralytics/nn/tasks.py — so MEFE must be injected there.
     if not hasattr(modules, 'MEFE'):
         modules.MEFE = MEFE
-        # Also register in the tasks module's class dict
-        try:
-            from ultralytics.nn.tasks import DetectionModel
-            # ultralytics uses a module lookup dict; ensure MEFE is findable
-            import ultralytics.nn.modules as _m
-            _m.MEFE = MEFE
-        except ImportError:
-            pass
+    # Critical: tasks.py uses globals() lookup for module classes
+    if 'MEFE' not in vars(tasks_module):
+        tasks_module.MEFE = MEFE
+    # Also inject into tasks module's global dict directly
+    tasks_module.__dict__['MEFE'] = MEFE
 
     # Write model YAML
     yaml_path = get_yolo_mfd_yaml_path()
