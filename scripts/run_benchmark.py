@@ -10,15 +10,18 @@ Models:
   - DeepLabV3+ (Standard Segmentation Baseline) — BenchmarkTrainer
 
 Dataset Groups:
-  - Baseline (Raw): Severstal original only
-  - Baseline (Trad): Original + traditional geometric augmentations
-  - CASDA-Full: Original + all ~2,901 CASDA synthetic images
-  - CASDA-Pruning: Original + top CASDA images by suitability
+  - baseline_raw  (alias: baseline, raw)  : Severstal original only
+  - baseline_trad (alias: trad)           : Original + traditional augmentations
+  - casda_full    (alias: full)           : Original + all CASDA synthetic images
+  - casda_pruning (alias: pruning)        : Original + top CASDA images by suitability
+  - all                                   : Run all groups
 
 Usage:
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml
-  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --models yolo_mfd eb_yolov8
-  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --groups baseline_raw casda_pruning
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --models yolo_mfd --groups baseline
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --groups full pruning
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --groups all
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --list-groups
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --fid-only
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume --output-dir outputs/benchmark_results/20260223_143000
 """
@@ -60,6 +63,97 @@ from src.training.metrics import (
 # Detection Model Set (uses ultralytics)
 # ============================================================================
 ULTRALYTICS_MODELS = {"yolo_mfd", "eb_yolov8"}
+
+
+# ============================================================================
+# Dataset Group Aliases & Validation
+# ============================================================================
+# Short aliases for convenience. Keys are alias names, values are the
+# canonical group key that appears in the YAML config.
+GROUP_ALIASES = {
+    # Shorthand aliases
+    "baseline":  "baseline_raw",
+    "raw":       "baseline_raw",
+    "trad":      "baseline_trad",
+    "traditional": "baseline_trad",
+    "full":      "casda_full",
+    "pruning":   "casda_pruning",
+    # Special
+    "all":       "__ALL__",
+}
+
+
+def resolve_groups(
+    requested: list,
+    available: list,
+) -> list:
+    """
+    Resolve CLI group names (with alias support) to canonical group keys.
+
+    Args:
+        requested: List of group names/aliases from CLI --groups
+        available: List of canonical group keys from YAML config
+
+    Returns:
+        List of resolved canonical group keys (deduplicated, order-preserved)
+
+    Raises:
+        SystemExit: If any requested group is not valid
+    """
+    if requested is None:
+        return available
+
+    resolved = []
+    seen = set()
+
+    for g in requested:
+        g_lower = g.lower().strip()
+
+        # Check alias first
+        if g_lower in GROUP_ALIASES:
+            target = GROUP_ALIASES[g_lower]
+            if target == "__ALL__":
+                for k in available:
+                    if k not in seen:
+                        resolved.append(k)
+                        seen.add(k)
+                continue
+            canonical = target
+        elif g_lower in available:
+            canonical = g_lower
+        elif g in available:
+            canonical = g
+        else:
+            # Not found — print helpful error
+            alias_list = ", ".join(
+                f"{alias} → {target}" for alias, target in sorted(GROUP_ALIASES.items())
+                if target != "__ALL__"
+            )
+            print(f"\n[ERROR] Unknown dataset group: '{g}'")
+            print(f"\nAvailable groups (from config):")
+            for k in available:
+                print(f"  - {k}")
+            print(f"\nSupported aliases:")
+            print(f"  {alias_list}")
+            print(f"\nSpecial:")
+            print(f"  all → run all {len(available)} groups")
+            print(f"\nExamples:")
+            print(f"  --groups baseline casda_full")
+            print(f"  --groups full pruning")
+            print(f"  --groups all")
+            sys.exit(1)
+
+        if canonical not in available:
+            print(f"\n[ERROR] Resolved group '{canonical}' (from alias '{g}') "
+                  f"not found in config.")
+            print(f"Available groups: {available}")
+            sys.exit(1)
+
+        if canonical not in seen:
+            resolved.append(canonical)
+            seen.add(canonical)
+
+    return resolved
 
 
 # ============================================================================
@@ -417,9 +511,33 @@ def main():
         description="CASDA Benchmark Experiment Runner (3 models x 4 datasets = 12 runs)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Dataset Groups:
+  baseline_raw     Baseline (Raw)      — Severstal original only, no augmentation
+  baseline_trad    Baseline (Trad)     — Original + traditional geometric augmentations
+  casda_full       CASDA-Full          — Original + all ~2,901 CASDA synthetic images
+  casda_pruning    CASDA-Pruning       — Original + top CASDA images by suitability
+
+Short Aliases:
+  baseline → baseline_raw       raw → baseline_raw
+  trad → baseline_trad          traditional → baseline_trad
+  full → casda_full             pruning → casda_pruning
+  all → run all groups
+
 Examples:
   # Run full benchmark (all 12 experiments)
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml
+
+  # Run baseline only (alias for baseline_raw)
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml \\
+      --models yolo_mfd --groups baseline
+
+  # Run CASDA experiments with short aliases
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml \\
+      --groups full pruning
+
+  # Run all groups explicitly
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml \\
+      --groups all
 
   # Colab: specify data paths and output directory explicitly
   python scripts/run_benchmark.py \\
@@ -429,16 +547,14 @@ Examples:
       --casda-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \\
       --split-csv /content/drive/MyDrive/data/Severstal/casda/splits/split_70_15_15_seed42.csv \\
       --output-dir /content/drive/MyDrive/data/Severstal/casda/benchmark_results \\
-      --models yolo_mfd --groups baseline_raw --epochs 10
-
-  # Run specific models only
-  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --models yolo_mfd deeplabv3plus
-
-  # Run specific dataset groups only
-  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --groups baseline_raw casda_pruning
+      --models yolo_mfd --groups baseline --epochs 10
 
   # Resume: add CASDA runs to existing experiment (skips completed runs)
-  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --resume --output-dir outputs/benchmark_results/20260223_143000
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml \\
+      --resume --output-dir outputs/benchmark_results/20260223_143000
+
+  # List available groups and models from config
+  python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --list-groups
         """,
     )
     parser.add_argument('--config', type=str, default='configs/benchmark_experiment.yaml',
@@ -450,7 +566,12 @@ Examples:
     parser.add_argument('--models', nargs='+', default=None,
                         help='Subset of models to run (e.g., yolo_mfd eb_yolov8)')
     parser.add_argument('--groups', nargs='+', default=None,
-                        help='Subset of dataset groups (e.g., baseline_raw casda_pruning)')
+                        help='Dataset groups to run. Accepts config keys '
+                             '(baseline_raw, baseline_trad, casda_full, casda_pruning) '
+                             'or short aliases (baseline, trad, full, pruning, all). '
+                             'Examples: --groups baseline full | --groups all')
+    parser.add_argument('--list-groups', action='store_true',
+                        help='List available dataset groups and aliases, then exit')
     parser.add_argument('--device', type=str, default=None,
                         help='Device (cuda/cpu). Auto-detected if not specified.')
     parser.add_argument('--fid-only', action='store_true',
@@ -482,6 +603,41 @@ Examples:
 
     with open(config_path) as f:
         config = yaml.safe_load(f)
+
+    # ---- --list-groups: show available groups and exit ----
+    if args.list_groups:
+        available = list(config.get('dataset_groups', {}).keys())
+        print("\nAvailable Dataset Groups:")
+        print("-" * 70)
+        for key in available:
+            grp = config['dataset_groups'][key]
+            name = grp.get('name', key)
+            desc = grp.get('description', '')
+            casda = grp.get('casda_data')
+            tag = ""
+            if casda == "full":
+                tag = " [CASDA full]"
+            elif casda == "pruning":
+                tag = " [CASDA pruning]"
+            elif grp.get('augmentation') == 'traditional':
+                tag = " [traditional aug]"
+            else:
+                tag = " [no augmentation]"
+            print(f"  {key:<20s} {name:<22s} {tag}")
+            if desc:
+                print(f"  {'':<20s} {desc}")
+        print(f"\nShort Aliases:")
+        for alias, target in sorted(GROUP_ALIASES.items()):
+            if target == "__ALL__":
+                print(f"  {alias:<20s} → (all {len(available)} groups)")
+            else:
+                print(f"  {alias:<20s} → {target}")
+        print(f"\nAvailable Models:")
+        for mk, mv in config.get('models', {}).items():
+            pipeline = "ultralytics" if mk in ULTRALYTICS_MODELS else "BenchmarkTrainer"
+            print(f"  {mk:<20s} {mv.get('name', mk):<22s} [{pipeline}]")
+        print()
+        sys.exit(0)
 
     # Override data paths if specified via CLI
     if args.data_dir:
@@ -559,10 +715,13 @@ Examples:
 
     # Determine models and groups to run
     model_keys = args.models or list(config['models'].keys())
-    group_keys = args.groups or list(config['dataset_groups'].keys())
+    available_groups = list(config['dataset_groups'].keys())
+    group_keys = resolve_groups(args.groups, available_groups)
 
     logging.info(f"Models: {model_keys}")
     logging.info(f"Dataset groups: {group_keys}")
+    if args.groups:
+        logging.info(f"  (resolved from CLI: {args.groups})")
     logging.info(f"Total experiments: {len(model_keys) * len(group_keys)}")
 
     # Log training pipeline info

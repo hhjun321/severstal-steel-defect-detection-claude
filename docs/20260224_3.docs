@@ -1,0 +1,127 @@
+20260224 작업 일지 #3 - --groups CLI 별칭 시스템 및 편의 기능 개선
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+run_benchmark.py의 --groups CLI 옵션에서 4개 데이터셋 그룹(baseline_raw,
+baseline_trad, casda_full, casda_pruning)을 개별적으로 더 편리하게 선택할 수
+있도록 별칭(alias) 시스템, 유효성 검증, --list-groups 플래그를 추가한다.
+
+
+2. 변경 파일
+================================================================================
+
+  | 파일                         | 상태  | 라인        | 변경 내용                          |
+  |------------------------------|-------|-------------|-----------------------------------|
+  | scripts/run_benchmark.py     | 수정  | 808 (←740)  | GROUP_ALIASES, resolve_groups(),   |
+  |                              |       |             | --list-groups, epilog 개선          |
+
+
+3. 주요 변경 내용
+================================================================================
+
+3.1 GROUP_ALIASES 상수 (L73-83)
+---------------------------------
+  GROUP_ALIASES = {
+      "baseline":    "baseline_raw",
+      "raw":         "baseline_raw",
+      "trad":        "baseline_trad",
+      "traditional": "baseline_trad",
+      "full":        "casda_full",
+      "pruning":     "casda_pruning",
+      "all":         "__ALL__",
+  }
+
+3.2 resolve_groups() 함수 (L86-156)
+--------------------------------------
+- CLI에서 입력된 그룹명/별칭을 YAML config의 canonical 키로 변환
+- 대소문자 무시 (case-insensitive)
+- 중복 제거 (순서 보존)
+- "all" 입력 시 config의 모든 그룹을 순서대로 반환
+- 잘못된 그룹명 입력 시 사용 가능한 그룹/별칭 목록과 예시를 표시하고 종료
+
+3.3 --list-groups 플래그
+--------------------------
+  --list-groups를 지정하면 config에서 사용 가능한 그룹/별칭/모델 목록을
+  표 형태로 출력한 후 종료한다.
+
+  출력 예시:
+    Available Dataset Groups:
+    ----------------------------------------------------------------------
+      baseline_raw         Baseline (Raw)         [no augmentation]
+      baseline_trad        Baseline (Trad)        [traditional aug]
+      casda_full           CASDA-Full             [CASDA full]
+      casda_pruning        CASDA-Pruning          [CASDA pruning]
+
+    Short Aliases:
+      all                  → (all 4 groups)
+      baseline             → baseline_raw
+      full                 → casda_full
+      ...
+
+3.4 --groups 도움말 개선
+--------------------------
+  변경 전:
+    --groups: Subset of dataset groups (e.g., baseline_raw casda_pruning)
+
+  변경 후:
+    --groups: Dataset groups to run. Accepts config keys
+              (baseline_raw, baseline_trad, casda_full, casda_pruning)
+              or short aliases (baseline, trad, full, pruning, all).
+              Examples: --groups baseline full | --groups all
+
+3.5 epilog 개선
+-----------------
+  Dataset Groups 및 Short Aliases 표를 epilog에 추가.
+  사용 예시에 별칭 활용 패턴 추가:
+    --groups baseline
+    --groups full pruning
+    --groups all
+
+
+4. 사용 예시
+================================================================================
+
+    # 원본셋만 학습 (baseline_raw)
+    --groups baseline
+    --groups raw
+    --groups baseline_raw
+
+    # CASDA 전체셋 + 상위셋
+    --groups full pruning
+    --groups casda_full casda_pruning
+
+    # 모든 그룹 실행
+    --groups all
+
+    # 잘못된 그룹명 → 에러 메시지
+    --groups wrong_name
+    →  [ERROR] Unknown dataset group: 'wrong_name'
+       Available groups (from config):
+         - baseline_raw
+         - baseline_trad
+         - casda_full
+         - casda_pruning
+       ...
+
+    # 그룹/모델 목록 확인
+    --list-groups
+
+
+5. 코드 diff
+================================================================================
+
+변경 전 (그룹 결정 로직, L652-653):
+    model_keys = args.models or list(config['models'].keys())
+    group_keys = args.groups or list(config['dataset_groups'].keys())
+
+변경 후 (L716-719):
+    model_keys = args.models or list(config['models'].keys())
+    available_groups = list(config['dataset_groups'].keys())
+    group_keys = resolve_groups(args.groups, available_groups)
+
+
+6. 구문 검증
+================================================================================
+  python -c "import ast; ast.parse(open('scripts/run_benchmark.py', encoding='utf-8').read())"
+  → Syntax OK
