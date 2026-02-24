@@ -1,0 +1,193 @@
+20260224 작업 일지 #5 - YOLO 데이터셋 사전 변환 및 캐시 재사용 시스템
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+매 학습마다 반복되는 YOLO 포맷 변환(CSV 파싱 → RLE→bbox → 이미지 심링크/복사)을
+1회만 수행하고, 이후 학습에서는 사전 변환된 디렉토리를 즉시 참조하도록 개선.
+Colab 환경에서 수 분 소요되던 데이터셋 준비를 ~1초로 단축.
+
+
+2. 변경 파일
+================================================================================
+
+  | 파일                                    | 상태 | 라인수 변경    | 변경 내용                              |
+  |-----------------------------------------|------|---------------|---------------------------------------|
+  | src/training/dataset_yolo.py            | 수정 | 423 (←345)    | validate_yolo_dataset() 함수 추가      |
+  | src/training/ultralytics_trainer.py     | 수정 | 409 (←380)    | yolo_dir 파라미터, _prepare_dataset 개선|
+  | scripts/run_benchmark.py               | 수정 | 825 (←813)    | --yolo-dir CLI 인자, 전달 경로 연결     |
+
+
+3. 주요 변경 내용
+================================================================================
+
+3.1 validate_yolo_dataset() 함수 (dataset_yolo.py L37-112)
+------------------------------------------------------------
+사전 변환된 YOLO 데이터셋 디렉토리의 유효성을 검증하는 새 함수.
+
+검증 항목:
+  1. dataset.yaml 존재 및 YAML 파싱 가능
+  2. images/{train,val,test} 디렉토리 존재
+  3. labels/{train,val,test} 디렉토리 존재
+  4. train/val 디렉토리에 실제 파일 존재 (빈 디렉토리 방지)
+  5. dataset.yaml에 nc/names 필드 존재
+  6. path 필드가 현재 위치와 다르면 자동 업데이트 (이동된 경우 대응)
+
+인자:
+  - yolo_dir: YOLO 데이터셋 루트 (또는 그룹별 하위 디렉토리 포함 상위 경로)
+  - dataset_group: 비어있지 않으면 yolo_dir/{dataset_group}/ 하위 디렉토리 탐색
+
+반환값:
+  - 유효하면 dataset.yaml 절대 경로 (str)
+  - 무효하면 None
+
+
+3.2 UltralyticsTrainer.__init__에 yolo_dir 파라미터 추가
+---------------------------------------------------------
+변경 전:
+    def __init__(self, ..., resume: bool = False):
+
+변경 후:
+    def __init__(self, ..., resume: bool = False, yolo_dir: Optional[str] = None):
+        ...
+        self.yolo_dir = yolo_dir
+
+
+3.3 _prepare_dataset() 캐시 우선 탐색 로직
+---------------------------------------------
+변경 전:
+    def _prepare_dataset(self) -> str:
+        from src.training.dataset_yolo import prepare_yolo_dataset
+        ...
+        yaml_path = prepare_yolo_dataset(...)
+        return yaml_path
+
+변경 후:
+    def _prepare_dataset(self) -> str:
+        # 1) 사전 변환 데이터셋 존재 시 즉시 반환
+        if self.yolo_dir:
+            from src.training.dataset_yolo import validate_yolo_dataset
+            cached_yaml = validate_yolo_dataset(
+                yolo_dir=self.yolo_dir,
+                dataset_group=self.dataset_group,
+            )
+            if cached_yaml:
+                return cached_yaml  # 변환 건너뜀
+
+        # 2) 없으면 기존 변환 수행
+        from src.training.dataset_yolo import prepare_yolo_dataset
+        ...
+        # yolo_dir 지정 시 해당 경로에 저장 (다음 실행 시 재사용)
+        if self.yolo_dir:
+            yolo_dataset_dir = str(Path(self.yolo_dir) / self.dataset_group)
+        else:
+            yolo_dataset_dir = str(self.output_dir / "yolo_dataset")
+
+핵심: yolo_dir가 지정되었지만 아직 비어있으면, 변환 결과를
+yolo_dir/{dataset_group}/ 에 저장하여 다음 실행부터 재사용.
+
+
+3.4 --yolo-dir CLI 인자 (run_benchmark.py)
+--------------------------------------------
+    parser.add_argument('--yolo-dir', type=str, default=None,
+        help='사전 변환된 YOLO 포맷 데이터셋 디렉토리. '
+             '그룹별 하위 디렉토리(예: baseline_raw/)에 '
+             'images/, labels/, dataset.yaml이 있으면 변환을 건너뜀. '
+             '없으면 이 디렉토리에 변환 결과를 저장하여 다음 실행 시 재사용')
+
+전달 경로: main() → run_single_experiment(yolo_dir=args.yolo_dir)
+          → UltralyticsTrainer(yolo_dir=yolo_dir) → _prepare_dataset()
+
+
+4. 사용 흐름
+================================================================================
+
+4.1 최초 실행 (변환 수행, 결과를 yolo_dir에 저장)
+---------------------------------------------------
+  python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+      --csv /content/drive/MyDrive/data/Severstal/train.csv \
+      --yolo-dir /content/yolo_datasets \
+      --output-dir /content/drive/MyDrive/data/Severstal/casda/benchmark_results \
+      --models yolo_mfd --groups baseline --epochs 10
+
+  → /content/yolo_datasets/baseline_raw/
+      images/{train,val,test}/
+      labels/{train,val,test}/
+      dataset.yaml
+
+4.2 재실행 (변환 건너뜀, ~1초)
+--------------------------------
+  python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --yolo-dir /content/yolo_datasets \
+      --output-dir /content/drive/MyDrive/data/Severstal/casda/benchmark_results \
+      --models yolo_mfd --groups baseline --epochs 10
+
+  로그:
+    Validated existing YOLO dataset at /content/yolo_datasets/baseline_raw
+      train: 4666 images, val: 1000 images, test: 1000 images
+      nc: 4, names: {0: Class1, 1: Class2, 2: Class3, 3: Class4}
+    Using pre-converted YOLO dataset (skipping conversion)
+
+4.3 다른 그룹 추가 (새 그룹만 변환)
+-------------------------------------
+  --groups baseline full
+  → baseline_raw/: 캐시 히트 (건너뜀)
+  → casda_full/: 캐시 미스 → 변환 → 저장
+
+4.4 --yolo-dir 미지정 (기존 동작 유지)
+----------------------------------------
+  yolo_dir=None → 기존처럼 run_dir/yolo_dataset/에 매번 변환
+
+
+5. 디렉토리 구조
+================================================================================
+
+  --yolo-dir 지정 시:
+  /content/yolo_datasets/              ← --yolo-dir 경로
+    baseline_raw/                      ← dataset_group별 하위 디렉토리
+      images/
+        train/   (4666 images, symlinks)
+        val/     (1000 images)
+        test/    (1000 images)
+      labels/
+        train/   (4666 .txt files)
+        val/     (1000 .txt files)
+        test/    (1000 .txt files)
+      dataset.yaml
+    casda_full/
+      images/
+        train/   (4666 + CASDA synthetic)
+        ...
+      dataset.yaml
+    casda_pruning/
+      ...
+
+
+6. 성능 개선 효과
+================================================================================
+
+  | 항목                  | 변경 전          | 변경 후 (캐시 히트) |
+  |-----------------------|-----------------|---------------------|
+  | CSV 파싱              | 매번 수행        | 건너뜀               |
+  | RLE→bbox 변환         | 매번 수행        | 건너뜀               |
+  | 이미지 심링크/복사     | 매번 수행        | 건너뜀               |
+  | dataset.yaml 생성     | 매번 수행        | path 업데이트만       |
+  | 예상 시간             | 2-5분            | ~1초                 |
+
+  Colab에서 baseline_raw(4666 train + 1000 val + 1000 test = 6,666장) 기준
+  매 실행마다 2-5분 절약. 12회 벤치마크 전체 시 최대 ~30분 절약 가능.
+
+
+7. 구문 검증
+================================================================================
+  python -c "import ast; ast.parse(open('src/training/dataset_yolo.py', encoding='utf-8').read())"
+  → Syntax OK
+
+  python -c "import ast; ast.parse(open('src/training/ultralytics_trainer.py', encoding='utf-8').read())"
+  → Syntax OK
+
+  python -c "import ast; ast.parse(open('scripts/run_benchmark.py', encoding='utf-8').read())"
+  → Syntax OK

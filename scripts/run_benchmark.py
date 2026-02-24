@@ -38,6 +38,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -227,6 +228,7 @@ def run_single_experiment(
     experiment_dir: Path,
     device: str = 'cuda',
     resume: bool = False,
+    yolo_dir: Optional[str] = None,
 ) -> dict:
     """
     Run a single training experiment.
@@ -295,6 +297,7 @@ def run_single_experiment(
             output_dir=str(run_dir),
             device=device,
             resume=resume,
+            yolo_dir=yolo_dir,
         )
 
         test_metrics = trainer.train()
@@ -549,6 +552,13 @@ Examples:
       --output-dir /content/drive/MyDrive/data/Severstal/casda/benchmark_results \\
       --models yolo_mfd --groups baseline --epochs 10
 
+  # Fast re-run: use pre-converted YOLO dataset (skip CSV->YOLO conversion)
+  python scripts/run_benchmark.py \\
+      --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \\
+      --yolo-dir /content/yolo_datasets \\
+      --output-dir /content/drive/MyDrive/data/Severstal/casda/benchmark_results \\
+      --models yolo_mfd --groups baseline --epochs 10
+
   # Resume: add CASDA runs to existing experiment (skips completed runs)
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml \\
       --resume --output-dir outputs/benchmark_results/20260223_143000
@@ -593,6 +603,11 @@ Examples:
                         help='사전 생성된 분할 CSV 파일 경로 '
                              '(scripts/create_dataset_split.py로 생성). '
                              '지정 시 동적 분할 대신 이 파일의 분할을 사용')
+    parser.add_argument('--yolo-dir', type=str, default=None,
+                        help='사전 변환된 YOLO 포맷 데이터셋 디렉토리. '
+                             '그룹별 하위 디렉토리(예: baseline_raw/)에 '
+                             'images/, labels/, dataset.yaml이 있으면 변환을 건너뜀. '
+                             '없으면 이 디렉토리에 변환 결과를 저장하여 다음 실행 시 재사용')
     args = parser.parse_args()
 
     # Load config
@@ -765,6 +780,7 @@ Examples:
                     experiment_dir=experiment_dir,
                     device=device,
                     resume=args.resume,
+                    yolo_dir=args.yolo_dir,
                 )
 
                 model_name = config['models'][model_key]['name']

@@ -87,7 +87,7 @@ models:
     backbone: "yolov8s"  # base architecture
     custom_modules:
       mefe: true  # Multi-scale Edge Feature Enhancement module
-    input_size: [640, 640]
+    input_size: [640, 640]  # max side=640; rect=True auto-adjusts for 256x1600
     training:
       epochs: 300
       batch_size: 16
@@ -109,7 +109,7 @@ models:
     custom_modules:
       bifpn: true  # Bi-directional Feature Pyramid Network
       enhanced_backbone: true
-    input_size: [640, 640]
+    input_size: [640, 640]  # max side=640; rect=True auto-adjusts for 256x1600
     training:
       epochs: 300
       batch_size: 16

@@ -34,6 +34,84 @@ from src.utils.rle_utils import rle_decode
 logger = logging.getLogger(__name__)
 
 
+def validate_yolo_dataset(yolo_dir: str, dataset_group: str = "") -> Optional[str]:
+    """
+    Validate an existing YOLO-format dataset directory.
+    
+    Checks:
+      1. dataset.yaml exists and is readable
+      2. images/{train,val,test} directories exist with images
+      3. labels/{train,val,test} directories exist with label files
+    
+    Args:
+        yolo_dir: Path to the YOLO dataset root (or parent containing per-group subdirs)
+        dataset_group: If non-empty, look for yolo_dir/{dataset_group}/ subdirectory
+    
+    Returns:
+        Path to dataset.yaml if valid, None otherwise
+    """
+    base = Path(yolo_dir)
+    
+    # If dataset_group specified, check for group subdirectory
+    if dataset_group:
+        group_dir = base / dataset_group
+        if group_dir.exists():
+            base = group_dir
+    
+    yaml_path = base / "dataset.yaml"
+    if not yaml_path.exists():
+        logger.debug(f"No dataset.yaml found at {yaml_path}")
+        return None
+    
+    # Check directory structure
+    required_splits = ['train', 'val', 'test']
+    for split in required_splits:
+        img_dir = base / "images" / split
+        lbl_dir = base / "labels" / split
+        if not img_dir.exists():
+            logger.warning(f"Missing images/{split} directory in {base}")
+            return None
+        if not lbl_dir.exists():
+            logger.warning(f"Missing labels/{split} directory in {base}")
+            return None
+        
+        # Check there are actual files
+        img_count = sum(1 for _ in img_dir.iterdir()) if img_dir.exists() else 0
+        if split in ('train', 'val') and img_count == 0:
+            logger.warning(f"Empty images/{split} directory in {base}")
+            return None
+    
+    # Read yaml to do basic sanity check
+    try:
+        import yaml
+        with open(yaml_path) as f:
+            ds_cfg = yaml.safe_load(f)
+        if 'nc' not in ds_cfg or 'names' not in ds_cfg:
+            logger.warning(f"dataset.yaml missing 'nc' or 'names' fields: {yaml_path}")
+            return None
+    except Exception as e:
+        logger.warning(f"Failed to parse dataset.yaml: {e}")
+        return None
+    
+    # Count stats for logging
+    train_imgs = sum(1 for _ in (base / "images" / "train").iterdir())
+    val_imgs = sum(1 for _ in (base / "images" / "val").iterdir())
+    test_imgs = sum(1 for _ in (base / "images" / "test").iterdir())
+    logger.info(f"Validated existing YOLO dataset at {base}")
+    logger.info(f"  train: {train_imgs} images, val: {val_imgs} images, test: {test_imgs} images")
+    logger.info(f"  nc: {ds_cfg['nc']}, names: {ds_cfg['names']}")
+    
+    # Update path field in dataset.yaml to match current location
+    # (in case the dataset was moved)
+    if ds_cfg.get('path') != base.as_posix():
+        ds_cfg['path'] = base.as_posix()
+        with open(yaml_path, 'w') as f:
+            yaml.dump(ds_cfg, f, default_flow_style=False)
+        logger.info(f"  Updated path field to: {base.as_posix()}")
+    
+    return str(yaml_path)
+
+
 def _rle_to_bboxes(rle_string: str, shape: Tuple[int, int] = (256, 1600)) -> List[List[float]]:
     """
     Convert RLE mask to list of bounding boxes in normalized YOLO format.
@@ -192,7 +270,8 @@ def prepare_yolo_dataset(
         f"test: images/test\n"
         f"\n"
         f"nc: {num_classes}\n"
-        f"names: {class_names}\n"
+        f"names:\n" +
+        "".join(f"  {i}: {name}\n" for i, name in enumerate(class_names))
     )
     with open(yaml_path, 'w') as f:
         f.write(yaml_content)

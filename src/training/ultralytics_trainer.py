@@ -48,6 +48,7 @@ class UltralyticsTrainer:
         output_dir: str,
         device: str = 'cuda',
         resume: bool = False,
+        yolo_dir: Optional[str] = None,
     ):
         """
         Args:
@@ -60,6 +61,7 @@ class UltralyticsTrainer:
             output_dir: Base output directory for this run
             device: Training device
             resume: Whether to resume from existing checkpoint
+            yolo_dir: Pre-converted YOLO dataset directory (skip conversion if valid)
         """
         self.model_key = model_key
         self.model_config = model_config
@@ -72,6 +74,7 @@ class UltralyticsTrainer:
         self.output_dir = Path(output_dir)
         self.device = device
         self.resume = resume
+        self.yolo_dir = yolo_dir
 
         # Training config
         train_cfg = model_config.get('training', {})
@@ -97,7 +100,26 @@ class UltralyticsTrainer:
     def _prepare_dataset(self) -> str:
         """
         Prepare YOLO-format dataset and return path to dataset.yaml.
+        
+        If yolo_dir is specified and contains a valid pre-converted dataset
+        (for this dataset_group), skip conversion and return the existing
+        dataset.yaml path directly. This saves significant time on repeated runs.
         """
+        # Try to use pre-converted dataset first
+        if self.yolo_dir:
+            from src.training.dataset_yolo import validate_yolo_dataset
+            cached_yaml = validate_yolo_dataset(
+                yolo_dir=self.yolo_dir,
+                dataset_group=self.dataset_group,
+            )
+            if cached_yaml:
+                logger.info(f"Using pre-converted YOLO dataset (skipping conversion)")
+                logger.info(f"  dataset.yaml: {cached_yaml}")
+                return cached_yaml
+            else:
+                logger.info(f"Pre-converted dataset not found/invalid at {self.yolo_dir}, "
+                            f"will convert from scratch")
+
         from src.training.dataset_yolo import prepare_yolo_dataset
 
         image_dir = self._resolve_path(self.dataset_config['image_dir'])
@@ -121,7 +143,14 @@ class UltralyticsTrainer:
                 casda_dir = self._resolve_path(raw_dir)
                 casda_mode = "pruning"
 
-        yolo_dataset_dir = str(self.output_dir / "yolo_dataset")
+        # Determine output directory for converted dataset
+        # If yolo_dir specified (but invalid/empty), save there for future reuse
+        # Otherwise save in run output directory
+        if self.yolo_dir:
+            yolo_dataset_dir = str(Path(self.yolo_dir) / self.dataset_group)
+        else:
+            yolo_dataset_dir = str(self.output_dir / "yolo_dataset")
+
         class_names = self.dataset_config.get('class_names',
                                                [f"Class{i+1}" for i in range(self.num_classes)])
 
@@ -220,6 +249,7 @@ class UltralyticsTrainer:
             conf=self.conf_threshold,
             iou=self.iou_threshold,
             device=self.device,
+            rect=True,  # rectangular batching for consistent eval
             verbose=False,
         )
 
@@ -307,7 +337,7 @@ class UltralyticsTrainer:
             data=dataset_yaml,
             epochs=self.epochs,
             batch=self.batch_size,
-            imgsz=self.input_size[0],  # ultralytics uses single int for square
+            imgsz=self.input_size[0],  # longest side; rect=True handles 256x1600 aspect ratio
             device=self.device,
             optimizer=optimizer,
             lr0=self.lr,
@@ -325,6 +355,7 @@ class UltralyticsTrainer:
             save=True,
             save_period=-1,  # only save best and last
             plots=True,
+            rect=True,  # rectangular batching for Severstal 256x1600 (1:6.25 aspect ratio)
             val=True,
         )
 
