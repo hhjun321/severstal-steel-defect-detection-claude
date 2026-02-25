@@ -506,3 +506,5 @@ See [Technical Whitepaper](TECHNICAL_WHITEPAPER_EN.md) Chapter 9 for detailed tr
 **Version**: 1.0.0  
 **Status**: Production Ready ✅
 
+#   s e v e r s t a l - s t e e l - d e f e c t - d e t e c t i o n - c l a u d e  
+ 
