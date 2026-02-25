@@ -1,0 +1,52 @@
+======================================================================
+  ControlNet Model Validation Report
+======================================================================
+
+Phase 1: Basic Generation
+----------------------------------------
+  Samples: 967/967
+  Model: /content/drive/MyDrive/data/Severstal/controlnet_training_v4/best_model
+  Steps: 30
+  Guidance: 7.5
+  Quality Score: 0.6254
+    Color Consistency: 0.6541
+    Artifact Score: 0.9258
+    Sharpness Score: 0.8830
+    SSIM Score: 0.0269  (967 samples)
+    LPIPS Score: 0.5774  (967 samples)
+    Images Evaluated: 967
+  Quality Status: PASS
+  Overall Status: PASS
+
+Phase 2: Parameter Exploration
+----------------------------------------
+  Guidance scales: [3.0, 5.0, 7.5, 10.0]
+  Inference steps: [20, 30, 50]
+  Seeds: [42, 123, 456, 789]
+  Combinations tested: 11
+  Quality Scores by Parameter:
+    guidance_scale=3.0: quality=0.6301  SSIM=0.0469  LPIPS=0.5560
+    guidance_scale=5.0: quality=0.6242  SSIM=0.0490  LPIPS=0.5532
+    guidance_scale=7.5: quality=0.6151  SSIM=0.0518  LPIPS=0.5484
+    guidance_scale=10.0: quality=0.6078  SSIM=0.0551  LPIPS=0.5453
+    num_inference_steps=20: quality=0.6153  SSIM=0.0517  LPIPS=0.5481
+    num_inference_steps=30: quality=0.6151  SSIM=0.0518  LPIPS=0.5484
+    num_inference_steps=50: quality=0.6152  SSIM=0.0519  LPIPS=0.5484
+    seed=42: quality=0.6416  SSIM=0.0666  LPIPS=0.5162
+    seed=123: quality=0.6320  SSIM=0.0576  LPIPS=0.5741
+    seed=456: quality=0.6340  SSIM=0.0200  LPIPS=0.5236
+    seed=789: quality=0.6370  SSIM=0.1080  LPIPS=0.5554
+  Best: seed=42 (score=0.6416)
+
+Phase 3: Unseen Data Generalization
+----------------------------------------
+  Unseen samples: 12/12
+  Quality Score: 0.6316
+    Color Consistency: 0.6500
+    Artifact Score: 0.9269
+    Sharpness Score: 0.9103
+    SSIM Score: 0.0313  (12 samples)
+    LPIPS Score: 0.5703  (12 samples)
+    Images Evaluated: 12
+  Quality Status: PASS
+  Overall Status: PASS

@@ -1,0 +1,128 @@
+20260221 작업 일지 #2 - 품질 메트릭 전면 개선 (Colab 검증 결과 대응)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+Colab 실행 결과에서 발견된 5가지 품질 메트릭 문제를 수정하여,
+Phase 2 파라미터 탐색이 실제로 다른 guidance_scale/steps/seed 간
+품질 차이를 정량적으로 구분할 수 있도록 한다.
+
+
+2. 문제 분석 및 수정 결과
+================================================================================
+
+  | 문제                                        | 원인                             | 수정                              |
+  |---------------------------------------------|----------------------------------|-----------------------------------|
+  | Phase 2 SSIM/LPIPS 항상 스킵               | _build_reference_map이 single-   | sources/ 디렉토리 생성 +          |
+  |                                             | image 모드 출력 구조 미지원      | 3단계 참조 탐색 로직 추가         |
+  | artifact_score = 0.0 (모든 이미지)          | Sobel gradient > 200 고정 임계값 | 통계적 이상치(mean+3σ) 방식 +    |
+  |                                             | → 금속 에지에서 항상 초과        | 고주파 에너지 비율 분석 추가      |
+  | color_score = 0.9 (모든 이미지)             | 그레이스케일 후처리 이미지에서   | 히스토그램 엔트로피 + 밝기 범위   |
+  |                                             | a,b 채널이 항상 ~0 → 무차별     | + 텍스처 복잡도 4종 지표로 대체   |
+  | blur_score = 1.0 (모든 이미지)              | Laplacian var ≥ 100 임계값이     | 임계값 500으로 상향 +             |
+  |                                             | diffusion 출력 대비 너무 낮음    | gradient contrast ratio 추가      |
+  | SSIM = 0.018 (hint vs 생성 이미지 비교)     | hint(에지 마스크)와 생성(실사)   | hint 자동 감지 → Canny 에지맵    |
+  |                                             | 직접 비교 → 구조적 무관          | 추출 후 hint와 비교 방식으로 변경 |
+
+
+3. 변경 파일
+================================================================================
+
+  | 파일                              | 변경 내용                                        |
+  |-----------------------------------|--------------------------------------------------|
+  | scripts/test_controlnet.py        | generate_single_image(): hint를 sources/ 저장     |
+  | scripts/run_validation_phases.py  | _build_reference_map(): 3단계 참조 탐색 로직      |
+  |                                   | _score_artifacts(): 통계적 이상치 + 고주파 분석   |
+  |                                   | _score_color_consistency(): 4종 지표 종합 평가    |
+  |                                   | _score_sharpness(): 임계값 재보정 + gradient 비율 |
+  |                                   | _compute_ssim(): hint 자동 감지 + Canny 에지 비교 |
+  |                                   | docstring: lpips/scikit-image 설치 안내 추가      |
+
+
+4. 메트릭별 상세 변경
+================================================================================
+
+4.1 _build_reference_map() (run_validation_phases.py)
+-----------------------------------------------------
+변경 전: comparisons/ 와 sources/ 서브디렉토리에서만 참조 탐색
+변경 후: 3단계 탐색
+  1) comparisons/ 디렉토리 (batch 모드)
+  2) sources/ 디렉토리 (batch/single 공통 - test_controlnet.py에서 저장)
+  3) output_dir 직접의 *_generated_*.png → *_comparison.png 매핑 (폴백)
+
+4.2 _score_artifacts() (run_validation_phases.py)
+-------------------------------------------------
+변경 전: gradient_magnitude > 200 고정 임계값 + ratio * 10 배율
+  → 금속 표면 에지에서 Sobel이 200을 쉽게 초과 → ratio ≥ 0.1 → score = 0.0
+
+변경 후:
+  (1) 통계적 이상치 비율 (mean + 3σ 초과 비율)
+      - 자연 이미지: < 1% → 1.0
+      - 아티팩트: > 5% → 0.0
+  (2) 고주파 에너지 비율 (Laplacian/Gradient)
+      - 자연 이미지: 1.0~2.5 → 1.0
+      - 체커보드 패턴: > 5.0 → 0.0
+  가중 결합: 0.6 * edge_score + 0.4 * hf_score
+
+4.3 _score_color_consistency() (run_validation_phases.py)
+---------------------------------------------------------
+변경 전: L범위 + a,b 편차 + a,b 표준편차 + L표준편차
+  → 그레이스케일 이미지에서 a,b가 항상 ~0 → 항상 ~0.9
+
+변경 후: 4종 지표 종합
+  (1) 채도 점수 (a,b 절대편차, 0.20)
+  (2) 밝기 범위 (L의 5th~95th percentile, 0.25)
+  (3) 히스토그램 엔트로피 (64 bins, 0.30) ← 핵심 차별화 지표
+  (4) 텍스처 복잡도 (L 표준편차, 0.25)
+
+기대: guidance_scale이 높으면 contrast가 강해져 range/entropy가 변화,
+      steps가 적으면 텍스처가 단조로워 entropy가 낮아짐
+
+4.4 _score_sharpness() (run_validation_phases.py)
+-------------------------------------------------
+변경 전: Laplacian var ≥ 100 → 1.0
+  → diffusion 출력이 쉽게 100 초과 → 항상 1.0
+
+변경 후:
+  (1) Laplacian variance: 30~500 범위에서 선형 스코어
+  (2) Gradient contrast ratio (P90/P50): 1.5~4.0 범위에서 선형 스코어
+  가중 결합: 0.5 * lap_score + 0.5 * edge_sharpness
+
+4.5 _compute_ssim() (run_validation_phases.py)
+----------------------------------------------
+변경 전: 생성 grayscale vs 참조 BGR 직접 비교
+  → hint(에지 마스크) vs 실사 생성 이미지 = SSIM ≈ 0.018
+
+변경 후: 참조 이미지 유형 자동 판별
+  - unique_ratio < 0.15 → hint (바이너리 마스크)로 판정
+  - hint인 경우: 생성 이미지에 Canny 적용 → 에지맵 vs hint SSIM
+  - 실사인 경우: 기존 직접 SSIM
+  - win_size를 이미지 크기에 적응 (최소 3, 최대 7)
+
+4.6 test_controlnet.py - sources/ 디렉토리 생성
+------------------------------------------------
+generate_single_image()에서 hint 이미지를 sources/{hint_stem}.png로 저장.
+→ _build_reference_map()의 2단계 탐색에서 자동으로 참조 매핑됨.
+
+
+5. Colab 실행 시 필요 사항
+================================================================================
+  pip install lpips scikit-image
+
+  # lpips가 없으면 LPIPS 메트릭이 자동 스킵됨 (3개 메트릭 폴백)
+  # scikit-image가 없으면 SSIM 메트릭이 자동 스킵됨 (3개 메트릭 폴백)
+
+
+6. 다음 단계
+================================================================================
+  1. Colab에서 수정된 코드로 Phase 2 재실행 → 품질 차별화 확인
+  2. Phase 3 SSIM이 hint-alignment 기반으로 의미 있는 값을 반환하는지 확인
+  3. 5,000장 합성 이미지 생성 (500 samples × 10 images)
+  4. CASDA-Pruning 선별 (suitability ≥ 0.7 → 상위 2,000장)
+  5. 벤치마크 실험 (3 models × 4 dataset groups = 12 training runs)
+
+
+7. 문법 검증
+================================================================================
+  ast.parse(run_validation_phases.py) → OK
+  ast.parse(test_controlnet.py) → OK

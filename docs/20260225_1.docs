@@ -1,0 +1,317 @@
+20260225 작업 일지 #1 - ControlNet v4 품질 불량 원인 분석 및 개선 계획
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+ControlNet v4 학습 후 생성된 이미지(outputs/augmented_dataset_v4, test_results_v4)가
+흑백 노이즈/블롭 패턴만 출력하는 문제의 근본 원인을 진단하고 개선 방안을 수립한다.
+
+  참고 검증 지표 (phase4_report 기준):
+    SSIM  = 0.0269  (거의 무상관 — 완전 랜덤이면 ~0.00)
+    LPIPS = 0.5774  (높은 지각적 차이 — 완전 불일치 기준 ~1.0)
+    quality_score_stats: min=0.0 / max=0.0 / mean=0.0
+    pruning 결과: 2,901장 중 0장 통과 (threshold=0.7)
+
+
+2. 진단 요약
+================================================================================
+
+  원인 분류  | 원인                                 | 근거 파일
+  ----------|--------------------------------------|-----------------------------------------------
+  [Critical] | 힌트 타입 불일치                      | hint_generator.py, 사전학습 모델 스펙
+  [Critical] | ROI 극단적 업스케일 → 블롭 학습 표적  | train_controlnet.py, roi_metadata.csv
+  [Major]    | 학습 스텝 극단적 부족                 | phase4_report (578 steps/24 epochs)
+  [Major]    | epoch 1에서 손실 수렴 후 정체          | training_log.json
+  [Major]    | 잘못된 학습 데이터셋 참조 가능성        | training_config.json
+  [Medium]   | constant_with_warmup 스케줄러         | training_config.json
+  [Medium]   | 낮은 guidance scale일수록 품질 우수    | phase4_report Phase 2
+
+
+3. 원인별 상세 분석
+================================================================================
+
+3.1 [Critical] 힌트 타입 불일치
+---------------------------------
+
+  사용된 사전학습 모델: lllyasviel/sd-controlnet-canny
+  → Canny 엣지 맵 (흰색 엣지, 검은 배경, 이진 맵)을 힌트로 기대
+
+  실제 v4 힌트 생성 로직 (src/preprocessing/hint_generator.py):
+    R 채널 = 결함 마스크
+    G 채널 = 배경 구조 엣지 (Sobel 기반)
+    B 채널 = 텍스처 밀도
+    → gray = R*0.5 + G*0.3 + B*0.2  (3채널 동일값)
+
+  불일치 영향:
+    - sd-controlnet-canny의 ControlNet encoder는 Canny 엣지 패턴을 특징으로
+      학습된 상태. 완전히 다른 분포의 힌트(그레이스케일 혼합)가 입력될 때
+      conditioning residual이 의미 없는 값으로 출력됨.
+    - 578 스텝으로는 새 힌트 분포를 재학습하기에 턱없이 부족.
+    - 결과: ControlNet conditioning이 사실상 무력화되어 UNet이 힌트를
+      무시하고 base SD 분포에서 샘플링.
+
+3.2 [Critical] ROI 극단적 업스케일 → 블롭이 학습 표적이 됨
+-------------------------------------------------------------
+
+  ROI 패치 원본 크기: 약 50–200px (roi_metadata.csv의 patch bounds 기준)
+  학습 해상도: 512×512 (train_controlnet.py: Resize(512) + CenterCrop(512))
+  업스케일 배율: 2.5× ~ 10×
+
+  + force_grayscale_target=True (train_controlnet.py):
+      target_image = Image.fromarray(
+          np.stack([gray, gray, gray], axis=2).astype(np.uint8)
+      )
+    → 학습 표적(target) 자체가 흐릿한 그레이스케일 블롭
+
+  결합 효과:
+    1) 소형 결함 패치를 512×512로 강제 업스케일 → 경계가 뭉개진 블롭
+    2) 표적을 그레이스케일로 변환 → 색상 정보 없음
+    3) 모델이 학습한 것 = "그레이스케일 흐릿한 블롭 생성"
+    4) 생성 결과가 학습 표적 분포를 정확히 재현 → SSIM 낮음(원본 컬러와 비교)
+
+3.3 [Major] 학습 스텝 극단적 부족
+------------------------------------
+
+  Phase 4 보고서 (docs/20260221_3.docs):
+    Total Steps  = 578
+    Total Epochs = 24
+    학습 데이터셋 크기 ≈ 578 / 24 ≈ 24 samples/epoch
+
+  일반 ControlNet fine-tuning 권장:
+    최소: 1,000 ~ 5,000 스텝 (소규모 도메인 적응)
+    권장: 10,000 ~ 50,000 스텝 (새 conditioning 타입 학습)
+
+  578 스텝에서 달성 가능한 것:
+    - 기존 conditioning 분포의 경미한 도메인 이동만 가능
+    - 힌트 타입이 완전히 다를 경우(3.1절) 재학습 불가
+
+3.4 [Major] epoch 1 이후 손실 정체 → 암기 현상
+--------------------------------------------------
+
+  training_log.json 손실 패턴:
+    Step 10   : 0.184  (초기)
+    Step 50   : ~0.065 (급격 하락)
+    Step 100+ : 0.009–0.030 (정체)
+
+  의미:
+    - 급격한 하락 후 정체 = 소수 샘플 암기(memorization)
+    - 모델이 학습 데이터 분포(블롭)를 암기한 뒤 더 이상 개선 없음
+    - 실제 결함 패턴 구조를 학습하지 못함
+
+3.5 [Major] 잘못된 학습 데이터셋 참조 가능성
+----------------------------------------------
+
+  controlnet_training/training_config.json 내용:
+    "data_dir": "/content/.../controlnet_dataset"  ← v4 아님!
+
+  기대값: "/content/.../controlnet_dataset_v4" (1,000 샘플)
+  실제값: "/content/.../controlnet_dataset"     (원본 소규모 데이터셋)
+
+  영향:
+    - controlnet_dataset_v4에는 1,000 pairs 준비됨 (packaging_summary.txt)
+    - 원본 controlnet_dataset은 ~48 샘플 추정 (1200 steps / 100 epochs = 12 steps/epoch = ~48 samples)
+    - 48 샘플로 학습 시 암기 발생 필연적
+    - 주의: Colab 실행 시 경로가 달랐을 가능성 있으나 config가 유일한 증거
+
+3.6 [Medium] constant_with_warmup 스케줄러 문제
+-------------------------------------------------
+
+  training_config.json: "lr_scheduler": "constant_with_warmup"
+
+  이전 실험 기록 (docs/20260221_3.docs v2/v3):
+    - v2, v3에서 constant_with_warmup → 불수렴(non-convergence) 관찰
+    - cosine 또는 cosine_with_restarts 권장으로 명시
+
+  v4에서 동일 문제 반복 가능성: warmup 이후 LR이 constant로 유지되어
+  fine-grained 최적화가 이루어지지 않고 손실이 조기 plateau에 수렴.
+
+3.7 [Medium] 낮은 guidance scale에서 더 나은 품질
+---------------------------------------------------
+
+  Phase 4 Phase 2 결과 (guidance scale vs quality):
+    guidance_scale=3.0  → quality=0.6301 (최고)
+    guidance_scale=7.5  → quality=0.6254
+    guidance_scale=10.0 → quality < 0.62 (추정)
+
+  의미: conditioning signal이 약함 → guidance를 높일수록 conditioning의
+  왜곡이 증폭되어 오히려 품질 하락. 모델이 힌트를 실제로 활용하지 못하고
+  base SD 생성에 의존하고 있음을 시사.
+
+
+4. 근거 데이터 요약
+================================================================================
+
+  지표                          | 값             | 해석
+  ------------------------------|---------------|------------------------------------------
+  SSIM                          | 0.0269         | 구조적 유사성 거의 없음 (완전 무관)
+  LPIPS                         | 0.5774         | 높은 지각적 불일치
+  quality_score_stats.max       | 0.0            | 생성 품질 점수 전량 0점
+  pruning 통과율                 | 0/2,901        | 어떤 이미지도 threshold(0.7) 미달
+  phase4 total_steps             | 578            | ControlNet 재학습에 크게 부족
+  학습 손실 수렴 시점             | epoch 1 직후   | 소수 샘플 암기 패턴
+  training_config data_dir       | controlnet_dataset (v4 아님) | 잘못된 데이터셋 가능성
+  힌트 타입 불일치               | 그레이스케일 혼합 vs Canny 엣지 | conditioning 무력화
+
+
+5. v5 개선 계획
+================================================================================
+
+5.1 [최우선] 힌트 포맷 수정 — 사전학습 모델과 정렬
+----------------------------------------------------
+
+  Option A: 표준 Canny 엣지 힌트 사용 (권장)
+    - hint_generator.py를 Canny 엣지 생성으로 교체
+    - sd-controlnet-canny 사전학습 가중치의 conditioning encoder와 정렬
+    - 결함 마스크로 강제 엣지 생성: cv2.Canny(mask_region, 50, 150)
+    - 강점: 사전학습 표현 활용 가능 → 적은 스텝으로 수렴
+    - 약점: 결함 마스크 정밀도에 의존
+
+  Option B: ControlNet 처음부터 학습 (scratch training)
+    - lllyasviel/stable-diffusion-v1-5 기반 새 ControlNet 초기화
+    - 커스텀 힌트 포맷(현 그레이스케일 혼합) 그대로 사용 가능
+    - 필요 스텝: 50,000+ (SD 기반 ControlNet scratch 기준)
+    - 강점: 힌트 포맷 자유
+    - 약점: 매우 긴 학습 시간, 대용량 데이터 필요
+
+  → Option A 권장 (가용 컴퓨팅 제약 고려)
+
+5.2 [최우선] 학습 해상도 및 입력 전략 수정
+-------------------------------------------
+
+  현재 문제: ROI 패치(50–200px) → 512×512 업스케일 → 블롭 표적
+
+  개선 방향:
+    (a) 전체 결함 이미지 컨텍스트 사용
+        - 원본 철강 스트립 이미지(256×1600)를 512×512 타일로 분할
+        - 결함이 포함된 타일 선택 → 타일 내 결함 마스크 생성
+        - 실제 스케일에서 결함 패턴 학습 가능
+        - 학습 쌍: (힌트 타일, 원본 타일)
+
+    (b) force_grayscale_target 비활성화
+        - 컬러 원본 이미지를 표적으로 사용
+        - 표적이 실제 결함 외관을 반영 → 모델이 현실적 텍스처 학습
+
+5.3 [Major] 학습 규모 확대
+---------------------------
+
+  최소 권장:
+    training_samples : 3,000+  (현재 48~1,000)
+    total_steps      : 10,000+ (현재 578)
+    lr_scheduler     : cosine  (현재 constant_with_warmup)
+    train_batch_size : 4       (현재 1, gradient_accum=4)
+
+  Colab 기준 예상 학습 시간 (A100):
+    10,000 steps, batch=4, 512×512: 약 3–5시간
+
+5.4 [Major] 올바른 데이터셋 확인 및 경로 수정
+----------------------------------------------
+
+  training_config.json 수정 전 확인 필요:
+    - Colab 환경에서 controlnet_dataset_v4 경로 접근 가능 여부
+    - packaging_summary.txt: 1,000 pairs 준비됨 확인 완료
+    - train.jsonl 경로가 Colab 절대 경로와 일치하는지 재확인
+
+  수정:
+    변경 전: "data_dir": ".../controlnet_dataset"
+    변경 후: "data_dir": ".../controlnet_dataset_v4"
+
+5.5 [Medium] ControlNet-Inpaint 아키텍처 검토
+----------------------------------------------
+
+  현재 접근: ControlNet으로 새 결함 이미지 생성 (전체 이미지)
+  대안     : ControlNet-Inpaint로 결함 영역만 교체 (inpainting)
+
+  ControlNet-Inpaint 장점:
+    - 배경(비결함 영역)을 원본 그대로 유지
+    - 결함 위치/형태만 합성 → SSIM 자연 향상
+    - 사전학습 모델: runwayml/stable-diffusion-inpainting + ControlNet
+    - 현실적 학습 쌍 생성 용이: (마스크, 원본) → (마스크, 결함 삽입 이미지)
+
+5.6 권장 v5 학습 설정
+----------------------
+
+  {
+    "base_model"            : "runwayml/stable-diffusion-v1-5",
+    "controlnet_model_name" : "lllyasviel/sd-controlnet-canny",
+    "data_dir"              : "/content/.../controlnet_dataset_v5",
+    "hint_type"             : "canny",
+    "force_grayscale_target": false,
+    "resolution"            : 512,
+    "train_batch_size"      : 4,
+    "gradient_accumulation" : 1,
+    "num_train_epochs"      : 50,
+    "learning_rate"         : 1e-5,
+    "lr_scheduler"          : "cosine",
+    "lr_warmup_steps"       : 500,
+    "checkpointing_steps"   : 1000,
+    "validation_steps"      : 500
+  }
+
+  예상 총 스텝: 50 epochs × (3000 / 4) = ~37,500 steps
+  → 새 힌트 분포 학습 및 도메인 적응에 충분
+
+
+6. 데이터셋 재구성 계획 (v5용)
+================================================================================
+
+  단계  | 작업                                          | 예상 출력
+  ------|-----------------------------------------------|-----------------------------
+  1     | 원본 이미지 512×512 타일 분할                  | ~20,000 타일
+  2     | 결함 포함 타일 선택 (결함 픽셀 비율 > 0.5%)    | ~8,000 타일
+  3     | 결함 마스크로 Canny 힌트 생성                  | 8,000 힌트 이미지
+  4     | 힌트-표적 학습 쌍 구성 (원본 컬러 유지)         | 8,000 pairs
+  5     | 학습/검증 분할 (90/10)                         | 7,200 train / 800 val
+  6     | JSONL 작성 (절대 경로)                         | train.jsonl, val.jsonl
+
+  품질 기준 (v5 평가 목표):
+    SSIM  > 0.30  (v4: 0.0269)
+    LPIPS < 0.40  (v4: 0.5774)
+    quality_score > 0.63 (pruning threshold)
+
+
+7. 영향 범위
+================================================================================
+
+  항목                    | 현재 상태            | v5 개선 후 예상
+  ------------------------|---------------------|-------------------------------
+  quality_score           | 0.0 (전량)          | 0.54+ (ROI 점수 기준)
+  casda_pruning 이미지 수  | 0/2,901             | 1,000+ / 3,000+
+  SSIM                    | 0.0269              | 0.30+
+  LPIPS                   | 0.5774              | 0.40-
+  벤치마크 CASDA 효과      | 측정 불가 (데이터 없음) | 측정 가능
+
+  주의: 현재 벤치마크는 casda_full=2,901장(quality_score=0 이지만 CASDA-Full에 포함),
+  casda_pruning=0장으로 진행 중. v5 완료 전까지는 casda_pruning 그룹 결과 해석 주의.
+
+
+8. 즉시 가능한 임시 조치
+================================================================================
+
+  8.1 현재 벤치마크 계속 진행 가능 여부
+      → CASDA-Full 그룹: 2,901장 포함 (quality_score=0이나 이미지는 존재)
+        - CASDA 이미지 자체는 생성됨 (블롭이지만 데이터로는 존재)
+        - 벤치마크 실행은 가능하나 "CASDA가 도움이 되는지" 측정 의미 퇴색
+      → CASDA-Pruning 그룹: 0장 → 패스 불가, 스킵 필요
+
+  8.2 package_casda_data.py --roi-metadata 옵션 (이미 구현 완료)
+      - ROI suitability_score (0.54–0.69) 전파 가능
+      - 재패키징 시 casda_pruning threshold를 0.50으로 낮추면
+        일부 통과 가능 (967개 샘플 중 score 0.54+)
+      - 단, 이미지 자체 품질(블롭)은 개선되지 않음
+
+  8.3 벤치마크 실행 권장 순서
+      (1) yolo_mfd + baseline_raw, baseline_trad → 현재 실행 가능
+      (2) yolo_mfd + casda_full → quality=0 이미지 포함 효과 측정
+      (3) casda_pruning은 v5 완료 후 재실행
+
+
+9. 구조 검증
+================================================================================
+  - 본 문서는 코드 변경 없음 (분석 및 계획 수립만)
+  - 참조 파일:
+      src/preprocessing/hint_generator.py   (힌트 생성 로직)
+      scripts/train_controlnet.py           (학습 파이프라인)
+      controlnet_training/training_config.json (학습 설정)
+      controlnet_training/training_log.json (학습 이력)
+      outputs/augmented_dataset_v4/packaging_report.json (결과 지표)
+      docs/20260221_3.docs                  (phase4_report)

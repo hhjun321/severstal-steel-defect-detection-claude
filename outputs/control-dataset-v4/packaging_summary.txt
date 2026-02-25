@@ -1,0 +1,8 @@
+ControlNet Dataset Packaging Summary
+================================================================================
+
+total_packaged: 1000
+hints_created: True
+output_directory: /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4
+train_jsonl: /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/train.jsonl
+metadata_json: /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/metadata.json

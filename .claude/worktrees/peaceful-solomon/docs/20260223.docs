@@ -1,0 +1,1040 @@
+20260223 작업 일지 #1 - 벤치마크 실행 준비 (버그 수정, Resume 기능, Colab 최적화)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+작업 일지 #3(20260221_3)에서 구현한 벤치마크 실험 코드를 Colab에서 실행하기
+위한 사전 준비 작업을 수행한다.
+
+  - 코드 정적 분석 중 발견된 버그 3건 수정
+  - Colab T4 GPU 환경에 맞춘 설정 조정
+  - --resume 기능 구현 (완료된 run 재학습 방지, 중단된 학습 재개)
+  - Baseline-only 실행 전략 수립 (CASDA 데이터 미생성 상태)
+  - 실행 명령어 준비
+
+
+2. 변경 파일
+================================================================================
+
+  | 파일                              | 상태 | 라인  | 변경 내용                                    |
+  |-----------------------------------|------|-------|----------------------------------------------|
+  | scripts/run_benchmark.py          | 수정 | 548   | 버그 3건 + --resume 기능 + skip/재개 로직    |
+  | src/training/trainer.py           | 수정 | 428   | resume_from 매개변수 + 체크포인트 로드 로직  |
+  | configs/benchmark_experiment.yaml | 수정 | 197   | num_workers 4→2 (Colab 호환)                 |
+
+
+3. 핵심 기능: --resume (재학습 방지)
+================================================================================
+
+3.1 문제
+---------
+기존 코드는 실행할 때마다 timestamp 기반 새 디렉토리를 생성하고
+모든 model×group 조합을 처음부터 학습한다.
+
+  experiment_dir = output_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
+
+따라서:
+  (1) baseline 6 runs를 완료한 뒤 CASDA 6 runs를 추가하면 baseline을 또 학습함
+  (2) 학습 도중 Colab 세션이 끊기면 처음부터 재시작해야 함
+
+3.2 해결: --resume 옵션
+------------------------
+  python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --resume outputs/benchmark_results/20260223_143000
+
+  동작:
+  (1) 기존 experiment_dir을 그대로 재사용 (새 timestamp 디렉토리 생성 안 함)
+  (2) 각 model+group 조합에 대해 best.pth + experiment_meta.json 존재 여부 확인
+  (3) 둘 다 존재 → SKIP: 기존 메트릭을 JSON에서 로드하여 reporter에 전달
+  (4) latest.pth만 존재 → RESUME: 중단 지점부터 학습 재개
+  (5) 둘 다 없음 → 새로 학습
+
+3.3 변경 위치: scripts/run_benchmark.py
+-----------------------------------------
+
+  CLI 옵션 (370~373번 줄):
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from existing experiment directory.')
+
+  experiment_dir 생성 로직 (401~410번 줄):
+    if args.resume:
+        experiment_dir = Path(args.resume)
+        if not experiment_dir.exists():
+            sys.exit(1)
+    else:
+        # 기존 timestamp 생성 로직
+
+  run_single_experiment() 함수 (91~150번 줄):
+    - resume 매개변수 추가 (기본값 False)
+    - 완료 확인: best_path.exists() and meta_path.exists() → JSON에서 메트릭 로드, return
+    - 중단 확인: latest_path.exists() and not best_path.exists() → resume_checkpoint 설정
+    - resume_checkpoint를 BenchmarkTrainer에 resume_from으로 전달
+
+  main() 호출부 (504번 줄):
+    resume=bool(args.resume) 전달
+
+3.4 변경 위치: src/training/trainer.py
+---------------------------------------
+
+  __init__() 매개변수 추가 (89번 줄):
+    resume_from: Optional[str] = None
+
+  _load_checkpoint() 메서드 신규 (190~210번 줄):
+    - model_state_dict, optimizer_state_dict 복원
+    - start_epoch = checkpoint['epoch'] + 1
+    - history 복원
+    - scheduler를 start_epoch까지 advance
+
+  train() 메서드 수정 (352번 줄):
+    - for epoch in range(self.start_epoch, self.epochs)
+    - best_metric = self.history.get('best_metric', 0.0) (0.0 대신 복원값 사용)
+
+
+4. 버그 수정 상세
+================================================================================
+
+4.1 typing import 위치 오류 (Critical)
+---------------------------------------
+  위치: scripts/run_benchmark.py
+  증상: `from typing import Dict`가 파일 489번 줄(하단)에 위치
+  영향: create_model() 함수 시그니처에서 `Dict` 타입 힌트 사용 →
+        모듈 로드 시 NameError 발생 (Dict가 아직 import되지 않은 상태)
+  수정: 36번 줄(상단 import 블록)으로 이동
+
+4.2 FID 무조건 실행 오류 (Medium)
+----------------------------------
+  위치: scripts/run_benchmark.py, 474~482번 줄
+  증상: FID 평가가 --groups 필터링과 무관하게 항상 실행됨
+  영향: baseline_raw/baseline_trad만 실행할 때도 InceptionV3 로드 시도,
+        CASDA 디렉토리가 존재하지 않으면 FileNotFoundError 발생
+  수정: CASDA 그룹 포함 여부를 확인하는 조건문 추가
+
+  변경 후 로직:
+    casda_groups = {'casda_full', 'casda_pruning'}
+    has_casda = any(g in casda_groups for g in group_keys)
+    if args.fid_only or (has_casda and config...fid.compute):
+        fid_results = run_fid_evaluation(...)
+    elif not has_casda:
+        logging.info("Skipping FID evaluation (no CASDA groups selected)")
+
+4.3 --epochs CLI 옵션 누락 (Low)
+----------------------------------
+  위치: scripts/run_benchmark.py
+  수정: `--epochs N` 옵션 추가, 지정 시 모든 모델의 epochs를 오버라이드
+  용도: 빠른 검증 (예: --epochs 10)
+
+
+5. 설정 변경
+================================================================================
+
+5.1 Colab num_workers 조정
+---------------------------
+  파일: configs/benchmark_experiment.yaml, 9번 줄
+  변경: num_workers: 4 → 2
+  근거: Colab T4 인스턴스는 vCPU 2개 제공, num_workers > 2는
+        프로세스 경합으로 인한 성능 저하 또는 메모리 오류 발생 가능
+
+
+6. 기타 발견 사항 (미수정)
+================================================================================
+
+6.1 CASDASyntheticDataset idx 미전달 (Low Priority)
+----------------------------------------------------
+  위치: src/training/dataset.py
+  증상: _get_detection_item()과 _get_segmentation_item() 내부에서
+        fallback 경로에 `idx` 변수를 사용하나, 메서드 매개변수로 전달되지 않음
+  영향: 실제 도달 가능성 낮음 (try-except의 except 블록 내부)
+  판단: CASDA 데이터 생성 후 해당 경로 테스트 시 수정 예정
+
+6.2 train.csv 포맷 호환성 확인
+-------------------------------
+  실제 데이터: ImageId, ClassId 칼럼이 분리되어 있음 (ImageId_ClassId 결합 아님)
+  코드 대응: dataset.py에서 두 가지 포맷을 조건문으로 분기 처리 → 호환 OK
+
+
+7. Colab 실행 계획
+================================================================================
+
+7.1 심볼릭 링크 설정
+--------------------
+  Severstal 데이터가 Google Drive에 위치하므로, 프로젝트 루트에 심볼릭 링크 생성.
+  YAML config의 상대 경로(train_images, train.csv)를 수정하지 않고 사용.
+
+    cd /content/severstal-steel-defect-detection
+    ln -sf /content/drive/MyDrive/data/Severstal/train_images train_images
+    ln -sf /content/drive/MyDrive/data/Severstal/train.csv train.csv
+
+7.2 테스트 실행 (YOLO-MFD, 10 epochs)
+---------------------------------------
+  단일 모델 × 단일 그룹으로 파이프라인 전체 동작 검증.
+
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --models yolo_mfd \
+        --groups baseline_raw \
+        --epochs 10
+
+  확인 항목:
+    - CSV 파싱 및 데이터 로드 정상 여부
+    - 모델 생성 및 GPU 메모리 적합성
+    - 학습 루프 (train → validate → checkpoint)
+    - 메트릭 계산 (mAP@0.5)
+    - 결과 저장 (JSON, 로그)
+
+7.3 전체 Baseline 실행 (3 models × 2 groups, 100 epochs)
+---------------------------------------------------------
+  테스트 통과 후 baseline_raw + baseline_trad 그룹에 대해 전체 실행.
+
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --groups baseline_raw baseline_trad
+
+  예상 소요: T4 GPU 기준 모델당 약 30~60분 × 6 runs = 3~6시간
+
+7.4 이후 CASDA 그룹 추가 시 (--resume 활용)
+--------------------------------------------
+  CASDA 합성 이미지 생성 완료 후, 기존 baseline 결과 디렉토리에 추가 실행.
+  baseline 6 runs는 자동 SKIP되고 CASDA 6 runs만 새로 학습.
+
+    python scripts/run_benchmark.py \
+        --config configs/benchmark_experiment.yaml \
+        --resume outputs/benchmark_results/<baseline_실행_timestamp>
+
+  이렇게 하면 12 runs 전체가 하나의 experiment_dir에 모이며,
+  가설 검증(H1~H5) 시 baseline과 CASDA 결과를 직접 비교 가능.
+
+
+8. 추가 변경: --data-dir / --csv CLI 옵션 및 경로 해석 수정
+================================================================================
+
+8.1 문제
+---------
+  Colab에서 실행 시, CWD(현재 작업 디렉토리)와 프로젝트 루트가 다를 수 있음.
+  기존 코드는 config YAML의 상대 경로(예: "train_images", "train.csv")를
+  CWD 기준으로 해석 → 경로 불일치 시 FileNotFoundError 발생.
+
+  또한 Google Drive의 실제 데이터 위치가 config에 하드코딩된 상대 경로와
+  다를 수 있어, 절대 경로를 CLI에서 직접 지정할 수 있어야 함.
+
+8.2 해결
+---------
+  (1) CLI 옵션 추가 (scripts/run_benchmark.py):
+      --data-dir : 이미지 디렉토리 절대 경로 (config의 image_dir 오버라이드)
+      --csv      : 어노테이션 CSV 절대 경로 (config의 annotation_csv 오버라이드)
+      --output-dir : 출력 디렉토리 절대 경로 (config의 output_dir 오버라이드)
+
+  (2) 경로 해석 로직 (src/training/dataset.py):
+      project_root = Path(__file__).resolve().parents[2]
+      - 절대 경로 → 그대로 사용
+      - 상대 경로 → project_root 기준으로 resolve
+
+  (3) run_fid_evaluation() 내부에서도 동일한 경로 오버라이드 적용
+
+8.3 변경 위치 상세
+-------------------
+
+  scripts/run_benchmark.py:
+    - CLI 옵션 추가: --data-dir, --csv, --output-dir (argparse)
+    - main() 내 config 오버라이드 로직:
+        if args.data_dir:
+            config['dataset']['image_dir'] = args.data_dir
+        if args.csv:
+            config['dataset']['annotation_csv'] = args.csv
+        if args.output_dir:
+            config['output']['base_dir'] = args.output_dir
+    - run_fid_evaluation()에서 image_dir 경로 해석 시 동일 로직 적용
+    - epilog 및 examples 텍스트 업데이트
+
+  src/training/dataset.py:
+    - 모듈 상단에 project_root 정의
+    - SteelDefectDataset.__init__(): annotation_csv, image_dir 경로 해석
+    - CASDASyntheticDataset.__init__(): casda_dir 경로 해석
+    - 디버그 로깅 제거 (임시 출력이었음)
+
+8.4 변경 파일 테이블 (갱신)
+----------------------------
+
+  | 파일                              | 상태 | 라인  | 변경 내용                                                   |
+  |-----------------------------------|------|-------|-------------------------------------------------------------|
+  | scripts/run_benchmark.py          | 수정 | ~555  | Dict→dict, --resume, --epochs, --data-dir, --csv,           |
+  |                                   |      |       | --output-dir, FID skip, 경로 해석, epilog 갱신              |
+  | src/training/trainer.py           | 수정 | ~428  | resume_from 매개변수 + 체크포인트 로드 로직                 |
+  | src/training/dataset.py           | 수정 | ~737  | project_root 경로 해석, 절대/상대 경로 분기,                |
+  |                                   |      |       | 디버그 로깅 제거                                            |
+  | configs/benchmark_experiment.yaml | 수정 | 197   | num_workers 4→2                                             |
+
+
+9. Colab 실행 명령어 (갱신)
+================================================================================
+
+  심볼릭 링크 방식 대신, CLI 인자로 절대 경로를 직접 지정하는 방식으로 변경.
+  (심볼릭 링크 방식도 여전히 사용 가능하나, CLI 인자 방식이 더 명시적.)
+
+9.1 테스트 실행 (YOLO-MFD, 10 epochs)
+--------------------------------------
+    python /content/severstal-steel-defect-detection/scripts/run_benchmark.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --output-dir /content/drive/MyDrive/outputs/benchmark_results \
+        --models yolo_mfd \
+        --groups baseline_raw \
+        --epochs 10
+
+9.2 전체 Baseline 실행 (3 models × 2 groups, 100 epochs)
+---------------------------------------------------------
+    python /content/severstal-steel-defect-detection/scripts/run_benchmark.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --output-dir /content/drive/MyDrive/outputs/benchmark_results \
+        --groups baseline_raw baseline_trad
+
+9.3 이후 CASDA 그룹 추가 시 (--resume 활용)
+--------------------------------------------
+    python /content/severstal-steel-defect-detection/scripts/run_benchmark.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --resume /content/drive/MyDrive/outputs/benchmark_results/<baseline_timestamp>
+
+  주의: --data-dir, --csv, --output-dir 경로는 사용자의 실제 Google Drive 구조에
+  맞게 조정 필요. 위 경로는 예시.
+
+
+10. 추가 변경: test_ids 저장 및 결과 파일 경량화
+================================================================================
+
+10.1 배경
+---------
+  벤치마크 실험의 4개 데이터셋 그룹(baseline_raw, baseline_trad, casda_full,
+  casda_pruning)은 동일한 seed=42 기반 stratified split을 사용하므로
+  test set이 동일하다. 이를 명시적으로 기록하여 사후 검증 가능하게 한다.
+  또한 학습 완료 후 불필요한 대용량 파일을 정리하여 저장 공간을 절약한다.
+
+10.2 변경 사항
+---------------
+
+  (A) dataset_split.json 저장 (run_benchmark.py)
+      - create_data_loaders()가 split_info dict를 추가 반환
+        (train_ids, val_ids, test_ids, split_config, 각 set 크기)
+      - experiment_dir에 dataset_split.json으로 1회만 저장
+        (이미 존재하면 재저장하지 않음)
+      - 모든 run이 동일한 split을 사용함을 JSON으로 증명 가능
+
+  (B) experiment_meta.json 경량화 (run_benchmark.py)
+      - 기존: training_history 전체를 중복 저장 (에포크별 loss/metric 배열)
+      - 변경: best_epoch, best_metric, total_epochs_trained만 요약 저장
+      - training_history는 별도 {name}_history.json에만 존재 (중복 제거)
+
+  (C) best.pth 경량화 (trainer.py)
+      - 학습 완료 후 best.pth에서 optimizer_state_dict, history 제거
+      - 추론에 필요한 model_state_dict, epoch, metrics만 유지
+      - 예상 크기 절감: 모델에 따라 40~60% 감소
+
+  (D) latest.pth 자동 삭제 (trainer.py)
+      - latest.pth는 학습 중 resume 전용 체크포인트
+      - 학습 정상 완료 후 자동 삭제 (os.remove)
+      - 중단된 경우에만 latest.pth가 남아 --resume으로 활용 가능
+
+10.3 변경 위치
+---------------
+
+  src/training/dataset.py:
+    - create_data_loaders() 반환형: Tuple[..., DataLoader] → Tuple[..., DataLoader, dict]
+    - 함수 끝에서 split_info dict 생성 및 반환
+
+  scripts/run_benchmark.py:
+    - create_data_loaders() 호출부: split_info 수신
+    - dataset_split.json 저장 로직 추가
+    - experiment_meta.json에서 training_history 제거, 요약 필드로 대체
+
+  src/training/trainer.py:
+    - train() 종료 시: best.pth slim down (optimizer 제거)
+    - train() 종료 시: latest.pth 삭제
+
+10.4 실험 출력 디렉토리 구조 (변경 후)
+---------------------------------------
+
+  experiment_dir/
+    dataset_split.json                    ← NEW: test_ids 등 split 정보 (1회)
+    yolo_mfd_baseline_raw/
+      experiment_meta.json                ← 경량화 (history 제거)
+      yolo_mfd_baseline_raw_history.json  ← 학습 이력 (기존과 동일)
+      checkpoints/
+        yolo_mfd_baseline_raw_best.pth    ← 경량화 (optimizer 제거)
+                                             latest.pth는 학습 완료 시 삭제됨
+      tensorboard/                        ← TensorBoard 로그
+    yolo_mfd_baseline_trad/
+      ...
+    eb_yolov8_baseline_raw/
+      ...
+
+
+11. 추가 변경: 300 epoch 골든 스탠다드 + AMP + Early Stopping 기록
+================================================================================
+
+11.1 배경
+---------
+  데이터 증강(CASDA)의 효과를 객관적으로 입증하려면 모델의 성능을 충분히
+  끌어낸 상태에서 비교해야 한다. 300 epoch를 학습 상한선으로 설정하고,
+  Early Stopping 결과를 함께 제시하는 것이 골든 스탠다드 설정이다.
+  AMP(Automatic Mixed Precision)를 적용하여 T4 GPU Tensor Core를 활용,
+  학습 시간을 1.5~2배 단축한다.
+
+11.2 YAML config 변경 (benchmark_experiment.yaml)
+--------------------------------------------------
+
+  | 모델          | 항목                     | 변경 전 | 변경 후 |
+  |---------------|--------------------------|---------|---------|
+  | YOLO-MFD      | epochs                   | 100     | 300     |
+  |               | warmup_epochs            | 5       | 10      |
+  |               | early_stopping_patience  | 15      | 30      |
+  |               | use_amp                  | (없음)  | true    |
+  | EB-YOLOv8     | epochs                   | 100     | 300     |
+  |               | warmup_epochs            | 5       | 10      |
+  |               | early_stopping_patience  | 15      | 30      |
+  |               | use_amp                  | (없음)  | true    |
+  | DeepLabV3+    | epochs                   | 100     | 300     |
+  |               | warmup_epochs            | 3       | 5       |
+  |               | early_stopping_patience  | 20      | 40      |
+  |               | use_amp                  | (없음)  | true    |
+
+  patience 근거: epoch 상한의 ~10%로 설정하여, 일시적 plateau에서
+  조기 종료를 방지하면서도 수렴 후 불필요한 학습을 막음.
+
+11.3 AMP 적용 (trainer.py)
+---------------------------
+  torch.cuda.amp.GradScaler + autocast 적용.
+
+  변경 위치:
+    __init__():
+      - self.use_amp = config에서 읽음 (기본 True, CPU면 False)
+      - self.scaler = GradScaler(enabled=self.use_amp)
+
+    train_one_epoch():
+      - forward pass: with autocast(enabled=self.use_amp)
+      - backward: scaler.scale(loss).backward()
+      - gradient clip: scaler.unscale_() 후 clip_grad_norm_
+      - optimizer step: scaler.step() + scaler.update()
+
+    validate():
+      - inference: with autocast(enabled=self.use_amp)
+
+    _save_checkpoint():
+      - scaler_state_dict 저장 (resume 시 복원용)
+
+    _load_checkpoint():
+      - scaler_state_dict 복원
+
+11.4 Early Stopping 기록 (trainer.py + run_benchmark.py)
+---------------------------------------------------------
+  trainer.py — train() 종료 시 history에 기록:
+    - early_stopped: bool (early stopping 발생 여부)
+    - stopped_epoch: 실제 학습 종료 에포크
+    - max_epochs: 설정된 상한 (300)
+    - total_time_seconds: 총 학습 시간 (초)
+    - use_amp: AMP 사용 여부
+
+  run_benchmark.py — experiment_meta.json에 추가 필드:
+    - early_stopped, stopped_epoch, max_epochs
+    - total_time_seconds, use_amp
+
+  논문 제시 형태 예시:
+    "YOLO-MFD: 300 epoch 상한, patience=30, 실제 187 epoch에서 수렴
+     (early stopping), best mAP@0.5 = 0.XXX at epoch 152"
+
+11.5 변경 파일 테이블 (갱신)
+----------------------------
+
+  | 파일                              | 상태 | 변경 내용                                    |
+  |-----------------------------------|------|----------------------------------------------|
+  | configs/benchmark_experiment.yaml | 수정 | epochs 300, patience 30/40, warmup 조정,     |
+  |                                   |      | use_amp: true 추가                           |
+  | src/training/trainer.py           | 수정 | AMP(GradScaler+autocast), early stop 기록,   |
+  |                                   |      | scaler state 저장/복원                       |
+  | scripts/run_benchmark.py          | 수정 | meta.json에 early stop + AMP 정보 추가       |
+
+
+12. CASDA 데이터 패키징 스크립트 (package_casda_data.py)
+================================================================================
+
+12.1 목적
+---------
+  ControlNet v4 출력물을 CASDASyntheticDataset이 기대하는 벤치마크 형식으로 변환.
+
+  입력:
+    - augmented_images_v4/generated/*.png (생성 이미지 ~967장)
+    - augmented_images_v4/generation_summary.json (메타데이터 + 품질 점수)
+    - controlnet_dataset_v4/hints/*_hint.png (힌트 이미지, Red채널 = 결함 마스크)
+
+  출력:
+    - casda_full/images/, casda_full/masks/, casda_full/metadata.json
+    - casda_pruning/images/, casda_pruning/masks/, casda_pruning/metadata.json
+    - packaging_report.json (패키징 통계)
+
+12.2 5가지 갭 해결 방법
+-----------------------
+  | 갭                          | 해결 방법                                       |
+  |-----------------------------|------------------------------------------------|
+  | metadata.json 부재          | generation_summary.json 파싱 → 생성             |
+  | 마스크 부재                  | 힌트 Red채널 추출, threshold(>127) → 이진 마스크 |
+  | suitability_score 부재       | quality_score를 그대로 사용                     |
+  | 디렉토리 구조 불일치         | generated/ → images/, 마스크 → masks/           |
+  | class_id 인코딩 (1-indexed) | 파일명에서 class{N} 파싱 → N-1 (0-indexed)      |
+
+12.3 핵심 함수
+--------------
+  parse_class_id_from_filename(filename)
+    - 정규식 _class(\d+)_ 로 추출, 1-indexed → 0-indexed 변환
+
+  extract_mask_from_hint(hint_path, threshold=127)
+    - OpenCV BGR 로드 → channel[2] (Red) 추출 → cv2.threshold → 이진 마스크
+
+  build_quality_map(summary)
+    - quality.sample_scores[] → {filename: quality_score} 매핑
+
+  filename_to_sample_name(filename)
+    - "xxx_gen0.png" → "xxx" (sample_name으로 역변환)
+
+  package_data(...)
+    - 메인 로직: 전체 처리 + casda_full 생성 + casda_pruning 필터링
+
+12.4 pruning 로직
+-----------------
+  1. suitability_score >= threshold (기본 0.7) 필터
+  2. score 내림차순 정렬
+  3. top_k (기본 2000) 제한
+  → ~967개 중 threshold 통과분만 casda_pruning에 포함
+
+12.5 CLI 인수
+-------------
+  --generated-dir     생성 이미지 디렉토리
+  --summary-json      generation_summary.json 경로
+  --hint-dir          힌트 이미지 디렉토리
+  --output-dir        출력 디렉토리 (casda_full/, casda_pruning/ 생성)
+  --suitability-threshold  pruning 임계값 (기본: 0.7)
+  --pruning-top-k     pruning 최대 개수 (기본: 2000)
+  --mask-threshold    Red 채널 이진화 임계값 (기본: 127)
+
+12.6 Colab 실행 예시
+--------------------
+  python scripts/package_casda_data.py \
+      --generated-dir /content/drive/MyDrive/data/Severstal/augmented_images_v4/generated \
+      --summary-json /content/drive/MyDrive/data/Severstal/augmented_images_v4/generation_summary.json \
+      --hint-dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/hints \
+      --output-dir /content/drive/MyDrive/data/Severstal/data/augmented
+
+12.7 YAML config 주석 갱신
+--------------------------
+  - "5,000 synthetic images" → "~967 synthetic images (ControlNet v4)"
+  - "top 2,000 by suitability" → "top-K by suitability (threshold >= 0.7)"
+  - casda_full description: "all ~967 CASDA synthetic images"
+  - casda_pruning description: "threshold >= 0.7"
+
+12.8 변경 파일 테이블
+---------------------
+  | 파일                               | 상태 | 변경 내용                               |
+  |------------------------------------|------|-----------------------------------------|
+  | scripts/package_casda_data.py      | 신규 | ControlNet v4 출력 → 벤치마크 형식 변환  |
+  | configs/benchmark_experiment.yaml  | 수정 | 이미지 수량 주석 갱신 (~967)            |
+
+
+13. torch.load weights_only 호환성 수정
+================================================================================
+
+13.1 문제
+---------
+  Colab 환경 PyTorch 2.6에서 벤치마크 실행 시 에러 발생:
+    _pickle.UnpicklingError: Weights only load failed.
+    Unsupported global: GLOBAL numpy._core.multiarray.scalar
+
+  원인: PyTorch 2.6부터 torch.load()의 기본값이 weights_only=True로 변경됨.
+  체크포인트에 저장된 numpy scalar (metrics 값 등)가 safe allowlist에 없어 거부됨.
+
+  에러 발생 위치:
+    src/training/trainer.py:447 — train() 종료 후 best 모델 로드 시점
+
+13.2 수정 내용
+--------------
+  모든 torch.load() 호출에 weights_only=False 명시적 추가.
+  자체 생성 체크포인트만 로드하므로 보안 위험 없음.
+
+  수정 위치 (총 4곳):
+
+  | 파일                               | 라인 | 함수/컨텍스트                      |
+  |------------------------------------|------|------------------------------------|
+  | src/training/trainer.py            | 201  | _load_checkpoint() — 학습 재개     |
+  | src/training/trainer.py            | 447  | train() — best 모델 테스트 평가    |
+  | src/training/trainer.py            | 469  | train() — best 체크포인트 경량화   |
+  | scripts/generate_augmented_data.py | 91   | load_model() — ControlNet 모델 로드|
+
+  변경 전: torch.load(path, map_location=device)
+  변경 후: torch.load(path, map_location=device, weights_only=False)
+
+13.3 변경 파일 테이블
+---------------------
+  | 파일                               | 상태 | 변경 내용                                |
+  |------------------------------------|------|------------------------------------------|
+  | src/training/trainer.py            | 수정 | torch.load에 weights_only=False 추가 (3곳)|
+  | scripts/generate_augmented_data.py | 수정 | torch.load에 weights_only=False 추가 (1곳)|
+
+
+14. Resume 체크포인트 복원 버그 수정
+================================================================================
+
+14.1 문제 (3건)
+---------------
+  (A) EarlyStopping 상태 미복원
+      _load_checkpoint() 에서 history는 복원하지만, EarlyStopping 객체의
+      best_score가 초기값(None)으로 남아 있음.
+      → resume 후 patience 카운터가 0부터 재시작됨.
+
+  (B) Scheduler 상태 미복원 + step 루프 버그
+      기존 코드:
+        for _ in range(self.start_epoch):
+            if self.start_epoch > self.warmup_epochs:
+                self.scheduler.step()
+      → 조건이 루프 변수(_)가 아닌 self.start_epoch 기준이므로,
+        warmup 이전 epoch에 대해서도 step이 호출됨.
+      → scheduler_state_dict를 저장/복원하는 것이 정확한 방법.
+
+  (C) --resume 파라미터 혼란
+      CLI 정의: --resume type=str (경로를 받음)
+      호출부:   resume=bool(args.resume) → bool로 변환
+      → 경로를 받는 파라미터를 boolean으로 변환하는 혼란스러운 설계.
+      → 실제로 경로는 experiment_dir로만 사용, resume는 bool만 필요.
+
+14.2 수정 내용
+--------------
+  (A) EarlyStopping best_score 복원 (trainer.py _load_checkpoint)
+      history에서 best_metric을 읽어 early_stopping.best_score에 설정.
+      counter는 0에서 재시작 (resume 직후 새로 카운팅하는 것이 합리적).
+
+      추가 코드:
+        best_metric = self.history.get('best_metric', 0.0)
+        if best_metric > 0:
+            self.early_stopping.best_score = best_metric
+
+  (B) Scheduler state 저장/복원 (trainer.py)
+      _save_checkpoint():
+        state dict에 'scheduler_state_dict' 추가.
+
+      _load_checkpoint():
+        'scheduler_state_dict'가 있으면 load_state_dict()로 복원.
+        없으면 (구버전 체크포인트) fallback으로 epoch별 step 호출.
+        fallback에서 버그 수정: 조건을 루프 변수(ep) 기준으로 변경.
+
+      기존 (버그):
+        for _ in range(self.start_epoch):
+            if self.start_epoch > self.warmup_epochs:
+                self.scheduler.step()
+
+      수정 후 (fallback):
+        for ep in range(self.start_epoch):
+            if ep >= self.warmup_epochs:
+                self.scheduler.step()
+
+  (C) --resume 파라미터 리팩터링 (run_benchmark.py)
+      변경 전:
+        --resume type=str → 경로를 받음
+        experiment_dir = Path(args.resume)
+        resume=bool(args.resume)
+
+      변경 후:
+        --resume action='store_true' → 플래그만
+        --output-dir → 기존 실험 디렉토리 경로 지정
+        resume 모드: output_dir을 직접 experiment_dir로 사용 (timestamp 미생성)
+        일반 모드: output_dir/timestamp 하위 디렉토리 생성
+
+      사용법 변경:
+        전: --resume /path/to/experiment
+        후: --resume --output-dir /path/to/experiment
+
+14.3 변경 파일 테이블
+---------------------
+  | 파일                      | 상태 | 변경 내용                                    |
+  |---------------------------|------|----------------------------------------------|
+  | src/training/trainer.py   | 수정 | _save: scheduler_state_dict 저장             |
+  |                           |      | _load: scheduler/EarlyStopping 복원,          |
+  |                           |      |        step 루프 fallback 버그 수정           |
+  | scripts/run_benchmark.py  | 수정 | --resume: type=str → store_true              |
+  |                           |      | experiment_dir 결정 로직 리팩터링             |
+  |                           |      | docstring 사용 예시 갱신                      |
+
+
+15. --casda-dir CLI 인수 추가 (run_benchmark.py)
+================================================================================
+
+15.1 문제
+---------
+  YAML config의 casda.full_dir/pruning_dir이 상대경로("data/augmented/casda_full")로
+  설정되어 있어, Colab에서 package_casda_data.py로 생성한 casda_full/의 실제 절대경로와
+  불일치. --data-dir, --csv처럼 CLI에서 오버라이드할 수단이 없었음.
+
+15.2 수정 내용
+--------------
+  (A) argparse 인수 추가
+      --casda-dir: casda_full/ 과 casda_pruning/의 부모 디렉토리 경로.
+      지정 시 config의 dataset.casda.full_dir, pruning_dir을 자동 오버라이드.
+
+  (B) main()에서 config 오버라이드 로직
+      if args.casda_dir:
+          config['dataset']['casda']['full_dir'] = os.path.join(casda_base, 'casda_full')
+          config['dataset']['casda']['pruning_dir'] = os.path.join(casda_base, 'casda_pruning')
+
+  (C) docstring 사용 예시 추가
+      --casda-dir 사용 예시 1건 추가.
+
+15.3 Colab 실행 명령어
+----------------------
+  # CASDA-Full 테스트 (10 epoch)
+  python /content/severstal-steel-defect-detection/scripts/run_benchmark.py \
+      --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+      --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+      --csv /content/drive/MyDrive/data/Severstal/train.csv \
+      --casda-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \
+      --output-dir /content/drive/MyDrive/outputs/benchmark_results \
+      --models yolo_mfd \
+      --groups casda_full \
+      --epochs 10
+
+15.4 변경 파일 테이블
+---------------------
+  | 파일                      | 상태 | 변경 내용                               |
+  |---------------------------|------|-----------------------------------------|
+  | scripts/run_benchmark.py  | 수정 | --casda-dir 인수 추가, config 오버라이드 |
+  |                           |      | docstring 예시 갱신                      |
+
+
+16. 문법 검증
+================================================================================
+  ast.parse(scripts/run_benchmark.py)               → OK
+  ast.parse(src/training/trainer.py)                 → OK
+  ast.parse(src/training/dataset.py)                 → OK
+  ast.parse(scripts/package_casda_data.py)           → OK
+  ast.parse(scripts/generate_augmented_data.py)      → OK
+  yaml.safe_load(configs/benchmark_experiment.yaml)  → OK
+
+
+17. 품질 점수 문제 수정 (package_casda_data.py)
+================================================================================
+
+17.1 문제 진단
+--------------
+  Colab에서 package_casda_data.py 실행 결과, casda_pruning 디렉터리에 이미지 0개
+  문제:
+    1) generation_summary.json의 quality 섹션이 비어있음 (생성 시 품질 평가 미실행)
+    2) 2,901개 생성 이미지 vs 967개 summary 항목 (num_images_per_prompt=3)
+    3) build_quality_map()이 빈 dict 반환 → quality_map.get(filename, 0.0) = 0.0
+    4) 0.7 임계값으로 필터링 → 전부 탈락
+
+  로컬 품질 점수 분석 (outputs/test_results_v4/phase1_basic/generation_summary.json):
+    - 967개 이미지 (gen0만), 점수 범위 [0.5417, 0.6938], 평균 0.6254
+    - 0.7 이상: 0개 (0%) ← 임계값 자체가 도달 불가능
+    - P50: 0.6264, P75: 0.6425, P90: 0.6562
+
+17.2 수정 내용
+--------------
+  파일: scripts/package_casda_data.py
+
+  (1) --quality-json 인수 추가 (선택)
+      - 별도의 품질 점수 JSON 파일 지정 가능
+      - 형식: generation_summary.json (quality.sample_scores[]) 또는 직접 list
+      - Colab의 summary에 품질 섹션이 없을 때, 로컬에서 평가한 파일 활용
+
+  (2) 기본 점수 0.0 → 1.0 변경
+      - 품질 점수가 없는 이미지에 대해 기본값 1.0 부여 (포함, 배제 아님)
+      - --default-score 인수로 사용자 제어 가능
+      - 이전: quality_map.get(filename, 0.0) → 무조건 탈락
+      - 이후: get_quality_score(quality_map, filename, default=1.0) → 포함
+
+  (3) 다중 생성 filename 매칭 개선
+      - gen0만 품질 점수가 있을 때 gen1/gen2도 동일 점수 부여
+      - 매칭 순서: ① 정확한 filename → ② sample_name 폴백 (_genN 제거)
+      - build_quality_map()에 __sample_name_fallback__ 키로 sample_name→score 맵 내장
+      - get_quality_score() 헬퍼 함수 신규 추가
+
+  (4) 임계값 0.7 → 0.63 변경
+      - v4 품질 점수 분포 분석 결과 최대값 0.6938, 0.7 도달 불가
+      - 0.63 ≈ P50, 약 484개 sample × 3 gen = ~1,452개 pruning 대상
+      - package_casda_data.py 기본값, benchmark_experiment.yaml 모두 갱신
+
+17.3 변경 파일 테이블
+---------------------
+  | 파일                              | 상태 | 변경 내용                                       |
+  |-----------------------------------|------|-------------------------------------------------|
+  | scripts/package_casda_data.py     | 수정 | --quality-json, --default-score 인수 추가       |
+  |                                   |      | get_quality_score() 함수 추가 (폴백 매칭)       |
+  |                                   |      | build_quality_map() 다중 소스 + 폴백 지원       |
+  |                                   |      | 기본 점수 0.0→1.0, 임계값 0.7→0.63              |
+  | configs/benchmark_experiment.yaml | 수정 | suitability_threshold: 0.7→0.63                 |
+  |                                   |      | casda_full 설명 ~967→~2,901, pruning 설명 갱신  |
+  | src/training/dataset.py           | 수정 | 기본 suitability_threshold 폴백 0.7→0.63 (L700) |
+
+17.4 수정 이력 (코드 diff)
+---------------------------
+
+  [scripts/package_casda_data.py]
+
+  ■ build_quality_map() 함수 리팩터링 (L87-149)
+    변경 전:
+      def build_quality_map(summary: dict) -> dict:
+          quality_map = {}
+          quality_section = summary.get("quality", {})
+          sample_scores = quality_section.get("sample_scores", [])
+          for entry in sample_scores:
+              fname = entry.get("filename", "")
+              score = entry.get("quality_score", 0.0)
+              quality_map[fname] = score
+          return quality_map
+
+    변경 후:
+      def build_quality_map(summary: dict, quality_json_path=None) -> dict:
+          sample_scores = []
+          # 소스 1: 별도 --quality-json 파일 (우선)
+          if quality_json_path and quality_json_path.exists():
+              with open(quality_json_path) as f:
+                  quality_data = json.load(f)
+              if isinstance(quality_data, list):
+                  sample_scores = quality_data
+              elif isinstance(quality_data, dict):
+                  quality_section = quality_data.get("quality", quality_data)
+                  sample_scores = quality_section.get("sample_scores", [])
+          # 소스 2: 메인 summary JSON의 quality 섹션
+          if not sample_scores:
+              quality_section = summary.get("quality", {})
+              sample_scores = quality_section.get("sample_scores", [])
+          if not sample_scores:
+              print("WARNING: 품질 점수 소스 없음. 기본값 1.0 사용")
+              return {}
+          # 직접 매칭 맵 구축
+          quality_map = {e["filename"]: e["quality_score"] for e in sample_scores}
+          # sample_name 폴백 맵 구축 (gen0 점수를 gen1/gen2에 적용)
+          sample_name_scores = {}
+          for fname, score in quality_map.items():
+              sname = filename_to_sample_name(fname)
+              if sname not in sample_name_scores:
+                  sample_name_scores[sname] = score
+          quality_map["__sample_name_fallback__"] = sample_name_scores
+          return quality_map
+
+    변경 사유: 품질 점수 소스가 비어있을 때 빈 dict 반환하여 기본값(1.0) 사용.
+              별도 파일 지원. 다중 생성 폴백.
+
+  ■ get_quality_score() 함수 신규 추가 (L152-177)
+    def get_quality_score(quality_map, filename, default=1.0) -> float:
+        # 1순위: 정확한 filename 매칭
+        if filename in quality_map:
+            return quality_map[filename]
+        # 2순위: sample_name 폴백 (_genN 제거 후 매칭)
+        sample_name_scores = quality_map.get("__sample_name_fallback__", {})
+        if sample_name_scores:
+            sname = filename_to_sample_name(filename)
+            if sname in sample_name_scores:
+                return sample_name_scores[sname]
+        # 3순위: 기본값 (1.0)
+        return default
+
+    추가 사유: 기존 quality_map.get(filename, 0.0)을 대체.
+              3단계 폴백으로 다중 생성 + 품질 점수 부재 상황 처리.
+
+  ■ 점수 조회 부분 변경 (package_data 함수 내, L277)
+    변경 전: suitability_score = quality_map.get(filename, 0.0)
+    변경 후: suitability_score = get_quality_score(quality_map, filename, default=default_score)
+
+  ■ package_data() 시그니처 변경 (L207-217)
+    추가된 매개변수:
+      quality_json: Optional[Path] = None     # 별도 품질 점수 파일
+      default_score: float = 1.0              # 품질 점수 없을 때 기본값
+
+  ■ CLI 인수 추가 (L482-497)
+    --quality-json: 별도 품질 점수 JSON 경로 (선택)
+    --default-score: 점수 없는 이미지의 기본값 (기본: 1.0)
+
+  ■ 임계값 기본값 변경
+    --suitability-threshold: 0.7 → 0.63
+    package_data() 시그니처: suitability_threshold=0.7 → 0.63
+
+  [configs/benchmark_experiment.yaml]
+
+  ■ L35-38: CASDA 설정 변경
+    변경 전:
+      full_dir: "data/augmented/casda_full"        # ~967 synthetic images (ControlNet v4)
+      pruning_dir: "data/augmented/casda_pruning"  # top-K by suitability (threshold >= 0.7)
+      suitability_threshold: 0.7
+    변경 후:
+      full_dir: "data/augmented/casda_full"        # ~2,901 synthetic images (ControlNet v4, 3 gens/sample)
+      pruning_dir: "data/augmented/casda_pruning"  # top-K by suitability (threshold >= 0.63, ~P50)
+      suitability_threshold: 0.63
+
+  ■ L66-67: casda_full 설명 갱신
+    변경 전: description: "Original + all ~967 CASDA synthetic images"
+    변경 후: description: "Original + all ~2,901 CASDA synthetic images (3 gens × 967 samples)"
+
+  ■ L73-74: casda_pruning 설명 갱신
+    변경 전: description: "Original + top CASDA images by suitability score (threshold >= 0.7)"
+    변경 후: description: "Original + top CASDA images by suitability score (threshold >= 0.63, ~P50)"
+
+  [src/training/dataset.py]
+
+  ■ L700: 기본 임계값 폴백 변경
+    변경 전: suitability_threshold=casda_config.get('suitability_threshold', 0.7),
+    변경 후: suitability_threshold=casda_config.get('suitability_threshold', 0.63),
+
+17.5 Colab 재실행 명령어
+------------------------
+  # 방법 A: 품질 점수 없이 (기본값 1.0, pruning = 전체 2,901개)
+  python /content/severstal-steel-defect-detection/scripts/package_casda_data.py \
+      --generated-dir /content/drive/MyDrive/data/Severstal/augmented_images_v4/generated \
+      --summary-json /content/drive/MyDrive/data/Severstal/augmented_images_v4/generation_summary.json \
+      --hint-dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/hints \
+      --output-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \
+      --suitability-threshold 0.63 \
+      --pruning-top-k 2000
+
+  # 방법 B: 로컬 품질 점수 파일 업로드 후 사용 (권장)
+  # 먼저 outputs/test_results_v4/phase1_basic/generation_summary.json을
+  # Colab Drive에 업로드 후:
+  python /content/severstal-steel-defect-detection/scripts/package_casda_data.py \
+      --generated-dir /content/drive/MyDrive/data/Severstal/augmented_images_v4/generated \
+      --summary-json /content/drive/MyDrive/data/Severstal/augmented_images_v4/generation_summary.json \
+      --quality-json /content/drive/MyDrive/data/Severstal/quality_scores.json \
+      --hint-dir /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/hints \
+      --output-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \
+      --suitability-threshold 0.63 \
+      --pruning-top-k 2000
+
+17.6 예상 결과
+--------------
+  방법 A (품질 점수 없음):
+    - casda_full: 2,901개 (기본 점수 1.0)
+    - casda_pruning: 2,000개 (전부 1.0 ≥ 0.63, top_k=2000으로 제한)
+
+  방법 B (로컬 품질 점수 사용):
+    - casda_full: 2,901개 (gen0: 실제 점수, gen1/gen2: gen0 점수 폴백)
+    - casda_pruning: ~1,452개 (0.63 이상 ~484 samples × 3 gens, top_k 미적용)
+
+17.7 단위 테스트 결과
+---------------------
+  filename_to_sample_name: OK
+  get_quality_score: OK (직접 매칭, sample_name 폴백, 기본값 모두 검증)
+  실제 데이터 테스트: OK (967 direct, gen1 fallback 작동)
+
+
+18. 문법 검증 (섹션 17 이후)
+================================================================================
+  ast.parse(scripts/package_casda_data.py)           → OK
+  ast.parse(src/training/dataset.py)                 → OK
+  yaml.safe_load(configs/benchmark_experiment.yaml)  → OK
+
+
+19. CASDA 데이터셋 idx 미정의 버그 수정 (dataset.py)
+================================================================================
+
+19.1 문제
+---------
+  Colab에서 yolo_mfd + casda_full 학습 시 DataLoader 워커에서 NameError 발생:
+    NameError: name 'idx' is not defined. Did you mean: 'id'?
+
+  에러 위치: src/training/dataset.py L438 (_get_detection_item)
+  동일 버그: src/training/dataset.py L476 (_get_segmentation_item)
+
+  원인:
+    __getitem__(self, idx) 에서 idx를 받지만,
+    _get_detection_item(self, image, sample) 호출 시 idx를 전달하지 않음.
+    메서드 내부에서 f'synthetic_{idx}' 로 idx 참조 → NameError.
+
+19.2 수정 내용
+--------------
+  파일: src/training/dataset.py
+
+  (1) __getitem__ 내 호출부 변경 (L380-383)
+      변경 전:
+        if self.mode == "detection":
+            return self._get_detection_item(image, sample)
+        else:
+            return self._get_segmentation_item(image, sample)
+      변경 후:
+        if self.mode == "detection":
+            return self._get_detection_item(image, sample, idx)
+        else:
+            return self._get_segmentation_item(image, sample, idx)
+
+  (2) _get_detection_item 시그니처 변경 (L385)
+      변경 전: def _get_detection_item(self, image: np.ndarray, sample: Dict) -> Dict:
+      변경 후: def _get_detection_item(self, image: np.ndarray, sample: Dict, idx: int) -> Dict:
+
+  (3) _get_segmentation_item 시그니처 변경 (L441)
+      변경 전: def _get_segmentation_item(self, image: np.ndarray, sample: Dict) -> Dict:
+      변경 후: def _get_segmentation_item(self, image: np.ndarray, sample: Dict, idx: int) -> Dict:
+
+19.3 변경 파일 테이블
+---------------------
+  | 파일                    | 상태 | 변경 내용                                         |
+  |-------------------------|------|----------------------------------------------------|
+  | src/training/dataset.py | 수정 | __getitem__에서 idx를 하위 메서드에 전달 (L380-383) |
+  |                         |      | _get_detection_item 시그니처에 idx 추가 (L385)     |
+  |                         |      | _get_segmentation_item 시그니처에 idx 추가 (L441)  |
+
+19.4 문법 검증
+--------------
+  ast.parse(src/training/dataset.py)  → OK
+
+
+20. --epochs CLI 오버라이드 미작동 버그 수정 (trainer.py)
+================================================================================
+
+20.1 문제
+---------
+  run_benchmark.py에서 --epochs 10 을 지정했으나 실제 학습은 300 에포크로 실행됨.
+  로그: "Epochs: 300, LR: 0.001, Device: cuda"
+
+20.2 원인 분석
+--------------
+  run_benchmark.py L184:
+    training_config = {**model_config['training'], 'num_classes': num_classes}
+    → config를 flatten하여 전달: {'epochs': 10, 'lr': 0.001, ...}
+
+  trainer.py L108:
+    train_cfg = config.get('training', {})
+    → config에 'training' 키가 없음 → 빈 dict {} 반환
+    → {}.get('epochs', 300) = 300  ← 기본값 사용
+
+  즉 run_benchmark.py는 training 설정을 풀어서(flatten) 전달하는데,
+  trainer.py는 중첩(nested) 구조를 기대하여 항상 기본값 300을 사용.
+
+20.3 수정 내용
+--------------
+  파일: src/training/trainer.py
+
+  ■ train_cfg 추출 로직 변경 (L108)
+    변경 전:
+      train_cfg = config.get('training', {})
+
+    변경 후:
+      # config는 run_benchmark.py에서 model_config['training']을 flatten하여 전달
+      # 'training' 키가 중첩된 경우와 직접 전달된 경우 모두 지원
+      train_cfg = config.get('training', config) if isinstance(config.get('training'), dict) else config
+
+    동작 방식:
+      - config = {'epochs': 10, ...} (flatten)  → train_cfg = config 자체
+      - config = {'training': {'epochs': 50}} (nested) → train_cfg = config['training']
+      - config = {} (빈 dict)                   → train_cfg = {} → 기본값 300
+
+20.4 변경 파일 테이블
+---------------------
+  | 파일                      | 상태 | 변경 내용                                     |
+  |---------------------------|------|------------------------------------------------|
+  | src/training/trainer.py   | 수정 | train_cfg 추출 로직: flatten/nested 모두 지원  |
+
+20.5 단위 테스트 결과
+---------------------
+  Test 1 (flatten config):  epochs=10  → OK
+  Test 2 (nested config):   epochs=50  → OK
+  Test 3 (empty config):    epochs=300 → OK (기본값)
+
+20.6 문법 검증
+--------------
+  ast.parse(src/training/trainer.py)  → OK

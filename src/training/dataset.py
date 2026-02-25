@@ -5,7 +5,7 @@ Provides PyTorch Dataset classes for both detection and segmentation tasks,
 supporting 4 dataset groups:
   - Baseline (Raw): Original Severstal only
   - Baseline (Trad): Original + traditional augmentations
-  - CASDA-Full: Original + all 5,000 CASDA synthetic images
+  - CASDA-Full: Original + all ~2,901 synthetic images (ControlNet v4)
   - CASDA-Pruning: Original + top 2,000 CASDA images by suitability score
 """
 
@@ -348,17 +348,30 @@ class CASDASyntheticDataset(Dataset):
                     'suitability_score': 1.0,
                 })
 
-        # Filter by suitability
-        if suitability_threshold is not None:
+        # Filter by suitability (with top-K fallback)
+        if suitability_threshold is not None and max_samples is not None:
+            filtered = [
+                s for s in all_samples
+                if s.get('suitability_score', 0.0) >= suitability_threshold
+            ]
+            if len(filtered) >= max_samples:
+                # threshold 조건 충족 → 상위 max_samples 선택
+                filtered.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+                all_samples = filtered[:max_samples]
+            else:
+                # 점수 미산정 또는 threshold 미달 → score 기준 상위 max_samples (fallback)
+                all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+                all_samples = all_samples[:max_samples]
+        elif suitability_threshold is not None:
             all_samples = [
                 s for s in all_samples
-                if s.get('suitability_score', 1.0) >= suitability_threshold
+                if s.get('suitability_score', 0.0) >= suitability_threshold
             ]
-
-        # Sort by suitability (descending) and limit
-        all_samples.sort(key=lambda x: x.get('suitability_score', 1.0), reverse=True)
-        if max_samples is not None:
-            all_samples = all_samples[:max_samples]
+            all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+        else:
+            all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+            if max_samples is not None:
+                all_samples = all_samples[:max_samples]
 
         return all_samples
 

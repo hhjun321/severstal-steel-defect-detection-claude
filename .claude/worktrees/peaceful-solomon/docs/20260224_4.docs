@@ -1,0 +1,179 @@
+20260224 작업 일지 #4 - YOLO 데이터셋/학습 파이프라인 버그 수정 (3건)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+Colab T4에서 yolo_mfd + baseline 학습 시 mAP@0.5 ≈ 0.0007로 극히 저조한
+성능이 관측됨. 데이터셋 파이프라인(dataset_yolo.py) 전체 감사(audit)를 수행하여
+근본 원인 3건을 식별하고 수정함.
+
+감사 결과:
+  - CSV 파싱, RLE 디코딩, bbox 정규화, class 인덱싱: 정상 (버그 없음)
+  - 아래 3건의 문제 식별 및 수정
+
+
+2. 변경 파일
+================================================================================
+
+  | 파일                                    | 상태 | 라인수 변경  | 변경 내용                          |
+  |-----------------------------------------|------|-------------|-----------------------------------|
+  | src/training/dataset_yolo.py            | 수정 | 345 (←344)  | names 필드 YAML dict 형식으로 변경  |
+  | src/training/ultralytics_trainer.py     | 수정 | 380 (←378)  | rect=True 추가 (train + eval)      |
+  | configs/benchmark_experiment.yaml       | 수정 | 200 (동일)  | input_size 주석에 rect=True 설명    |
+
+
+3. 버그 상세 및 수정 내용
+================================================================================
+
+3.1 [심각] dataset_yolo.py - names 필드 YAML 형식 오류
+-------------------------------------------------------
+문제:
+  dataset.yaml 생성 시 names 필드가 Python list repr로 출력됨.
+    names: ['Class1', 'Class2', 'Class3', 'Class4']
+  Python의 single-quote 리스트 표현은 표준 YAML이 아님.
+  ultralytics가 이를 파싱할 때 클래스 매핑이 잘못될 수 있음.
+
+수정:
+  표준 YAML dict 형식으로 변경:
+    names:
+      0: Class1
+      1: Class2
+      2: Class3
+      3: Class4
+
+변경 전 (L194-195):
+    f"nc: {num_classes}\n"
+    f"names: {class_names}\n"
+
+변경 후 (L194-196):
+    f"nc: {num_classes}\n"
+    f"names:\n" +
+    "".join(f"  {i}: {name}\n" for i, name in enumerate(class_names))
+
+
+3.2 [심각] ultralytics_trainer.py - 정사각형 리사이즈로 인한 패딩 과다
+----------------------------------------------------------------------
+문제:
+  Severstal 이미지는 256×1600 (H×W, 종횡비 1:6.25)인데,
+  imgsz=640 단일 정수로 전달하면 ultralytics가 정사각형(640×640) 기준으로
+  letterbox 처리함:
+    - W=1600 → 640 (scale 0.4)
+    - H=256 × 0.4 = 102.4 → 128 (stride-32 정렬)
+    - 실효 영역: 640×128, 나머지 640×512 = 회색 패딩 (약 84%)
+  미세 결함(수 픽셀)이 축소 후 sub-pixel 수준이 됨.
+
+수정:
+  rect=True를 train_kwargs와 _evaluate_test()에 추가.
+  rect=True는 배치 내 유사 종횡비 이미지를 그룹화하여 직사각형 배치를 사용.
+    - 학습 시: 640×128 직사각형 배치 (패딩 최소화)
+    - 평가 시: 동일한 직사각형 배치로 일관성 유지
+
+변경 전 (train_kwargs, L328):
+    plots=True,
+    val=True,
+
+변경 후 (train_kwargs, L328-329):
+    plots=True,
+    rect=True,  # rectangular batching for Severstal 256x1600 (1:6.25 aspect ratio)
+    val=True,
+
+변경 전 (_evaluate_test, L216-224):
+    results = model.val(
+        data=dataset_yaml,
+        split='test',
+        batch=self.batch_size,
+        conf=self.conf_threshold,
+        iou=self.iou_threshold,
+        device=self.device,
+        verbose=False,
+    )
+
+변경 후 (_evaluate_test, L216-225):
+    results = model.val(
+        data=dataset_yaml,
+        split='test',
+        batch=self.batch_size,
+        conf=self.conf_threshold,
+        iou=self.iou_threshold,
+        device=self.device,
+        rect=True,  # rectangular batching for consistent eval
+        verbose=False,
+    )
+
+추가 변경 (imgsz 주석, L311):
+  변경 전: imgsz=self.input_size[0],  # ultralytics uses single int for square
+  변경 후: imgsz=self.input_size[0],  # longest side; rect=True handles 256x1600 aspect ratio
+
+
+3.3 [보통] benchmark_experiment.yaml - input_size 주석 보완
+------------------------------------------------------------
+문제:
+  input_size: [640, 640] 값이 정사각형 리사이즈를 의미하는 것처럼 보임.
+  실제로는 rect=True가 종횡비를 자동 조정하므로, 이를 주석으로 명시.
+
+변경 전 (yolo_mfd, L90):
+    input_size: [640, 640]
+
+변경 후:
+    input_size: [640, 640]  # max side=640; rect=True auto-adjusts for 256x1600
+
+변경 전 (eb_yolov8, L112):
+    input_size: [640, 640]
+
+변경 후:
+    input_size: [640, 640]  # max side=640; rect=True auto-adjusts for 256x1600
+
+
+4. 기술 분석: rect=True의 효과
+================================================================================
+
+4.1 정사각형 모드 (rect=False, 기존)
+  ┌─────────────────────────────────────────┐
+  │  ████████████████████████████████ 640px  │ ← 이미지 (640×128)
+  │                                         │
+  │           회색 패딩 (512px)               │
+  │                                         │
+  │                                         │
+  └─────────────────────────────────────────┘
+  640×640 canvas에서 실효 영역 16% (640×128 / 640×640)
+
+4.2 직사각형 모드 (rect=True, 수정 후)
+  ┌─────────────────────────────────────────┐
+  │  ████████████████████████████████ 640px  │ ← 이미지 (640×128)
+  └─────────────────────────────────────────┘
+  640×128 canvas → 패딩 0%, GPU 메모리 효율 ~5배 향상
+
+4.3 주의사항
+  - ultralytics에서 mosaic augmentation이 활성화되면 학습 중 rect가
+    자동 비활성화될 수 있음 (mosaic은 정사각형 필요)
+  - 검증(val) 시에는 항상 rect 적용
+  - mosaic=0으로 설정하면 학습 중에도 rect 강제 적용 가능
+    (추후 성능 미개선 시 검토)
+
+
+5. AMP(Mixed Precision) 영향 분석 결과
+================================================================================
+  별도 분석 수행: AMP는 성능 저하의 주 원인이 아님.
+  - ultralytics AMP는 충분히 검증된 기능
+  - MEFE의 torch.sqrt(1e-6 epsilon)에서 FP16 미세 불안정 가능하나
+    catastrophic failure 수준은 아님
+  - Loss 연산은 AMP 하에서도 FP32로 수행됨
+
+
+6. 구문 검증
+================================================================================
+  python -c "import ast; ast.parse(open('src/training/dataset_yolo.py', encoding='utf-8').read())"
+  → Syntax OK
+
+  python -c "import ast; ast.parse(open('src/training/ultralytics_trainer.py', encoding='utf-8').read())"
+  → Syntax OK
+
+  python -c "import yaml; yaml.safe_load(open('configs/benchmark_experiment.yaml', encoding='utf-8'))"
+  → Syntax OK
+
+
+7. 다음 작업
+================================================================================
+  - Colab에서 수정된 코드로 yolo_mfd + baseline 재학습 (10 epoch)
+  - mAP@0.5 개선 여부 확인
+  - 미개선 시: mosaic=0.0 추가 검토, 또는 imgsz 직접 조정

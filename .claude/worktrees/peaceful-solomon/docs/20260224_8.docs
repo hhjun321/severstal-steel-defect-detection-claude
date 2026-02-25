@@ -1,0 +1,125 @@
+20260224 작업 일지 #8 - MEFE 커스텀 모듈 ultralytics 등록 버그 수정
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+Colab에서 yolo_mfd + baseline_raw 벤치마크 실행 시 발생한 KeyError: 'MEFE' 오류 해결.
+ultralytics의 parse_model()이 커스텀 모듈을 올바르게 찾을 수 있도록
+MEFE 클래스를 ultralytics.nn.tasks 모듈의 global namespace에 등록.
+
+
+2. 변경 파일
+================================================================================
+
+  | 파일                          | 상태 | 라인수 변경    | 변경 내용                                 |
+  |-------------------------------|------|---------------|------------------------------------------|
+  | src/models/yolo_mfd.py        | 수정 | 291 (변동 없음)| MEFE 등록 로직을 tasks.__dict__ 주입으로 수정|
+
+
+3. 오류 분석
+================================================================================
+
+3.1 에러 메시지
+----------------
+  File "ultralytics/nn/tasks.py", line 1632, in parse_model
+      else globals()[m]
+           ~~~~~~~~~^^^
+  KeyError: 'MEFE'
+
+3.2 원인
+---------
+ultralytics의 parse_model() 함수는 모델 YAML에 정의된 모듈 이름을 해석할 때
+다음 순서로 탐색한다:
+
+  1) torch.nn 표준 모듈 (nn.Upsample 등)
+  2) ultralytics.nn.modules 내장 모듈 (Conv, C2f, SPPF 등)
+  3) globals()[m] — tasks.py 파일 스코프의 전역 변수
+
+MEFE는 ultralytics 내장이 아닌 커스텀 모듈이므로 3번에 해당.
+기존 코드는 ultralytics.nn.modules에만 등록하고,
+tasks.py의 globals()에는 등록하지 않아 KeyError 발생.
+
+  기존 등록 로직 (불완전):
+    modules.MEFE = MEFE           ← modules 속성으로는 등록됨
+    # tasks.py의 globals()에는 미등록 → KeyError
+
+  ultralytics/nn/tasks.py parse_model() 내부 (L1632):
+    m = eval(m) if isinstance(m, str) else m   # 문자열이면 eval 시도
+    # eval 실패 시:
+    else globals()[m]                           ← 여기서 KeyError
+
+
+4. 주요 변경 내용
+================================================================================
+
+4.1 MEFE 등록 로직 수정 (yolo_mfd.py L213-226)
+-------------------------------------------------
+
+변경 전:
+    from ultralytics import YOLO
+    import ultralytics.nn.modules as modules
+
+    # Register MEFE as a custom module so ultralytics can parse the YAML
+    if not hasattr(modules, 'MEFE'):
+        modules.MEFE = MEFE
+        # Also register in the tasks module's class dict
+        try:
+            from ultralytics.nn.tasks import DetectionModel
+            # ultralytics uses a module lookup dict; ensure MEFE is findable
+            import ultralytics.nn.modules as _m
+            _m.MEFE = MEFE
+        except ImportError:
+            pass
+
+변경 후:
+    from ultralytics import YOLO
+    import ultralytics.nn.modules as modules
+    import ultralytics.nn.tasks as tasks_module
+
+    # Register MEFE in ultralytics namespace.
+    # ultralytics parse_model() resolves custom modules via globals()[m]
+    # in ultralytics/nn/tasks.py — so MEFE must be injected there.
+    if not hasattr(modules, 'MEFE'):
+        modules.MEFE = MEFE
+    # Critical: tasks.py uses globals() lookup for module classes
+    if 'MEFE' not in vars(tasks_module):
+        tasks_module.MEFE = MEFE
+    # Also inject into tasks module's global dict directly
+    tasks_module.__dict__['MEFE'] = MEFE
+
+
+4.2 등록 3단계 설명
+---------------------
+  1) modules.MEFE = MEFE
+     → ultralytics.nn.modules 네임스페이스에 속성으로 등록.
+       다른 코드에서 from ultralytics.nn.modules import MEFE 가능.
+
+  2) tasks_module.MEFE = MEFE
+     → ultralytics.nn.tasks 모듈 객체의 속성으로 등록.
+       vars(tasks_module)['MEFE'] 조회 가능.
+
+  3) tasks_module.__dict__['MEFE'] = MEFE
+     → tasks.py 내부에서 globals()['MEFE'] 조회 시 해당 dict를 참조.
+       parse_model()의 globals()[m] 라인이 이 dict에서 MEFE를 찾음.
+       이것이 실제 KeyError를 해결하는 핵심 줄.
+
+  참고: 2)와 3)은 CPython에서 동일하게 동작하나, 명시적으로 __dict__ 직접 주입을
+  추가하여 Python 구현체 간 호환성을 보장함.
+
+
+5. 영향 범위
+================================================================================
+
+  | 항목                    | 영향                                          |
+  |------------------------|-----------------------------------------------|
+  | yolo_mfd 모델 생성      | KeyError 해결 → 정상 YAML 파싱 + 모델 빌드     |
+  | eb_yolov8 모델          | 영향 없음 (BiFPN은 별도 등록 또는 미사용)       |
+  | deeplabv3plus 모델      | 영향 없음 (ultralytics 미사용)                  |
+  | MEFE 모듈 동작          | 변경 없음 (등록 위치만 수정, 모듈 코드 동일)     |
+  | pretrained weight 전달  | 변경 없음 (_transfer_weights 동일)              |
+
+
+6. 구문 검증
+================================================================================
+  python -c "import ast; ast.parse(open('src/models/yolo_mfd.py', encoding='utf-8').read())"
+  → Syntax OK

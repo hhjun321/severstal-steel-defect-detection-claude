@@ -1,0 +1,247 @@
+20260220 작업 일지 - v4 학습 실행 시 hint 경로 해석 실패 분석 및 수정 계획
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+v4 ControlNet 학습(train_controlnet.py) 실행 시 sanity check에서 발생한
+hint 경로 해석 실패를 분석하고 수정 방안을 수립한다.
+
+  발생 에러:
+    ERROR: [FAIL] Sample 0: Cannot resolve hint path:
+           'controlnet_dataset_v4/hints/d84ad849e.jpg_class1_region1_hint.png'
+    ERROR: [FAIL] Sample 1: Cannot resolve hint path:
+           'controlnet_dataset_v4/hints/e2b3cf9a4.jpg_class1_region0_hint.png'
+    ERROR: Sanity check FAILED - fix data issues before training
+    ERROR: Data sanity check failed. Aborting training.
+
+  실행 환경: Google Colab + Google Drive
+
+2. 원인 분석
+================================================================================
+
+2-1. 에러 발생 흐름
+
+  train_controlnet.py 실행 시 sanity check 흐름:
+    run_sanity_check() (line 304-369)
+      → dataset[i] (line 320)
+        → __getitem__() (line 238)
+          → _resolve_hint_path(sample["hint"]) (line 254)
+            → FileNotFoundError 발생 (line 202)
+
+  train.jsonl에 기록된 hint 경로 형식:
+    "hint": "controlnet_dataset_v4/hints/d84ad849e.jpg_class1_region1_hint.png"
+
+  이 경로는 output_dir의 상위 디렉토리(output_dir.parent) 기준 상대 경로임.
+
+2-2. _resolve_hint_path()의 경로 해석 순서 (line 178-202)
+
+  현재 해석 순서와 각 단계의 실패 원인:
+
+  | 순서 | 시도 경로                                  | 결과  | 원인                              |
+  |------|-------------------------------------------|-------|-----------------------------------|
+  | 1    | 절대 경로 확인                             | SKIP  | 상대 경로이므로 해당 없음          |
+  | 2    | project_root / path_str                    | FAIL  | project_root 아래에               |
+  |      | (= repo_root/controlnet_dataset_v4/hints/) |       | controlnet_dataset_v4/ 없음       |
+  | 3    | data_dir / filename_only                   | FAIL  | data_dir 바로 아래에 hint 파일 없음|
+  | 4    | data_dir / "hints" / filename_only         | FAIL  | filename은 맞지만 (주1) 참조      |
+  | 5    | CWD 기준 상대 경로                         | FAIL  | CWD에 해당 디렉토리 없음          |
+
+  (주1) 4번 단계 실패 원인 상세:
+    data_dir = --data_dir 인자값 = train.jsonl이 있는 디렉토리
+    Colab 기준: /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/
+
+    4번 단계가 시도하는 경로:
+      /content/drive/MyDrive/data/Severstal/controlnet_dataset_v4/hints/d84ad849e...hint.png
+
+    이 경로에 hint 파일이 실제로 존재한다면 4번에서 해석 성공해야 함.
+    그러나 실패한다는 것은 다음 두 가지 가능성 중 하나:
+      (a) hint 파일이 실제로 생성되지 않았거나 다른 위치에 있음
+      (b) --data_dir 인자가 controlnet_dataset_v4가 아닌 다른 경로로 지정됨
+
+2-3. 근본 원인: create_train_jsonl()의 base_dir 불일치
+
+  [발생 위치] src/preprocessing/controlnet_packager.py line 584-588
+
+  현재 코드:
+    self.create_train_jsonl(
+        packaged_data,
+        train_jsonl_path,
+        relative_paths=True,
+        base_dir=output_dir.parent          # <--- 문제의 원인
+    )
+
+  동작:
+    output_dir = /content/drive/.../controlnet_dataset_v4/
+    base_dir   = /content/drive/.../                        (output_dir.parent)
+    hint 절대경로 = /content/drive/.../controlnet_dataset_v4/hints/xxx_hint.png
+
+    Path(hint_절대경로).relative_to(base_dir)
+    → "controlnet_dataset_v4/hints/xxx_hint.png"            (base_dir 기준 상대경로)
+
+  문제:
+    학습 시 --data_dir = output_dir = controlnet_dataset_v4/
+    self.data_dir = train.jsonl의 부모 = output_dir = controlnet_dataset_v4/
+
+    JSONL의 hint 경로는 output_dir.parent 기준이므로
+    "controlnet_dataset_v4/hints/xxx_hint.png" 형식이 되는데,
+    _resolve_hint_path()는 data_dir(=output_dir) 기준으로 해석을 시도함.
+
+    즉, JSONL 생성 시 base_dir와 학습 시 data_dir가 한 단계 어긋남:
+      JSONL base_dir  = output_dir.parent  (상위 디렉토리)
+      학습 data_dir   = output_dir          (자기 자신)
+
+2-4. _resolve_image_path()와의 비교
+
+  _resolve_image_path() (line 140-176)에는 다음 해석 단계가 있음:
+
+    # 3. data_dir 기준
+    for base in [self.data_dir, self.data_dir.parent]:     # <--- parent도 시도
+        candidate = base / path_str
+        if candidate.exists():
+            return candidate
+
+  self.data_dir.parent / path_str를 시도하므로:
+    data_dir.parent / "controlnet_dataset_v4/hints/xxx_hint.png"
+    = output_dir.parent / "controlnet_dataset_v4/hints/xxx_hint.png"
+    = 절대 경로와 동일 → 해석 성공
+
+  그러나 _resolve_hint_path()에는 이 단계가 누락되어 있음.
+  data_dir / path_str도, data_dir.parent / path_str도 시도하지 않음.
+  오직 filename만 추출하여 data_dir/filename, data_dir/hints/filename만 시도함.
+
+3. 수정 방안
+================================================================================
+
+3-1. [수정 A] _resolve_hint_path() 경로 해석 개선
+
+  [변경 파일] scripts/train_controlnet.py (line 178-202)
+
+  _resolve_image_path()와 동일하게 data_dir 기준 전체 상대 경로 해석 단계를 추가:
+
+  변경 전 (현재):
+    def _resolve_hint_path(self, path_str: str) -> Path:
+        path = Path(path_str)
+        if path.is_absolute() and path.exists():
+            return path
+        project_root = Path(__file__).parent.parent
+        candidate = project_root / path_str
+        if candidate.exists():
+            return candidate
+        for candidate in [
+            self.data_dir / Path(path_str).name,
+            self.data_dir / "hints" / Path(path_str).name,
+        ]:
+            if candidate.exists():
+                return candidate
+        if path.exists():
+            return path
+        raise FileNotFoundError(f"Cannot resolve hint path: '{path_str}'")
+
+  변경 후:
+    def _resolve_hint_path(self, path_str: str) -> Path:
+        path = Path(path_str)
+        if path.is_absolute() and path.exists():
+            return path
+        project_root = Path(__file__).parent.parent
+        candidate = project_root / path_str
+        if candidate.exists():
+            return candidate
+        # [신규] data_dir 및 data_dir.parent 기준 전체 상대 경로
+        for base in [self.data_dir, self.data_dir.parent]:
+            candidate = base / path_str
+            if candidate.exists():
+                return candidate
+        # filename만으로 재시도
+        for candidate in [
+            self.data_dir / Path(path_str).name,
+            self.data_dir / "hints" / Path(path_str).name,
+        ]:
+            if candidate.exists():
+                return candidate
+        if path.exists():
+            return path
+        raise FileNotFoundError(f"Cannot resolve hint path: '{path_str}'")
+
+  이 수정의 효과:
+    path_str = "controlnet_dataset_v4/hints/xxx_hint.png"
+    data_dir  = /content/drive/.../controlnet_dataset_v4/
+    data_dir.parent = /content/drive/.../
+
+    data_dir.parent / path_str
+    = /content/drive/.../controlnet_dataset_v4/hints/xxx_hint.png
+    → 해석 성공
+
+3-2. [수정 B] create_train_jsonl()의 base_dir 수정
+
+  [변경 파일] src/preprocessing/controlnet_packager.py (line 588)
+
+  변경 전:
+    base_dir=output_dir.parent
+
+  변경 후:
+    base_dir=output_dir
+
+  이 수정의 효과:
+    hint 절대경로 = /content/drive/.../controlnet_dataset_v4/hints/xxx_hint.png
+    Path(hint).relative_to(output_dir)
+    → "hints/xxx_hint.png"                 (output_dir 기준)
+
+    학습 시 data_dir = output_dir이므로:
+    data_dir / "hints/xxx_hint.png" → 직접 해석 가능
+
+  주의:
+    source/target 경로(roi_image_path)는 output_dir 외부에 위치하므로
+    relative_to(output_dir)에서 ValueError가 발생할 수 있음.
+    현재 except ValueError: pass로 절대 경로가 유지됨.
+    _resolve_image_path()는 절대 경로를 1번 단계에서 처리하므로 문제 없음.
+
+    따라서 source/target는 절대 경로로, hint는 상대 경로로 혼합 저장됨.
+    이는 _resolve_image_path()와 _resolve_hint_path()가 각각 처리 가능.
+
+3-3. 수정 적용 순서 및 영향
+
+  | 수정 | 대상 파일              | 효과                              | JSONL 재생성 |
+  |------|------------------------|-----------------------------------|-------------|
+  | A    | train_controlnet.py    | 기존/신규 JSONL 모두 호환          | 불필요       |
+  | B    | controlnet_packager.py | 향후 JSONL의 경로 형식 정규화      | 필요         |
+
+  권장 적용 순서:
+    1. 수정 A 먼저 적용 → 기존 v4 JSONL로 즉시 학습 재시도 가능
+    2. 수정 B 적용 → 향후 v5 이후 데이터셋 패키징 시 올바른 경로 생성
+    3. (선택) v4 데이터셋을 수정 B 적용 후 재패키징하면 경로가 정규화됨
+
+4. 이전 작업 (20260219) 구현 완료 사항 요약
+================================================================================
+
+  20260219.docs 섹션 10-8에 정의된 6개 개선 방안을 모두 코드로 구현 완료:
+
+  | 방안 | 구현 내용                                                  | 대상 파일              |
+  |------|------------------------------------------------------------|------------------------|
+  | A1   | generate_single()에 grayscale 후처리 추가                   | test_controlnet.py     |
+  |      | image.convert("L").convert("RGB")                           |                        |
+  |      | CLI: --grayscale_postprocess / --no_grayscale_postprocess    |                        |
+  | A2   | controlnet_conditioning_scale 기본값 1.0 → 0.7              | test_controlnet.py     |
+  |      |                                                             | run_validation_phases.py|
+  |      |                                                             | train_controlnet.py    |
+  | B1   | Target 이미지 grayscale 강제 변환                           | train_controlnet.py    |
+  |      | convert("L") → Image.merge("RGB", [gray,gray,gray])        |                        |
+  |      | CLI: --force_grayscale_target / --no_force_grayscale_target  |                        |
+  | B2   | Grayscale 일관성 loss 추가                                  | train_controlnet.py    |
+  |      | L_gray = MSE(ch0-ch1) + MSE(ch1-ch2)                       |                        |
+  |      | CLI: --gray_loss_lambda (기본값 0.1)                        |                        |
+  | B3   | snr_gamma 기본값 None → 5.0                                 | train_controlnet.py    |
+  |      | early_stopping_patience 기본값 0 → 20                       |                        |
+  |      | _apply_augmentation() 메서드 추가                           |                        |
+  |      | (horizontal flip 50%, brightness/contrast jitter 0.9~1.1)   |                        |
+  |      | CLI: --augment                                              |                        |
+
+  모든 수정 파일은 ast.parse() 문법 검증을 통과함.
+  git에 아직 커밋되지 않은 상태 (staged 아님).
+
+5. 다음 작업
+--------------------------------------------------------------------------------
+  (1) 수정 A 적용: _resolve_hint_path()에 data_dir/data_dir.parent 기준 해석 추가
+  (2) 수정 B 적용: create_train_jsonl()의 base_dir를 output_dir로 변경
+  (3) 문법 검증 후 git commit
+  (4) Colab에서 v4 학습 재실행
+  (5) 학습 후 validation 실행하여 RGB 아티팩트 해소 여부 확인

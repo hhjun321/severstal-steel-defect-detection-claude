@@ -1,0 +1,241 @@
+20260221 작업 일지 - 미해결 문제 6건 수정 (docs/20260221.docs 섹션 7 대응)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+docs/20260221.docs 섹션 7 "미해결 문제 및 권장 사항"에 기술된 6건의
+미해결 항목을 코드 수준에서 수정하고, 문법 검증(ast.parse)을 통과시킨다.
+
+
+2. 대상 항목 및 처리 결과
+================================================================================
+
+  | 항목  | 내용                                       | 결과     |
+  |-------|--------------------------------------------|----------|
+  | 7-1(1)| hint 경로 해석 버그 - 수정 A               | 이미 적용|
+  | 7-1(1)| hint 경로 해석 버그 - 수정 B               | 적용 완료|
+  | 7-2(3)| 품질 메트릭 보강 (SSIM, LPIPS)             | 적용 완료|
+  | 7-2(4)| Phase 2 정량적 평가                        | 적용 완료|
+  | 7-3(5)| 클래스 불균형 대응 (오버샘플링)             | 적용 완료|
+  | 7-3(6)| v1 vs v4 생성 이미지 직접 비교             | 적용 완료|
+
+
+3. 변경 파일
+================================================================================
+
+  | 파일                                        | 변경 내용                        |
+  |---------------------------------------------|----------------------------------|
+  | src/preprocessing/controlnet_packager.py     | 수정 B: base_dir 변경            |
+  | scripts/run_validation_phases.py             | 7-2(3), 7-2(4), 7-3(5), 7-3(6)  |
+  | scripts/train_controlnet.py                  | 변경 없음 (수정 A 이미 적용 확인)|
+
+
+4. 수정 상세
+================================================================================
+
+4-1. [7-1(1)] hint 경로 해석 버그 수정
+----------------------------------------------------------------------
+
+  수정 A: _resolve_hint_path()에 data_dir.parent 기준 해석 추가
+    [대상] scripts/train_controlnet.py line 196
+    [상태] 이미 적용되어 있었음. 코드 확인 결과:
+
+      for base in [self.data_dir, self.data_dir.parent]:
+          candidate = base / path_str
+          if candidate.exists():
+              return candidate
+
+    docs/20260219_1.docs에서 "미적용, 미커밋"으로 기록했으나,
+    실제 코드에는 이미 반영되어 있었음.
+
+  수정 B: create_train_jsonl()의 base_dir를 output_dir로 변경
+    [대상] src/preprocessing/controlnet_packager.py line 588
+    [변경]
+      변경 전: base_dir=output_dir.parent
+      변경 후: base_dir=output_dir
+
+    [효과]
+      JSONL의 hint 경로가 "controlnet_dataset_v4/hints/xxx.png" (parent 기준)
+      에서 "hints/xxx.png" (output_dir 기준)으로 정규화됨.
+      _resolve_hint_path()의 data_dir / path_str 단계에서 직접 해석 가능.
+
+    [주의사항]
+      source/target 경로는 output_dir 외부에 위치하므로
+      relative_to(output_dir)에서 ValueError 발생 → except 절에서
+      절대 경로로 유지됨. _resolve_image_path()가 절대 경로를 처리.
+
+4-2. [7-2(3)] 품질 메트릭 보강 - SSIM, LPIPS 추가
+----------------------------------------------------------------------
+
+  [대상] scripts/run_validation_phases.py _compute_generation_quality()
+
+  기존 3개 메트릭(색상 일관성, 아티팩트, 선명도)에 2개 메트릭 추가:
+
+  | 메트릭  | 라이브러리                        | 설명                    |
+  |---------|-----------------------------------|-------------------------|
+  | SSIM    | skimage.metrics                   | 구조적 유사도 (0~1)     |
+  | LPIPS   | lpips (AlexNet)                   | 지각적 거리 (0~1, 낮=좋)|
+
+  설계 원칙:
+    - optional dependency: SSIM/LPIPS 라이브러리 미설치 시 기존 3개 메트릭만 사용
+    - 참조 이미지 필요: comparisons/ 또는 sources/ 디렉토리에서 자동 탐색
+    - 동적 가중치: 사용 가능 메트릭에 따라 가중치 자동 조정
+
+  가중치 구성:
+    | 조건             | color | artifact | blur | SSIM | LPIPS |
+    |------------------|-------|----------|------|------|-------|
+    | 5개 모두 가능    | 0.30  | 0.20     | 0.20 | 0.15 | 0.15  |
+    | SSIM만 가능      | 0.30  | 0.25     | 0.25 | 0.20 | -     |
+    | LPIPS만 가능     | 0.30  | 0.25     | 0.25 | -    | 0.20  |
+    | 기존 3개만       | 0.40  | 0.30     | 0.30 | -    | -     |
+
+  추가된 함수:
+    _build_reference_map()   : 생성 이미지 ↔ 참조 이미지 매핑 구축
+    _compute_ssim()          : SSIM 계산 (grayscale 변환 + 크기 맞춤)
+    _compute_lpips()         : LPIPS 계산 (BGR→RGB→tensor 변환)
+
+  리포트 출력 변경:
+    Phase 1, Phase 3의 리포트에 SSIM/LPIPS 점수 표시 추가
+    (avg_ssim_score, avg_lpips_score, num_ssim_evaluated, num_lpips_evaluated)
+
+4-3. [7-2(4)] Phase 2 정량적 평가
+----------------------------------------------------------------------
+
+  [대상] scripts/run_validation_phases.py run_phase2()
+
+  변경 내용:
+    Phase 2 각 파라미터 조합(guidance_scale 4개, inference_steps 3개,
+    seed 4개 = 11개)에 대해 _compute_generation_quality() 호출.
+
+  추가된 기능:
+    (1) 파라미터별 품질 점수 산출
+        각 entry에 quality 필드 추가:
+          {"avg_quality_score", "avg_color_score", "avg_artifact_score",
+           "avg_blur_score", "avg_ssim_score", "avg_lpips_score",
+           "num_evaluated", "quality_passed"}
+
+    (2) 최적 파라미터 조합 자동 결정
+        avg_quality_score가 가장 높은 조합을 best_combination으로 기록
+
+    (3) phase2_summary.json 구조 변경
+        기존: {guidance_scales_tested, inference_steps_tested, seeds_tested, results}
+        추가: results[].quality, best_combination
+
+    (4) Phase 4 리포트 변경
+        파라미터별 품질 점수 목록 표시
+        최적 조합 표시
+
+4-4. [7-3(5)] 클래스 불균형 대응 - 오버샘플링 전략
+----------------------------------------------------------------------
+
+  [대상] scripts/run_validation_phases.py
+
+  추가된 함수:
+    _create_oversampled_jsonl(original_jsonl_path, output_dir) → Optional[Path]
+
+  동작:
+    (1) 원본 JSONL의 각 샘플에서 class 정보 추출
+        (hint 파일명 또는 prompt에서 "class{N}" 패턴 매칭)
+    (2) 최다 클래스 샘플 수(max_count) 계산
+    (3) 부족한 클래스의 샘플을 순환 복제하여 max_count까지 증가
+        - 복제 시 _oversample_seed_offset 필드를 추가하여 다양성 확보
+    (4) train_oversampled.jsonl로 저장
+    (5) 오버샘플링 전후 분포를 로그 출력
+
+  CLI 옵션:
+    --oversample_minority (기본값: False)
+
+  사용 예:
+    python scripts/run_validation_phases.py \
+        --model_path .../best_model \
+        --jsonl_path .../train.jsonl \
+        --oversample_minority \
+        --phases 1
+
+4-5. [7-3(6)] v1 vs v4 생성 이미지 직접 비교
+----------------------------------------------------------------------
+
+  [대상] scripts/run_validation_phases.py
+
+  추가된 함수:
+    _compare_v1_v4_generations(v1_dir, v4_dir, report_dir)
+    _extract_base_id(stem) → Optional[str]
+
+  동작:
+    (1) v1, v4 디렉토리에서 생성 이미지 수집
+    (2) base_id(예: d84ad849e_class1_region1)로 매칭
+    (3) 공통 ROI에 대해 4개 메트릭 비교:
+        - 색상 일관성 (color_consistency)
+        - 아티팩트 점수 (artifact_score)
+        - 선명도 (blur_score)
+        - RGB 채널 간 표준편차 (rgb_std) → grayscale 개선 효과 측정
+
+  출력물:
+    v1_v4_comparison.json     : 상세 비교 결과 (샘플별 + 통계 요약)
+    v1_v4_comparison_grid.png : 시각적 비교 그리드 (v1 상단, v4 하단)
+
+  CLI 옵션:
+    --v1_output_dir (기본값: None)
+    지정 시 Phase 4에서 자동 비교 수행
+
+  사용 예:
+    python scripts/run_validation_phases.py \
+        --model_path .../best_model \
+        --jsonl_path .../train.jsonl \
+        --v1_output_dir .../test_results_v1 \
+        --phases 4
+
+
+5. 문법 검증
+================================================================================
+
+  3개 파일 모두 ast.parse() 통과:
+
+    run_validation_phases.py  : OK
+    controlnet_packager.py    : OK
+    train_controlnet.py       : OK
+
+  LSP(pyright) 경고는 모두 런타임 환경 의존 import (cv2, numpy, torch,
+  lpips, matplotlib, PIL, skimage)이며, Colab 환경에서 정상 작동.
+
+
+6. 미커밋 상태
+================================================================================
+
+  모든 수정은 아직 git에 커밋되지 않은 상태.
+  커밋 전 확인 사항:
+    (1) 수정 B 적용 후 JSONL 재생성 필요 여부 판단
+        - 기존 v4 JSONL은 수정 A가 이미 적용되어 있으므로 학습 가능
+        - 수정 B 적용 후 재패키징하면 경로가 정규화됨
+    (2) requirements.txt에 lpips 패키지 추가 여부 판단
+        - optional dependency이므로 즉시 필수는 아님
+
+
+7. 다음 작업
+================================================================================
+
+  docs/20260221.docs 섹션 8 "다음 작업" 순서를 따름:
+
+  (1) [완료] hint 경로 수정 적용 (수정 A + 수정 B)
+  (2) [대기] git commit
+  (3) [대기] Colab에서 v4 학습 재실행 (수정된 코드 기반)
+  (4) [대기] 전체 4단계 검증 재실행 (Phase 1 포함)
+  (5) [완료] Phase 3 품질 메트릭 보강 (SSIM, LPIPS 추가)
+  (6) [대기] RGB 아티팩트 해소 여부 최종 확인
+  (7) [대기] 품질 검증 통과 시 → 5,000매 합성 이미지 생성
+  (8) [대기] 벤치마크 실험 준비 (docs/experiment.md 섹션 5 계획에 따라)
+
+
+8. 파일 참조
+================================================================================
+
+  수정 대상:
+    src/preprocessing/controlnet_packager.py    (line 588: base_dir 변경)
+    scripts/run_validation_phases.py            (전반적 확장)
+
+  확인 대상 (변경 없음):
+    scripts/train_controlnet.py                 (수정 A 이미 적용 확인)
+
+  참조 문서:
+    docs/20260221.docs     (분석 결과 및 미해결 문제 목록)
+    docs/20260219_1.docs   (hint 경로 버그 분석 + 수정 방안 원문)

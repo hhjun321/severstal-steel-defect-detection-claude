@@ -344,12 +344,22 @@ def _add_casda_to_training(
     if casda_mode == "pruning":
         threshold = casda_config.get('suitability_threshold', 0.63)
         top_k = casda_config.get('pruning_top_k', 2000)
-        all_samples = [
+        filtered = [
             s for s in all_samples
-            if s.get('suitability_score', 1.0) >= threshold
+            if s.get('suitability_score', 0.0) >= threshold
         ]
-        all_samples.sort(key=lambda x: x.get('suitability_score', 1.0), reverse=True)
-        all_samples = all_samples[:top_k]
+        if len(filtered) >= top_k:
+            # threshold 조건을 충족하는 샘플이 충분 → 상위 top_k 선택
+            filtered.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+            all_samples = filtered[:top_k]
+        else:
+            # 점수 미산정 또는 threshold 미달 → score 기준 상위 top_k (fallback)
+            logger.warning(
+                f"Pruning: only {len(filtered)} samples pass threshold {threshold} "
+                f"(need {top_k}). Falling back to top-{top_k} by score."
+            )
+            all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+            all_samples = all_samples[:top_k]
 
     count = 0
     for idx, sample in enumerate(all_samples):

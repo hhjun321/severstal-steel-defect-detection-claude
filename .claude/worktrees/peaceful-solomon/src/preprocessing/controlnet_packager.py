@@ -1,0 +1,624 @@
+"""
+ControlNet Dataset Packaging Module
+
+This module packages the processed ROI data into ControlNet training format.
+Creates:
+- Multi-channel hint images
+- train.jsonl with image paths and prompts
+- Organized directory structure for training
+
+Output format matches standard ControlNet training requirements.
+"""
+import json
+import pandas as pd
+import cv2
+import numpy as np
+from pathlib import Path
+from typing import Dict, List, Optional
+from tqdm import tqdm
+
+from .hint_generator import HintImageGenerator
+from .prompt_generator import PromptGenerator
+from ..utils.rle_utils import get_all_masks_for_image
+
+
+class ControlNetDatasetPackager:
+    """
+    Packages ROI data for ControlNet training.
+    """
+    
+    def __init__(self, hint_generator: Optional[HintImageGenerator] = None,
+                 prompt_generator: Optional[PromptGenerator] = None,
+                 prompt_style: str = 'detailed'):
+        """
+        Initialize dataset packager.
+        
+        Args:
+            hint_generator: HintImageGenerator instance
+            prompt_generator: PromptGenerator instance
+            prompt_style: Style for prompts ('simple', 'detailed', 'technical')
+        """
+        self.hint_generator = hint_generator or HintImageGenerator()
+        self.prompt_generator = prompt_generator or PromptGenerator(style=prompt_style)
+    
+    def _edge_filter(self, df: pd.DataFrame,
+                     edge_margin: float = 0.1) -> pd.DataFrame:
+        """
+        ROI 경계에 너무 가까운 결함을 가진 샘플을 제외합니다.
+
+        DatasetValidator.visual_check_sample()에서 경고만 출력하던
+        edge proximity 검사를 패키징 시점에 실제 제외 로직으로 적용합니다.
+
+        NOTE: roi_bbox == defect_bbox인 경우 (ROI 최적화가 실패하여
+        결함 bbox를 그대로 ROI로 사용하는 경우) edge margin이 항상 0이므로
+        해당 샘플은 검사를 건너뜁니다. 이 상황은 Severstal 이미지
+        (1600x256)에서 512x512 ROI 창이 맞지 않아 발생합니다.
+
+        Args:
+            df: ROI metadata DataFrame (roi_bbox, defect_bbox 컬럼 필요)
+            edge_margin: ROI 크기 대비 최소 마진 비율 (기본 0.1 = 10%)
+
+        Returns:
+            edge-flagged 샘플이 제거된 DataFrame
+        """
+        if 'roi_bbox' not in df.columns or 'defect_bbox' not in df.columns:
+            print("Edge filter: roi_bbox/defect_bbox columns not found, skipping")
+            return df
+
+        original_len = len(df)
+        exclude_indices = []
+        skipped_identical = 0
+
+        for idx, row in df.iterrows():
+            roi_bbox = row['roi_bbox']
+            defect_bbox = row['defect_bbox']
+
+            # Convert string tuples if needed
+            if isinstance(roi_bbox, str):
+                roi_bbox = eval(roi_bbox)
+            if isinstance(defect_bbox, str):
+                defect_bbox = eval(defect_bbox)
+
+            # roi_bbox == defect_bbox이면 ROI 최적화 실패로 결함 bbox를
+            # 그대로 사용한 것이므로 edge 검사가 무의미 (margin 항상 0).
+            # 이 경우 검사를 건너뛰고 샘플을 유지합니다.
+            if tuple(roi_bbox) == tuple(defect_bbox):
+                skipped_identical += 1
+                continue
+
+            roi_x1, roi_y1, roi_x2, roi_y2 = roi_bbox
+            def_x1, def_y1, def_x2, def_y2 = defect_bbox
+
+            roi_width = roi_x2 - roi_x1
+            roi_height = roi_y2 - roi_y1
+
+            # Skip if dimensions are zero to avoid division issues
+            if roi_width <= 0 or roi_height <= 0:
+                exclude_indices.append(idx)
+                continue
+
+            edge_issues = []
+            if (def_x1 - roi_x1) < roi_width * edge_margin:
+                edge_issues.append("left")
+            if (roi_x2 - def_x2) < roi_width * edge_margin:
+                edge_issues.append("right")
+            if (def_y1 - roi_y1) < roi_height * edge_margin:
+                edge_issues.append("top")
+            if (roi_y2 - def_y2) < roi_height * edge_margin:
+                edge_issues.append("bottom")
+
+            if edge_issues:
+                exclude_indices.append(idx)
+                image_id = row.get('image_id', 'unknown')
+                class_id = row.get('class_id', '?')
+                print(f"  Edge filter excluded: {image_id} (Class {class_id}) "
+                      f"- too close to {', '.join(edge_issues)} edge")
+
+        df = df.drop(index=exclude_indices).reset_index(drop=True)
+        removed = original_len - len(df)
+        print(f"Edge filter: {original_len} -> {len(df)} "
+              f"({removed} removed, {removed/max(original_len,1)*100:.1f}%)")
+        if skipped_identical > 0:
+            print(f"  ({skipped_identical} samples with roi_bbox==defect_bbox, "
+                  f"edge check skipped)")
+
+        return df
+
+    def _quality_filter(self, df: pd.DataFrame,
+                        min_area: int = 100,
+                        min_stability: float = 0.3,
+                        min_matching: float = 0.5,
+                        allowed_recommendations: Optional[List[str]] = None,
+                        ) -> pd.DataFrame:
+        """
+        품질 기준으로 ROI를 필터링합니다.
+
+        v2에서 50개 샘플만 사용하여 overfitting이 발생했으므로,
+        v3에서는 500개 샘플을 목표로 하되 품질 기준을 충족하는 ROI만 사용합니다.
+
+        Args:
+            df: ROI metadata DataFrame
+            min_area: 최소 결함 영역 (px). 너무 작은 결함은 hint가 불명확함.
+            min_stability: 최소 stability_score. 낮으면 마스크 품질이 불안정.
+            min_matching: 최소 matching_score. 낮으면 hint-target 불일치 가능.
+            allowed_recommendations: 허용할 recommendation 값 목록.
+                기본값: ['suitable', 'acceptable']
+
+        Returns:
+            필터링된 DataFrame
+        """
+        if allowed_recommendations is None:
+            allowed_recommendations = ['suitable', 'acceptable']
+
+        original_len = len(df)
+
+        # 1. recommendation 필터
+        if 'recommendation' in df.columns:
+            df = df[df['recommendation'].isin(allowed_recommendations)]
+
+        # 2. area 필터
+        if 'area' in df.columns:
+            df = df[df['area'] >= min_area]
+
+        # 3. stability_score 필터
+        if 'stability_score' in df.columns:
+            df = df[df['stability_score'] >= min_stability]
+
+        # 4. matching_score 필터
+        if 'matching_score' in df.columns:
+            df = df[df['matching_score'] >= min_matching]
+
+        filtered_len = len(df)
+        removed = original_len - filtered_len
+        print(f"Quality filter: {original_len} -> {filtered_len} "
+              f"({removed} removed, {removed/max(original_len,1)*100:.1f}%)")
+        print(f"  Criteria: area>={min_area}, stability>={min_stability}, "
+              f"matching>={min_matching}, recommendation in {allowed_recommendations}")
+
+        if 'class_id' in df.columns:
+            class_dist = df['class_id'].value_counts().sort_index()
+            print(f"  Post-filter class distribution: {dict(class_dist)}")
+
+        return df.reset_index(drop=True)
+
+    def _stratified_sample(self, df: pd.DataFrame, n_samples: int) -> pd.DataFrame:
+        """
+        클래스별 균등 분포로 샘플링합니다 (품질 우선 + 다양성 고려).
+        
+        v2에서는 random sampling을 사용했으나, v3에서는:
+        - suitability_score 기준으로 상위 샘플 우선 선택
+        - defect_subtype, background_type의 다양성을 보장
+        
+        각 클래스에서 동일한 수의 샘플을 추출하되,
+        샘플 수가 부족한 클래스는 가용한 전체 샘플을 사용하고
+        남은 할당량은 다른 클래스에 재분배합니다.
+        
+        Args:
+            df: ROI metadata DataFrame (class_id 컬럼 필요)
+            n_samples: 추출할 총 샘플 수
+            
+        Returns:
+            균등 분포로 샘플링된 DataFrame
+        """
+        if 'class_id' not in df.columns:
+            # class_id가 없으면 suitability_score 기반 상위 선택
+            if 'suitability_score' in df.columns:
+                return df.nlargest(min(n_samples, len(df)), 'suitability_score')
+            return df.sample(n=min(n_samples, len(df)), random_state=42)
+        
+        classes = sorted(df['class_id'].unique())
+        n_classes = len(classes)
+        
+        # 각 클래스별 균등 할당
+        per_class = n_samples // n_classes
+        remainder = n_samples % n_classes
+        
+        sampled_parts = []
+        deficit = 0  # 부족한 클래스에서 채우지 못한 수
+        
+        has_suitability = 'suitability_score' in df.columns
+        has_subtype = 'defect_subtype' in df.columns
+        has_bg = 'background_type' in df.columns
+        
+        for i, cls in enumerate(classes):
+            cls_df = df[df['class_id'] == cls].copy()
+            # 나머지는 앞쪽 클래스에 1개씩 추가 할당
+            target = per_class + (1 if i < remainder else 0)
+            
+            if len(cls_df) <= target:
+                # 부족한 클래스: 전체 사용
+                sampled_parts.append(cls_df)
+                deficit += target - len(cls_df)
+            else:
+                # 다양성 보장 샘플링
+                selected = self._diverse_select(cls_df, target,
+                                                has_suitability, has_subtype, has_bg)
+                sampled_parts.append(selected)
+        
+        # 부족분 재분배: 여유가 있는 클래스에서 추가 샘플링
+        if deficit > 0:
+            already_sampled_idx = pd.concat(sampled_parts).index
+            remaining_df = df[~df.index.isin(already_sampled_idx)]
+            
+            if len(remaining_df) > 0:
+                if has_suitability:
+                    additional = remaining_df.nlargest(
+                        min(deficit, len(remaining_df)), 'suitability_score'
+                    )
+                else:
+                    additional = remaining_df.sample(
+                        n=min(deficit, len(remaining_df)), random_state=42
+                    )
+                sampled_parts.append(additional)
+        
+        result = pd.concat(sampled_parts).reset_index(drop=True)
+        
+        # 다양성 통계 출력
+        if has_subtype:
+            subtype_counts = result['defect_subtype'].value_counts()
+            print(f"  Defect subtype diversity: {len(subtype_counts)} types")
+        if has_bg:
+            bg_counts = result['background_type'].value_counts()
+            print(f"  Background type diversity: {len(bg_counts)} types")
+        
+        return result
+    
+    def _diverse_select(self, cls_df: pd.DataFrame, target: int,
+                        has_suitability: bool, has_subtype: bool,
+                        has_bg: bool) -> pd.DataFrame:
+        """
+        다양성을 고려한 샘플 선택.
+        
+        전략:
+        1. defect_subtype과 background_type의 조합별로 그룹화
+        2. 각 그룹에서 suitability_score 상위 샘플을 라운드로빈으로 선택
+        3. 그룹이 없으면 suitability_score 상위 선택
+        """
+        if not (has_subtype or has_bg):
+            # 다양성 기준 없음 - suitability_score 상위 선택
+            if has_suitability:
+                return cls_df.nlargest(target, 'suitability_score')
+            return cls_df.sample(n=target, random_state=42)
+        
+        # 다양성 그룹 키 생성
+        if has_subtype and has_bg:
+            cls_df = cls_df.copy()
+            cls_df['_diversity_key'] = (
+                cls_df['defect_subtype'].astype(str) + '|' +
+                cls_df['background_type'].astype(str)
+            )
+        elif has_subtype:
+            cls_df = cls_df.copy()
+            cls_df['_diversity_key'] = cls_df['defect_subtype'].astype(str)
+        else:
+            cls_df = cls_df.copy()
+            cls_df['_diversity_key'] = cls_df['background_type'].astype(str)
+        
+        # 각 그룹을 suitability_score 내림차순으로 정렬
+        groups = {}
+        for key, group_df in cls_df.groupby('_diversity_key'):
+            if has_suitability:
+                groups[key] = group_df.sort_values(
+                    'suitability_score', ascending=False
+                ).index.tolist()
+            else:
+                groups[key] = group_df.index.tolist()
+        
+        # 라운드로빈으로 선택
+        selected_indices = []
+        group_keys = sorted(groups.keys())
+        group_pointers = {k: 0 for k in group_keys}
+        
+        while len(selected_indices) < target:
+            added_this_round = False
+            for key in group_keys:
+                if len(selected_indices) >= target:
+                    break
+                ptr = group_pointers[key]
+                if ptr < len(groups[key]):
+                    selected_indices.append(groups[key][ptr])
+                    group_pointers[key] = ptr + 1
+                    added_this_round = True
+            if not added_this_round:
+                break  # 모든 그룹 소진
+        
+        result = cls_df.loc[selected_indices]
+        if '_diversity_key' in result.columns:
+            result = result.drop(columns=['_diversity_key'])
+        return result
+    
+    def package_single_roi(self, roi_data: Dict, 
+                          roi_image: np.ndarray,
+                          roi_mask: np.ndarray,
+                          output_dir: Path) -> Dict:
+        """
+        Package a single ROI with hint image and metadata.
+        
+        Args:
+            roi_data: ROI metadata dictionary
+            roi_image: ROI image array (H, W, 3)
+            roi_mask: ROI mask array (H, W)
+            output_dir: Output directory
+            
+        Returns:
+            Updated roi_data with hint_path and prompt
+        """
+        # Generate hint image
+        hint_image = self.hint_generator.generate_hint_image(
+            roi_image=roi_image,
+            roi_mask=roi_mask,
+            defect_metrics=roi_data,
+            background_type=roi_data.get('background_type', 'smooth'),
+            stability_score=roi_data.get('stability_score', 0.5)
+        )
+        
+        # Save hint image
+        hint_dir = output_dir / 'hints'
+        hint_dir.mkdir(parents=True, exist_ok=True)
+        
+        image_id = roi_data['image_id']
+        class_id = roi_data['class_id']
+        region_id = roi_data['region_id']
+        hint_filename = f"{image_id}_class{class_id}_region{region_id}_hint.png"
+        hint_path = hint_dir / hint_filename
+        
+        self.hint_generator.save_hint_image(hint_image, hint_path)
+        
+        # Generate prompt
+        prompt = self.prompt_generator.generate_prompt(
+            defect_subtype=roi_data.get('defect_subtype', 'general'),
+            background_type=roi_data.get('background_type', 'smooth'),
+            class_id=class_id,
+            stability_score=roi_data.get('stability_score', 0.5),
+            defect_metrics=roi_data,
+            suitability_score=roi_data.get('suitability_score', 0.5)
+        )
+        
+        negative_prompt = self.prompt_generator.generate_negative_prompt()
+        
+        # Update roi_data
+        roi_data['hint_path'] = str(hint_path)
+        roi_data['prompt'] = prompt
+        roi_data['negative_prompt'] = negative_prompt
+        
+        return roi_data
+    
+    def create_train_jsonl(self, roi_metadata: List[Dict], 
+                          output_path: Path,
+                          relative_paths: bool = True,
+                          base_dir: Optional[Path] = None):
+        """
+        Create train.jsonl file for ControlNet training.
+        
+        Format per line:
+        {
+            "source": "path/to/roi_image.png",
+            "target": "path/to/roi_image.png",  # Same as source for this task
+            "prompt": "a linear scratch on vertical striped metal surface...",
+            "hint": "path/to/hint_image.png",
+            "negative_prompt": "blurry, low quality..."
+        }
+        
+        Args:
+            roi_metadata: List of ROI metadata dictionaries
+            output_path: Path to save train.jsonl
+            relative_paths: Use relative paths instead of absolute
+            base_dir: Base directory for relative paths
+        """
+        jsonl_lines = []
+        
+        for roi_data in roi_metadata:
+            # Get paths
+            source_path = roi_data.get('roi_image_path', '')
+            hint_path = roi_data.get('hint_path', '')
+            
+            if relative_paths and base_dir:
+                try:
+                    source_path = Path(source_path).relative_to(base_dir)
+                    hint_path = Path(hint_path).relative_to(base_dir)
+                except ValueError:
+                    pass  # Keep absolute if relative conversion fails
+            
+            entry = {
+                "source": str(source_path),
+                "target": str(source_path),  # For defect generation, target = source
+                "prompt": roi_data.get('prompt', ''),
+                "hint": str(hint_path),
+                "negative_prompt": roi_data.get('negative_prompt', '')
+            }
+            
+            jsonl_lines.append(entry)
+        
+        # Write JSONL file
+        with open(output_path, 'w') as f:
+            for entry in jsonl_lines:
+                f.write(json.dumps(entry) + '\n')
+        
+        print(f"Created train.jsonl with {len(jsonl_lines)} entries at: {output_path}")
+    
+    def create_metadata_json(self, roi_metadata: List[Dict], 
+                            output_path: Path):
+        """
+        Create comprehensive metadata JSON file.
+        
+        Args:
+            roi_metadata: List of ROI metadata dictionaries
+            output_path: Path to save metadata.json
+        """
+        metadata = {
+            'dataset_name': 'Severstal Steel Defect Detection - ControlNet Training Set',
+            'total_samples': len(roi_metadata),
+            'format': 'ControlNet training format with multi-channel hints',
+            'channels': {
+                'red': 'Defect mask with 4-indicator enhancement',
+                'green': 'Background structure lines (edge information)',
+                'blue': 'Background fine texture'
+            },
+            'prompt_structure': '[Defect characteristics] + [Background type] + [Surface condition]',
+            'samples': roi_metadata
+        }
+        
+        with open(output_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"Created metadata.json at: {output_path}")
+    
+    def package_dataset(self, roi_metadata_df: pd.DataFrame,
+                       train_images_dir: Path,
+                       train_csv: Path,
+                       output_dir: Path,
+                       create_hints: bool = True,
+                       max_samples: Optional[int] = None,
+                       quality_filter: bool = True,
+                       min_area: int = 100,
+                       min_stability: float = 0.3,
+                       min_matching: float = 0.5) -> Path:
+        """
+        Package complete dataset for ControlNet training.
+        
+        Args:
+            roi_metadata_df: DataFrame with ROI metadata from ROI extraction
+            train_images_dir: Directory with original training images
+            train_csv: Path to train.csv with RLE annotations
+            output_dir: Output directory for packaged dataset
+            create_hints: Whether to generate hint images
+            max_samples: Maximum number of samples to package.
+                v2에서 50개로 overfitting이 발생했으므로, v3에서는 500 권장.
+            quality_filter: 품질 필터 적용 여부 (기본: True)
+            min_area: 최소 결함 영역 (px, 기본: 100)
+            min_stability: 최소 stability_score (기본: 0.3)
+            min_matching: 최소 matching_score (기본: 0.5)
+            
+        Returns:
+            Path to output directory
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        print("="*80)
+        print("ControlNet Dataset Packaging")
+        print("="*80)
+        print(f"Input: {len(roi_metadata_df)} ROIs")
+        print(f"Output: {output_dir}")
+        print(f"Create hints: {create_hints}")
+        print(f"Quality filter: {quality_filter}")
+        print("="*80)
+        
+        # Load train.csv for mask decoding
+        train_df = pd.read_csv(train_csv)
+        
+        # Edge proximity 필터 적용 (결함이 ROI 경계에 너무 가까운 샘플 제외)
+        roi_metadata_df = self._edge_filter(roi_metadata_df)
+
+        # 품질 필터 적용
+        if quality_filter:
+            roi_metadata_df = self._quality_filter(
+                roi_metadata_df,
+                min_area=min_area,
+                min_stability=min_stability,
+                min_matching=min_matching,
+            )
+        
+        # Limit samples if specified (stratified sampling by class)
+        if max_samples and max_samples < len(roi_metadata_df):
+            roi_metadata_df = self._stratified_sample(roi_metadata_df, max_samples)
+            print(f"Stratified sampling: {max_samples} samples selected")
+            if 'class_id' in roi_metadata_df.columns:
+                class_dist = roi_metadata_df['class_id'].value_counts().sort_index()
+                print(f"  Class distribution: {dict(class_dist)}")
+        
+        packaged_data = []
+        
+        # Process each ROI
+        for idx, row in tqdm(roi_metadata_df.iterrows(), 
+                            total=len(roi_metadata_df),
+                            desc="Packaging ROIs"):
+            
+            roi_data = row.to_dict()
+            
+            # Load ROI image
+            roi_image_path = Path(row['roi_image_path'])
+            if not roi_image_path.exists():
+                print(f"Warning: Image not found: {roi_image_path}")
+                continue
+            
+            roi_image = cv2.imread(str(roi_image_path))
+            roi_image_rgb = cv2.cvtColor(roi_image, cv2.COLOR_BGR2RGB)
+            
+            # Load ROI mask
+            roi_mask_path = Path(row['roi_mask_path'])
+            if not roi_mask_path.exists():
+                print(f"Warning: Mask not found: {roi_mask_path}")
+                continue
+            
+            roi_mask = cv2.imread(str(roi_mask_path), cv2.IMREAD_GRAYSCALE)
+            roi_mask = (roi_mask > 0).astype(np.uint8)
+            
+            # Package this ROI
+            if create_hints:
+                roi_data = self.package_single_roi(
+                    roi_data=roi_data,
+                    roi_image=roi_image_rgb,
+                    roi_mask=roi_mask,
+                    output_dir=output_dir
+                )
+            else:
+                # Just generate prompts
+                prompt = self.prompt_generator.generate_prompt(
+                    defect_subtype=roi_data.get('defect_subtype', 'general'),
+                    background_type=roi_data.get('background_type', 'smooth'),
+                    class_id=roi_data['class_id'],
+                    stability_score=roi_data.get('stability_score', 0.5),
+                    defect_metrics=roi_data,
+                    suitability_score=roi_data.get('suitability_score', 0.5)
+                )
+                roi_data['prompt'] = prompt
+                roi_data['negative_prompt'] = self.prompt_generator.generate_negative_prompt()
+            
+            packaged_data.append(roi_data)
+        
+        print(f"\nSuccessfully packaged {len(packaged_data)} ROIs")
+        
+        # Create train.jsonl
+        print("\nCreating train.jsonl...")
+        train_jsonl_path = output_dir / 'train.jsonl'
+        self.create_train_jsonl(
+            packaged_data, 
+            train_jsonl_path,
+            relative_paths=True,
+            base_dir=output_dir
+        )
+        
+        # Create metadata.json
+        print("\nCreating metadata.json...")
+        metadata_path = output_dir / 'metadata.json'
+        self.create_metadata_json(packaged_data, metadata_path)
+        
+        # Save updated ROI metadata
+        print("\nSaving updated ROI metadata...")
+        packaged_df = pd.DataFrame(packaged_data)
+        packaged_csv = output_dir / 'packaged_roi_metadata.csv'
+        packaged_df.to_csv(packaged_csv, index=False)
+        print(f"Saved to: {packaged_csv}")
+        
+        # Create summary
+        summary = {
+            'total_packaged': len(packaged_data),
+            'hints_created': create_hints,
+            'output_directory': str(output_dir),
+            'train_jsonl': str(train_jsonl_path),
+            'metadata_json': str(metadata_path)
+        }
+        
+        summary_path = output_dir / 'packaging_summary.txt'
+        with open(summary_path, 'w') as f:
+            f.write("ControlNet Dataset Packaging Summary\n")
+            f.write("="*80 + "\n\n")
+            for key, value in summary.items():
+                f.write(f"{key}: {value}\n")
+        
+        print(f"\nSummary saved to: {summary_path}")
+        print("\n" + "="*80)
+        print("Packaging complete!")
+        print("="*80)
+        
+        return output_dir

@@ -1,0 +1,506 @@
+20260221 작업 일지 #3 - 벤치마크 실험 코드 구현 (3 Models x 4 Groups = 12 Runs)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+작업 일지 #2 섹션 6 "다음 단계" 5번 항목 및 docs/experiment.md 설계 문서에 따라,
+CASDA 증강 효과를 정량적으로 검증하기 위한 벤치마크 실험 코드를 전면 구현한다.
+
+Data-centric AI 접근법에 따라 모델 아키텍처는 "고정된 측정 도구"로 사용하고,
+학습 데이터만 변경하여 CASDA 합성 데이터의 효과를 분리 측정한다.
+
+  - 3개 모델: YOLO-MFD, EB-YOLOv8, DeepLabV3+
+  - 4개 데이터셋 그룹: Baseline Raw, Baseline Trad, CASDA-Full, CASDA-Pruning
+  - 5개 가설 검증: H1~H5
+
+
+2. 실험 설계 요약
+================================================================================
+
+  | 구분           | 내용                                                    |
+  |----------------|---------------------------------------------------------|
+  | 독립 변수      | 학습 데이터셋 (4 groups)                                |
+  | 종속 변수      | mAP@0.5, per-class AP, Dice, IoU, FID                  |
+  | 통제 변수      | 모델 아키텍처, 하이퍼파라미터, seed(42), split 비율     |
+  | 실험 규모      | 3 x 4 = 12 training runs                               |
+  | 데이터 분할    | train 70% / val 15% / test 15% (stratified)            |
+
+  가설:
+  H1: CASDA > Traditional augmentation (mAP)
+  H2: CASDA-Pruning > CASDA-Full (효율성)
+  H3: CASDA 효과가 아키텍처 독립적
+  H4: CASDA가 소수 클래스(Class 3, 4) 개선
+  H5: CASDA 합성 이미지의 물리적 타당성 (FID)
+
+
+3. 변경 파일
+================================================================================
+
+  | 파일                                  | 상태 | 라인 | 변경 내용                                |
+  |---------------------------------------|------|------|------------------------------------------|
+  | configs/benchmark_experiment.yaml     | 신규 | 197  | 실험 전체 설정 (모델/데이터/평가/가설)   |
+  | src/models/__init__.py                | 신규 |  14  | 모델 모듈 exports                        |
+  | src/models/yolo_mfd.py                | 신규 | 469  | YOLO-MFD 모델 (MEFE 모듈 포함)          |
+  | src/models/eb_yolov8.py               | 신규 | 422  | EB-YOLOv8 모델 (BiFPN 포함)             |
+  | src/models/deeplabv3plus.py           | 신규 | 266  | DeepLabV3+ 세그멘테이션 모델            |
+  | src/training/__init__.py              | 신규 |  36  | 학습 모듈 exports                        |
+  | src/training/dataset.py               | 신규 | 729  | 데이터셋 로더 및 4 그룹 파이프라인       |
+  | src/training/trainer.py               | 신규 | 398  | 통합 트레이너 (조기 종료, 스케줄링)      |
+  | src/training/metrics.py               | 신규 | 560  | 평가 메트릭 (mAP, Dice, FID, 리포터)    |
+  | scripts/run_benchmark.py              | 신규 | 492  | 벤치마크 실행 오케스트레이터             |
+  | scripts/analyze_benchmark_results.py  | 신규 | 435  | 결과 분석 및 시각화                      |
+  | requirements.txt                      | 수정 |  47  | scipy>=1.7.0, lpips>=0.1.4 추가          |
+  |---------------------------------------|------|------|------------------------------------------|
+  | 합계                                  |      |4,065 | 신규 11 + 수정 1 = 12 파일               |
+
+
+4. 모듈별 상세 설명
+================================================================================
+
+4.1 설정 파일 (configs/benchmark_experiment.yaml, 197줄)
+---------------------------------------------------------
+YAML 형식으로 실험 전체를 단일 파일에서 관리한다.
+
+  - experiment: 실험 이름(casda_benchmark_v1), seed(42), device, 출력 경로
+  - dataset: Severstal 이미지 경로, 256x1600 해상도, 4클래스, 7:1.5:1.5 분할
+  - dataset.casda: CASDA-Full(5,000장)/Pruning(2,000장, suitability≥0.7) 경로
+  - dataset_groups: 4개 그룹 정의
+    - baseline_raw: 원본만, augmentation 없음
+    - baseline_trad: 원본 + 기하학적 증강 (flip, rotation±15, scale 0.8~1.2 등)
+    - casda_full: 원본 + CASDA 5,000장
+    - casda_pruning: 원본 + CASDA 상위 2,000장
+  - models: 3개 모델 하이퍼파라미터
+    - YOLO-MFD/EB-YOLOv8: epochs 100, batch 16, AdamW lr=0.001, cosine LR
+    - DeepLabV3+: epochs 100, batch 8, AdamW lr=0.0001, poly LR (power=0.9)
+  - evaluation: mAP@0.5, per-class AP, PR curve, Dice, IoU, FID(dims=2048)
+  - reporting: hypothesis_tests H1~H5 정의 (비교 대상 그룹, 메트릭, focus 클래스)
+
+
+4.2 YOLO-MFD (src/models/yolo_mfd.py, 469줄)
+----------------------------------------------
+2025 YOLO-MFD 논문 기반. YOLOv8에 MEFE 모듈을 추가하여 미세 결함 검출 강화.
+
+주요 클래스:
+  - SobelEdgeExtractor: Sobel 커널(3x3)로 x/y 방향 에지 추출, magnitude 계산
+  - MEFEModule: 3개 스케일(1x1, 3x3, 5x5) 에지 특징 + 채널 어텐션(SE block)
+    → 에지 특징과 원본 feature map을 concat 후 fusion
+  - YOLOBackbone: CSP 기반 4-stage backbone (C3k2 블록), stride 4/8/16/32
+  - PANetNeck: FPN top-down + PAN bottom-up 경로로 P3/P4/P5 생성
+  - DetectionHead: 각 스케일별 cls/reg 분리 헤드
+  - YOLOMFD: 통합 모델 클래스
+    - compute_loss(): CIoU bbox loss + BCE cls loss (가중 합산)
+    - predict(): forward + NMS로 최종 검출 결과 반환
+    - nms(): confidence 필터링 → IoU 기반 NMS
+
+특징:
+  - MEFE가 backbone의 각 스케일 출력에 에지 정보를 주입
+  - 채널 어텐션으로 에지/텍스처 특징의 중요도를 적응적으로 조절
+  - 미세 결함(Class 3, 4)에 효과적인 multi-scale 에지 표현
+
+
+4.3 EB-YOLOv8 (src/models/eb_yolov8.py, 422줄)
+-------------------------------------------------
+2025 EB-YOLOv8 논문 기반. BiFPN으로 양방향 특징 융합을 수행.
+
+주요 클래스:
+  - ConvBNSiLU: Conv + BN + SiLU 기본 블록
+  - C2fBlock: CSP Bottleneck with 2 convolutions (YOLOv8 표준)
+  - SPPF: Spatial Pyramid Pooling Fast (5x5 maxpool 3회 연쇄)
+  - BiFPNLayer: 단일 BiFPN 레이어
+    - Fast normalized fusion: w_i / (Σw_j + ε) 가중 합산
+    - Top-down (P5→P4→P3) + Bottom-up (P3→P4→P5) 양방향
+  - StackedBiFPN: BiFPN 3층 스택 (반복 정제)
+  - DecoupledHead: cls/reg 분리 (각 branch 2층 conv)
+  - EBYOLOv8: 통합 모델 클래스
+    - backbone 4단계 + SPPF + BiFPN neck + 3-scale decoupled heads
+    - compute_loss()/predict()/nms(): YOLO-MFD와 동일 인터페이스
+
+특징:
+  - Fast normalized fusion으로 학습 안정성 확보 (softmax 대비 경량)
+  - 3-layer stacking으로 P3~P5 간 정보 반복 교환
+  - Decoupled head로 분류/회귀 분리 → 수렴 속도 향상
+
+
+4.4 DeepLabV3+ (src/models/deeplabv3plus.py, 266줄)
+-----------------------------------------------------
+Severstal 세그멘테이션 기준 모델. ResNet-101 backbone + ASPP + decoder.
+
+주요 클래스:
+  - ASPPConv: Atrous convolution (dilation rate별)
+  - ASPPPooling: Global average pooling → 1x1 conv → upsample
+  - ASPP: 1x1 conv + rate 6/12/18 atrous conv + GAP → concat → project
+  - DeepLabDecoder: low-level feature(layer1, 48ch) + ASPP 출력 concat → 3x3 conv
+  - DeepLabV3Plus: 통합 모델 클래스
+    - ResNet-101 pretrained backbone (torchvision, graceful fallback)
+    - output_stride=16, 256x512 입력
+    - compute_loss(): BCE + Dice 결합 손실 (0.5 + 0.5)
+    - predict(): sigmoid → threshold 0.5 → 4-class mask
+
+특징:
+  - torchvision 없을 때 graceful fallback (HAS_TORCHVISION 플래그)
+  - BCE + Dice loss 조합으로 클래스 불균형 대응
+  - Detection 모델과 다른 관점(픽셀 단위)에서 CASDA 효과 측정
+
+
+4.5 데이터셋 로더 (src/training/dataset.py, 729줄)
+----------------------------------------------------
+4개 데이터셋 그룹을 통합 관리하는 데이터 파이프라인.
+
+주요 클래스:
+  - SeverstalDetectionDataset: YOLO bbox 형식 (RLE → mask → bounding box)
+    - train.csv의 ImageId_ClassId 결합/분리 칼럼 모두 지원
+    - mask에서 connected component → bbox 추출
+    - [class_id, x_center, y_center, w, h] 정규화 좌표 반환
+  - SeverstalSegmentationDataset: 4-class 멀티 클래스 마스크 반환
+    - 256x1600 원본 → 지정 크기로 리사이즈
+    - (H, W, C) 형태의 바이너리 마스크 (C=4)
+  - CASDASyntheticDataset: CASDA 합성 이미지 전용 로더
+    - JSON 메타데이터 (suitability_score, class_id 등) 파싱
+    - 디렉토리 내 이미지 + 마스크 자동 매핑
+  - create_data_loaders(): 4 그룹 DataLoader 생성 핵심 함수
+    - ConcatDataset으로 원본 + 합성 데이터 결합
+    - stratified split (train_test_split) 사용
+    - albumentations 변환 (traditional augmentation 그룹)
+
+  기존 src/utils/rle_utils.py의 rle_decode() 함수를 import하여 사용.
+
+
+4.6 통합 트레이너 (src/training/trainer.py, 398줄)
+----------------------------------------------------
+Detection과 Segmentation 모델을 모두 지원하는 범용 학습 루프.
+
+주요 클래스:
+  - EarlyStopping: patience 기반 조기 종료 (max/min 모드)
+  - BenchmarkTrainer: 핵심 트레이너
+    - AdamW optimizer (모델별 lr/weight_decay)
+    - LR 스케줄러: cosine (detection), poly (segmentation)
+    - Warmup: 처음 N epochs linear warmup
+    - Gradient clipping (max_norm=10.0)
+    - TensorBoard 로깅 (선택적)
+    - Best model checkpointing (val metric 기준)
+    - train_one_epoch() → validate() → early_stopping_check
+    - 학습 이력 JSON 저장 (epoch별 loss/metric)
+
+
+4.7 평가 메트릭 (src/training/metrics.py, 560줄)
+--------------------------------------------------
+Detection/Segmentation/FID/Reporting 4개 평가 체계.
+
+주요 클래스:
+  - compute_iou() / compute_iou_matrix(): 박스 IoU 유틸리티
+  - DetectionEvaluator:
+    - mAP@0.5 계산 (전체 + per-class AP)
+    - Precision-Recall 커브 생성
+    - confidence 기반 매칭 (IoU threshold greedy matching)
+  - SegmentationEvaluator:
+    - Dice Score (전체 + per-class)
+    - IoU (전체 + per-class)
+    - threshold 적용 후 TP/FP/FN 집계
+  - FIDCalculator:
+    - InceptionV3 feature 추출 (dims=2048)
+    - Frechet Distance 계산 (mean/covariance 비교)
+    - per-class FID 지원
+  - BenchmarkReporter:
+    - 12 runs 결과를 JSON + CSV로 통합 저장
+    - 가설 검증 요약 (H1~H5 비교 결과)
+
+
+4.8 벤치마크 실행기 (scripts/run_benchmark.py, 492줄)
+------------------------------------------------------
+12 training runs 전체를 오케스트레이션하는 메인 스크립트.
+
+기능:
+  - CLI 인터페이스:
+    --config: YAML 설정 파일 경로
+    --models: 실행할 모델 선택 (예: yolo_mfd eb_yolov8)
+    --groups: 실행할 그룹 선택 (예: baseline_raw casda_pruning)
+    --fid-only: FID 계산만 수행
+    --device: cuda/cpu 지정
+  - create_model(): 모델 팩토리 (model_key → 모델 인스턴스)
+  - run_single_experiment(): 단일 (model, group) 조합 학습 + 평가
+  - run_fid_evaluation(): CASDA 합성 이미지 FID 계산
+  - run_hypothesis_tests(): H1~H5 통계 검증 수행
+  - main(): 전체 파이프라인 (12 runs → FID → 가설 검증 → 리포트)
+
+실행 흐름:
+  1) YAML 설정 로드
+  2) models × groups 조합 생성 (필터링 가능)
+  3) 각 조합에 대해 DataLoader 생성 → 모델 생성 → 학습 → 평가
+  4) FID 계산 (CASDA-Full/Pruning vs 원본)
+  5) H1~H5 가설 검증 (그룹 간 메트릭 비교)
+  6) BenchmarkReporter로 통합 결과 저장
+
+
+4.9 결과 분석 도구 (scripts/analyze_benchmark_results.py, 435줄)
+-----------------------------------------------------------------
+벤치마크 완료 후 결과를 시각화하고 논문용 표를 생성.
+
+기능:
+  - Markdown 비교 표 (모델 × 그룹 매트릭스)
+  - LaTeX 비교 표 (논문 삽입용)
+  - 모델별/그룹별 성능 막대 차트 (matplotlib)
+  - PR 커브 시각화
+  - 학습 곡선 (train/val loss + metric)
+  - 가설별 개선률(%) 계산 및 요약
+  - scipy.stats를 이용한 통계 검정 (paired t-test 등)
+
+
+5. 설계 결정 사항
+================================================================================
+
+5.1 아키텍처 동결 (Data-centric AI)
+------------------------------------
+모델 아키텍처와 하이퍼파라미터를 고정하고 데이터만 변경함으로써,
+성능 차이가 순수하게 데이터 품질/양에 의한 것임을 보장한다.
+YOLO-MFD/EB-YOLOv8은 동일한 training config (lr=0.001, cosine, epochs 100),
+DeepLabV3+만 세그멘테이션 특성에 맞게 별도 설정 (lr=0.0001, poly).
+
+5.2 Detection + Segmentation 이중 검증
+---------------------------------------
+Detection 모델 2개(YOLO-MFD, EB-YOLOv8)와 Segmentation 모델 1개(DeepLabV3+)를
+포함하여, bbox 수준과 pixel 수준 모두에서 CASDA 효과를 검증한다.
+H3(아키텍처 독립성) 가설을 위해 3개 모델 모두에서 일관된 개선을 확인.
+
+5.3 Graceful Dependency Handling
+---------------------------------
+모든 모듈에서 선택적 의존성을 try/except로 처리:
+  - torchvision: DeepLabV3+ pretrained backbone
+  - albumentations: Traditional augmentation
+  - tensorboard: 학습 로깅
+  - matplotlib: 차트 생성
+  - scipy: 통계 검정
+Colab 환경에서 누락된 패키지가 있어도 핵심 기능이 동작하도록 설계.
+
+5.4 기존 유틸리티 재사용
+--------------------------
+src/utils/rle_utils.py의 rle_decode() 함수를 SeverstalDetectionDataset과
+SeverstalSegmentationDataset에서 import하여 사용. 기존 코드와의 일관성 유지.
+
+5.5 Colab 최적화
+------------------
+로컬 환경에 PyTorch가 설치되어 있지 않으므로 (ast.parse 수준의 문법 검증만 수행),
+실제 실행은 Colab에서 이루어진다. 배치 크기, 메모리 사용량 등을 T4 GPU 기준으로 설정.
+
+
+6. ControlNet v4 검증 결과 (outputs/test_results_v4)
+================================================================================
+
+Colab에서 실행한 ControlNet v4 모델의 4단계 검증 결과를 분석한다.
+검증 파이프라인: Phase 1(기본 생성) → Phase 2(하이퍼파라미터) → Phase 3(일반화) → Phase 4(학습 리포트)
+
+  전체 결과: 4개 Phase 모두 PASS
+  결과 위치: outputs/test_results_v4/
+
+
+6.1 Phase 1 — 기본 생성 (967 samples)
+--------------------------------------
+전체 학습 데이터 967개 샘플에 대해 합성 이미지를 1장씩 생성.
+
+  | 항목              | 값                                                      |
+  |-------------------|---------------------------------------------------------|
+  | 생성 성공률       | 967/967 (100%)                                          |
+  | 모델              | controlnet_training_v4/best_model                       |
+  | Inference Steps   | 30                                                      |
+  | Guidance Scale    | 7.5                                                     |
+  | Seed              | 42                                                      |
+  | 판정              | PASS                                                    |
+
+  품질 메트릭 (967 samples 평균):
+  | 메트릭            | 값     | 해석                                          |
+  |-------------------|--------|-----------------------------------------------|
+  | Quality Score     | 0.6254 | 종합 품질 (가중 평균)                         |
+  | Color Consistency | 0.6541 | 그레이스케일 철강 이미지 특성상 변별력 제한적 |
+  | Artifact Score    | 0.9258 | 우수 — 시각적 아티팩트 거의 없음              |
+  | Sharpness         | 0.8830 | 양호 — 이미지가 선명함                        |
+  | SSIM              | 0.0269 | 매우 낮음 — hint↔생성 이미지 구조 차이 큼     |
+  | LPIPS             | 0.5774 | 중간 — 의미 있는 지각적 다양성 존재           |
+
+  클래스별 분포:
+  | 클래스   | 샘플 수 | 비율   |
+  |----------|---------|--------|
+  | Class 1  |     217 | 22.4%  |
+  | Class 2  |      96 |  9.9%  |
+  | Class 3  |     404 | 41.8%  |
+  | Class 4  |     250 | 25.9%  |
+
+  분석:
+  - Artifact Score 0.93은 생성 이미지에 눈에 띄는 결함이 거의 없다는 의미
+  - SSIM 0.027은 Canny edge hint와 생성 이미지 간 구조적 유사도가 낮음을 나타냄
+    → 이는 작업일지 #2에서 언급한 기존 한계 (hint는 에지, 생성물은 사실적 텍스처)
+  - LPIPS 0.58은 원본과 생성 이미지 간 적절한 지각적 거리를 보여줌
+  - Class 2(9.9%)가 가장 적어 소수 클래스 증강 시 우선 대상
+
+
+6.2 Phase 2 — 하이퍼파라미터 탐색 (11 combinations)
+-----------------------------------------------------
+3개 파라미터(guidance_scale, inference_steps, seed)를 변경하며 품질 변화를 측정.
+
+  6.2.1 Guidance Scale (각 4장 평가)
+  | guidance_scale | Quality | Artifact | Sharpness | SSIM   | LPIPS  |
+  |----------------|---------|----------|-----------|--------|--------|
+  | 3.0            | 0.6301  | 0.8992   | 0.9347    | 0.0469 | 0.5560 |
+  | 5.0            | 0.6242  | 0.8872   | 0.9172    | 0.0490 | 0.5532 |
+  | 7.5            | 0.6151  | 0.8680   | 0.8904    | 0.0518 | 0.5484 |
+  | 10.0           | 0.6078  | 0.8469   | 0.8722    | 0.0551 | 0.5453 |
+
+  → guidance_scale이 낮을수록 품질 점수가 높음 (3.0=0.6301 > 10.0=0.6078)
+  → 단조 감소 패턴: Artifact와 Sharpness 모두 낮은 guidance에서 우수
+  → 높은 guidance는 과도한 조건 추종으로 인해 아티팩트 증가 가능성
+
+  6.2.2 Inference Steps (각 4장 평가)
+  | steps | Quality | Artifact | Sharpness | SSIM   | LPIPS  |
+  |-------|---------|----------|-----------|--------|--------|
+  | 20    | 0.6153  | 0.8689   | 0.8902    | 0.0517 | 0.5481 |
+  | 30    | 0.6151  | 0.8680   | 0.8904    | 0.0518 | 0.5484 |
+  | 50    | 0.6152  | 0.8680   | 0.8906    | 0.0519 | 0.5484 |
+
+  → 3개 설정 간 품질 차이가 거의 없음 (0.6151~0.6153)
+  → steps=20으로도 충분 → 대량 생성 시 속도 최적화 가능 (30 대비 33% 단축)
+
+  6.2.3 Seed 변동 (각 1장 평가)
+  | seed | Quality | Artifact | Sharpness | SSIM   | LPIPS  |
+  |------|---------|----------|-----------|--------|--------|
+  | 42   | 0.6416  | 0.8204   | 1.0000    | 0.0666 | 0.5162 |
+  | 123  | 0.6320  | 0.8900   | 0.9325    | 0.0576 | 0.5741 |
+  | 456  | 0.6340  | 0.8021   | 1.0000    | 0.0200 | 0.5236 |
+  | 789  | 0.6370  | 0.8021   | 0.9936    | 0.1080 | 0.5554 |
+
+  → seed 간 품질 차이 소폭 (0.632~0.642), 모델이 seed에 강건함
+  → seed=789의 SSIM=0.108이 특이적으로 높음 (다른 seed 대비 2~5배)
+  → 통계적 유의성은 제한적 (각 1장만 평가)
+
+  Best Combination: seed=42 (Quality Score = 0.6416)
+
+
+6.3 Phase 3 — 미학습 데이터 일반화 (12 unseen samples)
+------------------------------------------------------
+학습에 사용되지 않은 12개 샘플로 과적합 여부를 검증.
+
+  | 항목              | 값                                                      |
+  |-------------------|---------------------------------------------------------|
+  | 테스트 샘플       | 12/12 (4 classes × 3 samples)                           |
+  | Quality Score     | 0.6316                                                  |
+  | Color Consistency | 0.6500                                                  |
+  | Artifact Score    | 0.9269                                                  |
+  | Sharpness         | 0.9103                                                  |
+  | SSIM              | 0.0313                                                  |
+  | LPIPS             | 0.5703                                                  |
+  | 판정              | PASS                                                    |
+
+  샘플별 품질 점수:
+  | 샘플                           | Class | Quality | Artifact | SSIM   | LPIPS  |
+  |--------------------------------|-------|---------|----------|--------|--------|
+  | 9d57d9095_class1_region0       |   1   | 0.6358  | 0.9955   | 0.0044 | 0.5629 |
+  | c22accc84_class1_region0       |   1   | 0.6209  | 0.8863   | 0.0149 | 0.5126 |
+  | 8f8a23f39_class1_region1       |   1   | 0.6105  | 0.9522   | 0.0641 | 0.6149 |
+  | 3fe32ff2f_class2_region1       |   2   | 0.6512  | 0.9018   | 0.0412 | 0.5359 |
+  | 8b9c035ec_class2_region0       |   2   | 0.6703  | 0.9660   | 0.0568 | 0.4667 |
+  | 68cc04a14_class2_region0       |   2   | 0.6146  | 0.9010   | 0.0075 | 0.5516 |
+  | 5fa81f2b5_class3_region0       |   3   | 0.6716  | 1.0000   | 0.0436 | 0.5204 |
+  | e8fefd824_class3_region0       |   3   | 0.6524  | 1.0000   | 0.0347 | 0.5310 |
+  | 09e15218c_class3_region1       |   3   | 0.5806  | 0.9449   | 0.0072 | 0.7891 |
+  | f41732c94_class4_region1       |   4   | 0.6307  | 0.7984   | 0.0713 | 0.5648 |
+  | 374d9c63f_class4_region0       |   4   | 0.6256  | 0.7765   | 0.0000 | 0.4981 |
+  | f4495532f_class4_region0       |   4   | 0.6148  | 1.0000   | 0.0295 | 0.6960 |
+
+  Phase 1 vs Phase 3 비교:
+  | 메트릭         | Phase 1 (학습) | Phase 3 (미학습) | 차이    |
+  |----------------|----------------|------------------|---------|
+  | Quality Score  | 0.6254         | 0.6316           | +0.0062 |
+  | Artifact       | 0.9258         | 0.9269           | +0.0011 |
+  | Sharpness      | 0.8830         | 0.9103           | +0.0273 |
+  | SSIM           | 0.0269         | 0.0313           | +0.0044 |
+  | LPIPS          | 0.5774         | 0.5703           | -0.0071 |
+
+  분석:
+  - Phase 3 품질(0.6316)이 Phase 1(0.6254)보다 오히려 약간 높음 → 과적합 없음
+  - 모든 메트릭에서 Phase 1과 Phase 3 차이가 미미함 (최대 ±0.03)
+  - 샘플별 품질 범위: 0.5806 ~ 0.6716 (표준 편차 약 0.025)
+  - Class 4의 Artifact Score가 상대적으로 낮음 (0.78~0.80) → 작은 blob 결함 생성이 어려울 수 있음
+  - 09e15218c_class3의 LPIPS=0.789는 전체 최고값 → 해당 샘플의 지각적 차이가 큼
+
+
+6.4 Phase 4 — 학습 통계 및 리포트
+-----------------------------------
+24 epochs, 578 steps 학습 과정의 loss 분석.
+
+  | 항목          | 값                                                        |
+  |---------------|-----------------------------------------------------------|
+  | Total Steps   | 578                                                       |
+  | Total Epochs  | 24                                                        |
+  | Loss Mean     | 0.2371                                                    |
+  | Loss Median   | 0.2342                                                    |
+  | Loss Std      | 0.0278                                                    |
+  | Loss Min      | 0.1768 (step 4280)                                        |
+  | Loss Max      | 0.4363 (step 20, 학습 초기)                               |
+  | Final Loss    | 0.2245                                                    |
+  | NaN 발생      | 0회                                                       |
+
+  학습 곡선 분석 (phase4_report/training_loss_curve.png):
+  - 학습 초기 (epoch 0): loss 0.44 → 0.24 급격 감소
+  - epoch 1 이후: loss 0.23~0.24에서 수렴, 추가 개선 미미
+  - epoch 평균 loss: epoch 0 = 0.31, epoch 1~23 = 0.23~0.24 (평탄)
+  - 최소 loss(0.177)는 step 4280에서 발생하나 전반적 추세와 큰 차이 없음
+
+  시각화 파일:
+  - phase4_report/training_loss_curve.png     : 전체 step별 loss 곡선
+  - phase4_report/epoch_avg_loss.png          : epoch 평균 loss 추이
+  - phase4_report/phase2_parameter_comparison.png : guidance scale별 생성 비교
+
+
+6.5 종합 분석
+--------------
+
+  강점:
+  - 4개 Phase 모두 PASS — 모델이 기능적으로 정상 동작
+  - Artifact Score 0.93 — 생성 이미지에 눈에 띄는 결함 거의 없음
+  - 과적합 없음 — 미학습 데이터에서도 동등 이상의 품질
+  - Seed 강건성 — seed 변경에도 품질 안정적 (0.632~0.642)
+  - Steps 무관 — 20 steps면 충분, 대량 생성 시 속도 이점
+
+  우려 사항:
+  - SSIM 매우 낮음 (0.02~0.07): edge hint와 생성 이미지 간 구조적 정렬이 약함
+    → 작업일지 #2에서 Canny edge 추출 후 비교하는 v2 메트릭으로 수정했으나
+       여전히 낮은 값 → ControlNet 조건 추종력에 한계가 있을 수 있음
+  - Color Score 0.65 고정: 그레이스케일 이미지 특성상 변별력 부재
+    → 메트릭 자체의 의미가 제한적, 실질적 품질 판단에 기여도 낮음
+  - 학습 조기 수렴: epoch 1에서 이미 수렴, 24 epochs 대부분이 불필요
+    → 데이터셋(967장)이 작아서 모델 용량 대비 빠르게 학습 완료
+    → 과적합 위험은 낮지만, 표현력의 한계 가능성
+  - Guidance Scale 역설: 낮은 guidance(3.0)가 높은 품질 → 조건 추종보다
+    자유 생성이 나은 상태 → ControlNet 조건부 학습이 최적화되지 않았을 가능성
+
+  5,000장 대량 생성을 위한 권장 설정:
+  | 파라미터         | 권장값 | 근거                                           |
+  |------------------|--------|------------------------------------------------|
+  | inference_steps  | 20     | 품질 동일, 속도 33% 향상 (30→20)               |
+  | guidance_scale   | 3.0    | Phase 2에서 최고 품질 (0.6301)                  |
+  | seed             | 다양화 | 이미지별 서로 다른 seed로 다양성 확보           |
+
+  결론:
+  - ControlNet v4 모델은 기본적인 합성 이미지 생성 능력을 확보
+  - 품질 점수 0.63 수준은 벤치마크 실험용 합성 데이터로 사용 가능한 수준
+  - 단, SSIM이 낮아 결함 위치의 정밀한 조건 추종은 기대하기 어려움
+  - 5,000장 대량 생성 시 steps=20, gs=3.0으로 속도-품질 최적화 권장
+  - 최종 품질 판단은 벤치마크 실험(H1~H5)의 하류 성능으로 결정해야 함
+
+
+7. 다음 단계
+================================================================================
+  1. 5,000장 합성 이미지 생성 (steps=20, gs=3.0, 다양한 seed)
+  2. CASDA-Pruning 선별 (suitability >= 0.7 → 상위 2,000장)
+  3. 벤치마크 실험 실행 (scripts/run_benchmark.py → 12 training runs)
+  4. 결과 분석 및 가설 검증 (scripts/analyze_benchmark_results.py)
+
+
+8. 문법 검증
+================================================================================
+  ast.parse(src/models/yolo_mfd.py)               → OK
+  ast.parse(src/models/eb_yolov8.py)               → OK
+  ast.parse(src/models/deeplabv3plus.py)            → OK
+  ast.parse(src/training/dataset.py)                → OK
+  ast.parse(src/training/trainer.py)                → OK
+  ast.parse(src/training/metrics.py)                → OK
+  ast.parse(scripts/run_benchmark.py)               → OK
+  ast.parse(scripts/analyze_benchmark_results.py)   → OK
+  yaml.safe_load(configs/benchmark_experiment.yaml) → OK

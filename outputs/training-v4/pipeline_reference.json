@@ -1,0 +1,6 @@
+{
+  "note": "Full pipeline was not saved (--skip_save_pipeline).",
+  "base_model": "runwayml/stable-diffusion-v1-5",
+  "controlnet_path": "/content/drive/MyDrive/data/Severstal/controlnet_training_v4/best_model",
+  "usage": "Load with: ControlNetModel.from_pretrained(controlnet_path) + StableDiffusionControlNetPipeline.from_pretrained(base_model, controlnet=...)"
+}

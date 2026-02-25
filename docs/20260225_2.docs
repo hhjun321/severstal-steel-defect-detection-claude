@@ -1,0 +1,417 @@
+20260225 작업 일지 #2 - ControlNet v4 품질 불량 원인 분석 (실험 데이터 기반 재진단)
+================================================================================
+
+[전 문서 20260225_1.docs 와의 차이]
+outputs/ 실험 결과 파일 직접 분석으로 이전 진단 3개 항목이 사실과 달랐음을 확인.
+본 문서가 최종 진단이며 이전 문서의 관련 항목을 대체한다.
+
+  수정된 항목:
+    ❌ 이전: "training_config.json이 controlnet_dataset(원본) 참조" (Major)
+    ✅ 실제: data_dir = controlnet_dataset_v4 (1,000 samples) — 정상
+
+    ❌ 이전: "lr_scheduler = constant_with_warmup" (Medium)
+    ✅ 실제: lr_scheduler = cosine — 정상
+
+    ❌ 이전: "578 optimizer steps만 수행" (Major)
+    ✅ 실제: total_steps=578 = 로그 항목 수 (매 10 스텝 기록)
+             실제 optimizer steps = 578 × 10 = 5,780
+             24 epoch × 250 steps/epoch = 6,000 ≈ 5,780 (early stopping) — 정상
+
+
+1. 분석 대상 파일
+================================================================================
+
+  파일                                        | 날짜       | 크기
+  --------------------------------------------|-----------|--------
+  outputs/training-v4/training_config.json    | 2026-02-19 | 1.2 KB
+  outputs/training-v4/training_log.json       | 2026-02-20 | 62 KB
+  outputs/training-v4/pipeline_reference.json | 2026-02-20 | 367 B
+  outputs/result-v4/training_stats.json       | 2026-02-25 | 328 B
+  outputs/result-v4/validation_report_phase4.txt | 2026-02-25 | 2.0 KB
+  outputs/result-v4/phase2_summary.json       | 2026-02-20 | 5.2 KB
+  outputs/result-v4/validation_results.json   | 2026-02-20 | 74 B
+  outputs/control-dataset-v4/metadata.json    | 2026-02-18 | 1.3 MB
+  outputs/control-dataset-v4/train.jsonl      | 2026-02-19 | 469 KB
+  outputs/control-dataset-v4/packaged_roi_metadata.csv | 2026-02-18 | 800 KB
+  outputs/roi-patch-v4/statistics.txt         | 2026-02-10 | 627 B
+
+
+2. 실험 결과 요약
+================================================================================
+
+2.1 학습 실행 현황 (training_config.json + training_stats.json + training_log.json)
+---------------------------------------------------------------------------------------
+
+  항목                     | 값                        | 상태
+  -------------------------|--------------------------|------
+  데이터셋                  | controlnet_dataset_v4     | ✅ 정상
+  학습 데이터 수             | 1,000 pairs               | ✅ 확인
+  lr_scheduler             | cosine                    | ✅ 정상
+  warmup_steps             | 100                       | ✅ 정상
+  최대 epochs              | 30                         | -
+  실제 종료 epochs          | 24 (early stopping)       | ℹ️ epoch 17 이후 개선 없음
+  총 optimizer steps       | 5,780 (578 로그항목 × 10) | ✅ 계획대로
+  steps/epoch              | 250 (1000 samples / grad_accum 4) | ✅ 정상
+  loss_min                 | 0.1768 @ step 4,280       | ℹ️ epoch 17에서 최솟값
+  final_loss               | 0.2245                    | -
+  loss 수렴 구간            | 0.22–0.25 (epoch 1 ~ 24)  | ⚠️ 아래 분석
+
+  학습 손실 궤적:
+    step 10  (epoch 0) : 0.4346  [warmup 진행 중, LR = 5e-7]
+    step 100 (epoch 0) : 0.2826  [LR = 5e-6, warmup 완료]
+    step 250 (epoch 1) : 0.2279  [급격 하락 후 첫 epoch 완료]
+    step 320 (epoch 1) : 0.1865  [epoch 1 내 최솟값]
+    step 4280(epoch 17): 0.1768  [전체 최솟값 — best_model 저장 시점]
+    step 5780(epoch 23): 0.2245  [early stopping 트리거 직전 최종값]
+
+2.2 검증 결과 (validation_report_phase4.txt + phase2_summary.json)
+--------------------------------------------------------------------
+
+  Phase 1 (967 samples, guidance=7.5, steps=30):
+    quality_score      = 0.6254
+    color_consistency  = 0.6541
+    artifact_score     = 0.9258   ← 높음 (아티팩트 거의 없음)
+    sharpness_score    = 0.8830   ← 높음 (선명)
+    SSIM               = 0.0269   ← 매우 낮음 ← 핵심 문제
+    LPIPS              = 0.5774   ← 높음 (지각적 불일치)
+
+  Phase 2 guidance_scale 실험 (4 samples each):
+    gs=3.0  → quality=0.6301, SSIM=0.0469, LPIPS=0.5560
+    gs=5.0  → quality=0.6242, SSIM=0.0490, LPIPS=0.5532
+    gs=7.5  → quality=0.6151, SSIM=0.0518, LPIPS=0.5484
+    gs=10.0 → quality=0.6078, SSIM=0.0551, LPIPS=0.5453
+
+    관측: guidance ↑ → quality ↓ / SSIM ↑ (미세) / LPIPS ↓ (미세)
+    → 아래 3.5절 상세 분석
+
+  Phase 3 (unseen 12 samples):
+    quality=0.6316, SSIM=0.0313, LPIPS=0.5703
+    → Phase 1 대비 큰 차이 없음 (미약한 일반화)
+
+
+3. 원인 분석
+================================================================================
+
+3.1 [Critical] train.jsonl: source == target (동일 파일 참조)
+--------------------------------------------------------------
+
+  train.jsonl 직접 확인 결과:
+    "source": "roi_patches/images/6b634bbe9.jpg_class1_region2.png"
+    "target": "roi_patches/images/6b634bbe9.jpg_class1_region2.png"
+    → source와 target이 동일한 파일
+
+  ControlNet 학습 원리:
+    - target → VAE 인코딩 → 노이즈 추가 → UNet + ControlNet이 노이즈 제거
+    - 학습 목표: hint + text_prompt 조건으로 target을 복원
+    - force_grayscale_target=True → 실제 학습 target = grayscale(source)
+
+  문제:
+    학습 시: "hint + prompt가 주어지면 source(=target)의 그레이스케일을 복원하라"
+    추론 시: txt2img (순수 노이즈 → 생성) → source 잠재 벡터 없음
+
+    모델이 학습한 것: "(특정 hint, 특정 prompt) → (특정 ROI patch의 그레이스케일)"
+    모델이 추론에서 하는 것: "hint만 주어짐 → 어떤 그레이스케일 이미지든 생성"
+
+    결과: 생성 이미지가 참조 ROI 패치와 공간적으로 무관
+    → SSIM ≈ 0 (서로 다른 콘텐츠 비교)
+
+  올바른 설계:
+    source = 배경 스트립 이미지 (결함 없는 영역)
+    target = 결함 삽입된 스트립 이미지
+    → img2img 추론: source를 시작점으로 hint 위치에 결함 생성
+
+3.2 [Critical] ROI 패치 극단적 업스케일 (10–40x)
+--------------------------------------------------
+
+  metadata.json / packaged_roi_metadata.csv에서 확인된 ROI 크기:
+
+    이미지 ID        | roi_bbox                | W×H(px) | 512 업스케일 배율
+    -----------------|------------------------|---------|------------------
+    d84ad849e.jpg    | (1412, 89, 1438, 125)  | 26×36   | 19.7× / 14.2×
+    8f8a23f39.jpg    | (1446, 59, 1466, 88)   | 20×29   | 25.6× / 17.7×
+    a335fc5cc.jpg    | (1484, 69, 1497, 98)   | 13×29   | 39.4× / 17.7×  ← 극단
+    2c113de25.jpg    | (709, 227, 734, 256)   | 25×29   | 20.5× / 17.7×
+    e2b3cf9a4.jpg    | (665, 148, 728, 208)   | 63×60   | 8.1× / 8.5×
+    9db16f031.jpg    | (729, 6, 765, 48)      | 36×42   | 14.2× / 12.2×
+
+  영향:
+    1) 13-40px 크기 결함을 512×512로 업스케일 → 극도로 흐릿한 블롭
+    2) 개별 픽셀이 수십 픽셀 크기의 블록으로 증폭
+    3) force_grayscale_target=True 결합 → 학습 target = "흐릿한 그레이스케일 블롭"
+    4) 모델이 정확히 학습한 것 = 흐릿한 그레이스케일 블롭 생성
+
+  statistics.txt 전체 ROI 통계:
+    총 16,011 ROIs, 평균 suitability=0.679
+    많은 ROI가 compact_blob (4,756개) / linear_scratch (4,273개) 유형
+    → 특히 compact_blob (class 1 대부분)이 매우 작은 크기
+
+3.3 [Critical] force_grayscale_target=True와 SSIM 측정 불일치
+--------------------------------------------------------------
+
+  학습:  target → grayscale → 모델 출력도 그레이스케일
+  추론:  생성 이미지 = 그레이스케일 (R=G=B)
+  평가:  SSIM(생성 이미지, 원본 ROI 패치)
+         → 원본 ROI는 컬러 (RGB 값 상이)
+         → 그레이스케일 생성 vs 컬러 참조 = 구조적 SSIM 저하
+
+  SSIM 공식: luma 채널 기반 → 그레이스케일 vs 컬러 비교 시 색상 차이로 인한 추가 불이익
+
+  가설: 만약 (그레이스케일 생성) vs (그레이스케일 변환 참조)로 비교했다면?
+    → 여전히 낮을 것 (3.1의 source=target 문제로 생성 콘텐츠 자체가 다름)
+    → 하지만 현재보다는 약간 높았을 가능성
+
+3.4 [Major] 커스텀 힌트 포맷과 sd-controlnet-canny 사전학습 불일치
+-------------------------------------------------------------------
+
+  사전학습 모델: lllyasviel/sd-controlnet-canny
+    → 이진 Canny 엣지맵 (0 또는 255, 흰색 엣지/검은 배경) 기대
+
+  실제 v4 힌트 (hint_generator.py):
+    R = 결함 마스크 (0-255, 연속값)
+    G = 배경 Sobel 엣지 (0-255, 연속값)
+    B = 텍스처 밀도 (0-255, 연속값)
+    → gray = R*0.5 + G*0.3 + B*0.2 → 3채널 동일 (R=G=B)
+
+  영향:
+    - ControlNet encoder가 Canny 엣지 통계를 기대하는 상황에서
+      완전히 다른 분포(그레이스케일 혼합)를 입력받음
+    - 5,780 optimizer steps / 1,000 samples는 새 힌트 분포로
+      ControlNet residuals를 완전히 재학습하기에 부족
+    - Phase 2: guidance_scale 높일수록 quality 감소
+      → conditioning residual이 올바른 공간 정보를 전달하지 못함
+      → 높은 guidance가 잘못된 conditioning을 증폭
+
+3.5 [Major] guidance_scale 역상관 패턴 해석
+---------------------------------------------
+
+  Phase 2 실험 (guidance_scale vs 지표):
+
+    gs  | quality | SSIM  | LPIPS | artifact | sharpness
+    ----|---------|-------|-------|----------|----------
+    3.0 | 0.6301  | 0.0469| 0.5560| 0.8992   | 0.9347
+    5.0 | 0.6242  | 0.0490| 0.5532| 0.8872   | 0.9172
+    7.5 | 0.6151  | 0.0518| 0.5484| 0.8680   | 0.8904
+    10.0| 0.6078  | 0.0551| 0.5453| 0.8469   | 0.8722
+
+  관측 패턴:
+    (a) quality, artifact, sharpness: guidance 증가 → 단조 감소
+    (b) SSIM: guidance 증가 → 미세 증가 (0.0469→0.0551)
+    (c) LPIPS: guidance 증가 → 미세 감소 (0.5560→0.5453, 즉 개선)
+
+  해석:
+    (a) 낮은 guidance → base SD가 주도 → 더 자연스럽고 clean한 이미지
+        높은 guidance → 잘못된 conditioning 증폭 → artifact, blur 증가
+
+    (b) (c) 높은 guidance → 더 결정론적(deterministic) 출력
+        → 샘플 간 분산 감소 → 특정 패턴이 반복되어 평균 SSIM/LPIPS가 미세 변동
+        → 통계적으로 유의미하지 않음 (Phase 2 샘플 n=4)
+
+    결론: 모델이 hint 조건을 제대로 활용하지 못하고 있음.
+    최적 guidance=3.0은 "conditioning을 약하게 반영할수록 품질이 더 좋다"는 것을 의미.
+
+3.6 [Major] Early stopping: epoch 17 이후 학습 정체
+----------------------------------------------------
+
+  training_log 분석:
+    - loss_min = 0.1768 @ step 4280 (epoch 17.1)
+    - 이후 steps: 0.20–0.28 사이 진동 (개선 없음)
+    - early_stopping_patience=5, validation_steps=0
+    → 학습 손실 기반 early stopping: epoch 17 이후 5 epoch 개선 없음
+    → epoch 22 종료 후 stopping trigger → epoch 23 도중 5,780 steps에서 중단
+
+  주의: early stopping이 학습 손실 기반이므로, 생성 품질 개선 여부와 무관하게
+  손실이 개선되지 않으면 학습을 중단함. 생성 품질과 학습 손실 간 괴리 존재.
+
+3.7 [Minor] Phase 2 샘플 크기 불충분
+--------------------------------------
+
+  guidance_scale 실험: n=4 samples each
+  seed 실험: n=1 sample each
+
+  통계적 신뢰도 문제:
+    - seed=42: SSIM=0.0666 (n=1) — 단일 샘플
+    - seed=789: SSIM=0.1080 (n=1) — 단일 샘플
+    → seed간 SSIM 분산이 큼 (0.0200 ~ 0.1080)
+    → Phase 2 결론의 통계적 신뢰성 제한적
+
+  권장: 최소 50-100 샘플로 재실험 필요
+
+
+4. 품질 점수 계산 구조 역산
+================================================================================
+
+  quality_score ≈ (color_consistency + artifact + sharpness + SSIM) / 4
+
+  검증:
+    Phase 1: (0.6541 + 0.9258 + 0.8830 + 0.0269) / 4 = 0.6225 ≈ 0.6254 ✓
+    gs=3.0:  (0.6323 + 0.8992 + 0.9347 + 0.0469) / 4 = 0.6283 ≈ 0.6301 ✓
+    gs=10.0: (0.6250 + 0.8469 + 0.8722 + 0.0551) / 4 = 0.5998 ≈ 0.6078 ✓
+
+  결론: SSIM이 quality_score를 크게 낮추는 주범.
+  SSIM이 0.4 수준이라면 quality_score ≈ 0.72+ 달성 가능.
+
+  성분별 현황:
+    color_consistency = 0.65: 그레이스케일 출력이 단색에 가까워 낮음
+    artifact_score    = 0.93: 업스케일된 블롭은 깨끗함 (아티팩트 없음)
+    sharpness_score   = 0.88: 블롭이지만 선명함 (업스케일 sharpening 효과)
+    SSIM              = 0.03: 참조 이미지와 완전 불일치
+
+
+5. 근본 설계 문제 (Architecture Mismatch)
+================================================================================
+
+  현재 설계 의도 (추정):
+    ROI 패치 → 힌트로 위치 지정 → ControlNet으로 유사 결함 생성
+    → 생성 이미지를 training augmentation에 사용
+
+  실제 구현 문제:
+    source = target = 동일 ROI 패치
+    모델이 학습하는 것: "(hint) → (특정 ROI 패치의 그레이스케일)"
+    모델이 추론하는 것: "(hint) → 임의의 그레이스케일 이미지"
+
+    이 두 가지는 같지 않음. img2img가 아닌 txt2img로 추론하면,
+    모델은 학습 시 봤던 1,000개 ROI 패치 분포에서 임의 샘플을 추출할 뿐.
+
+  ControlNet의 올바른 사용 패턴:
+    [결함 생성]:
+      source → (없음, txt2img) OR 배경 이미지(img2img)
+      hint   → Canny/depth/mask 형태의 구조 조건
+      output → hint 구조를 따르는 새 이미지
+
+    [결함 이식 (권장)]:
+      source → 결함이 없는 배경 영역 (원본 스트립 타일)
+      hint   → 결함 마스크 위치 (Canny 엣지)
+      output → 배경에 결함이 자연스럽게 합성된 이미지
+
+
+6. 진단 요약 (수정본)
+================================================================================
+
+  분류      | 원인                              | 증거
+  ----------|----------------------------------|-------------------------------------------
+  [Critical] | source == target (동일 파일)     | train.jsonl 직접 확인
+  [Critical] | ROI 극단 업스케일 (10–40×)       | metadata.json roi_bbox 분석 (13–63px)
+  [Critical] | force_grayscale_target=True      | training_config.json
+  [Major]    | 힌트 포맷 불일치 (커스텀 vs Canny)| guidance↑→quality↓ 패턴 (Phase 2)
+  [Major]    | epoch 17 이후 손실 정체 + early stop | training_log.json
+  [Major]    | SSIM 측정 불일치 (gray vs color) | validation_report + training_config
+  [Minor]    | Phase 2 샘플 n=1~4 (통계 부족)  | phase2_summary.json
+
+  ~~이전 오진断:~~
+    ~~잘못된 데이터셋 참조~~   → 정상 (controlnet_dataset_v4 사용)
+    ~~constant_with_warmup~~  → 정상 (cosine 사용)
+    ~~578 optimizer steps~~   → 정상 (5,780 steps = 24 epochs)
+
+
+7. v5 개선 방향 (실험 데이터 기반 수정)
+================================================================================
+
+7.1 [최우선] 학습 설계 재구성 — source ≠ target
+-------------------------------------------------
+
+  현재: source = target = ROI 패치 (동일 파일)
+  개선: source = 결함 없는 배경 타일, target = 동일 위치의 결함 있는 원본 타일
+
+  구체적 방법:
+    (a) 전체 스트립 이미지(256×1600) → 256×256 타일 분할
+    (b) 결함 마스크로 결함 포함 타일 식별
+    (c) 결함 영역을 주변 배경으로 인페인팅하여 "결함 없는 배경" 생성
+        (원본 = target, 인페인팅 결과 = source)
+    (d) 힌트 = 결함 마스크 위치 (Canny 에지)
+    (e) 학습: source + hint → target (결함이 있는 타일)
+
+  이렇게 하면 추론 시:
+    - 새 배경 타일 + 원하는 위치의 힌트 → 결함 삽입된 타일 생성
+
+7.2 [최우선] 힌트 → Canny 엣지 통일
+--------------------------------------
+
+  현재: R*0.5+G*0.3+B*0.2 그레이스케일 혼합
+  개선: 결함 마스크 경계의 Canny 엣지맵 (이진, 0/255)
+
+  근거:
+    - sd-controlnet-canny 사전학습 분포와 정렬
+    - Phase 2: guidance_scale을 높여도 conditioning이 강화되지 않음 →
+      현재 힌트가 유효한 공간 정보를 전달하지 못함을 시사
+    - Canny 엣지: 결함 경계를 명확히 지정 → 더 강한 위치 conditioning 가능
+
+7.3 [Major] force_grayscale_target 비활성화
+--------------------------------------------
+
+  현재: True → 학습 target 전체 그레이스케일 → SSIM 측정 불일치
+  개선: False → 컬러 원본 유지 → SSIM 측정 기준 일치
+
+  단, 이것만으로는 SSIM 개선 불충분.
+  7.1의 source/target 재설계와 함께 적용해야 의미 있음.
+
+7.4 [Major] 입력 해상도 전략 변경
+------------------------------------
+
+  현재: ROI 패치(13–63px) → Resize(512) = 8–40× 업스케일
+  개선: 타일 기반 (256×256 → 512×512 ×2)
+
+    방법 A: 결함 포함 원본 타일 그대로 (원본 스케일 유지)
+    방법 B: 결함 영역 중심 context-aware crop (결함+주변 배경 포함)
+            → 최소 padding을 줘서 업스케일 배율 최소화 (최대 4× 이내)
+
+  목표: 업스케일 배율 4× 이내, 결함 + 배경 텍스처 context 포함
+
+7.5 수정된 v5 권장 학습 설정
+-----------------------------
+
+  {
+    "base_model"                : "runwayml/stable-diffusion-v1-5",
+    "controlnet_model"          : "lllyasviel/sd-controlnet-canny",
+    "hint_type"                 : "canny_edge (defect mask boundary)",
+    "force_grayscale_target"    : false,
+    "source_target_design"      : "source=defect-removed-bg, target=original-with-defect",
+    "input_size"                : "256×256 tile → 512×512 (×2 upscale max)",
+    "train_batch_size"          : 4,
+    "gradient_accumulation"     : 1,
+    "num_train_epochs"          : 50,
+    "learning_rate"             : 5e-06,
+    "lr_scheduler"              : "cosine",
+    "lr_warmup_steps"           : 200,
+    "augment"                   : true,
+    "augment_ops"               : "flip, brightness, contrast",
+    "early_stopping_patience"   : 0,   ← 비활성화 (full 50 epoch 학습)
+    "validation_steps"          : 500, ← 검증 이미지로 FID/SSIM 측정
+    "dataset_size_target"       : "3,000+ pairs"
+  }
+
+  예상 총 스텝: 50 epoch × (3000/4) = 37,500 steps
+  Colab A100 예상 시간: 5–8시간
+
+
+8. 즉시 가능한 조치 (현재 벤치마크)
+================================================================================
+
+  8.1 CASDA-Full 벤치마크 계속 가능
+    - 2,901개 이미지 존재 (생성 품질 낮지만 데이터 파일은 정상)
+    - 'CASDA-Full 추가 시 mAP 변화' 측정은 여전히 가능
+    - 단, SSIM=0.027 수준의 이미지이므로 augmentation 효과 제한적 예상
+
+  8.2 CASDA-Pruning 그룹: v5 완료 전까지 실행 불가
+    - quality_score_stats.max=0.0 → threshold=0.7 기준 0장 통과
+    - package_casda_data.py --roi-metadata 옵션으로 ROI 점수 전파 후
+      threshold=0.50으로 낮추면 일부 이미지 확보 가능
+    - 단, 이미지 자체 품질(SSIM≈0) 문제는 해결 안 됨
+
+  8.3 Phase 2 재실험 권장 사항 (v5 완료 후)
+    - 현재 Phase 2: n=1~4 샘플 → 통계적 의미 없음
+    - v5 모델: 최소 n=50 샘플로 guidance_scale 실험
+
+
+9. 데이터 신뢰성 검증
+================================================================================
+
+  training_stats.json의 total_steps 해석 재확인:
+    total_steps  = 578    → 로그 항목 수 (매 10 스텝 기록)
+    last_step    = 5,780  (training_log.json 마지막 항목: step=5780, epoch=23)
+    total_epochs = 24     = 5780 / 250 steps_per_epoch = 23.1 ≈ 24 ✓
+    loss_min_step= 4,280  = optimizer step 값 (0 < 4280 < 5780) → 유효 ✓
+
+  pipeline_reference.json:
+    skip_save_pipeline=True → pipeline 전체 저장 안 됨
+    best_model 경로만 저장
+    → 추론 시 반드시 StableDiffusionControlNetPipeline + ControlNetModel 조합 필요

@@ -1,0 +1,200 @@
+# ============================================================================
+# CASDA Benchmark Experiment Configuration
+# 3 models x 4 dataset groups = 12 training runs
+# ============================================================================
+
+experiment:
+  name: "casda_benchmark_v1"
+  seed: 42
+  num_workers: 2
+  device: "cuda"
+  output_dir: "outputs/benchmark_results"
+  log_dir: "outputs/benchmark_logs"
+
+# ----------------------------------------------------------------------------
+# Dataset Configuration
+# ----------------------------------------------------------------------------
+dataset:
+  # Severstal Steel Defect Dataset
+  image_dir: "train_images"
+  annotation_csv: "train.csv"
+  image_size: [256, 1600]  # H x W (original Severstal dimensions)
+  num_classes: 4
+  class_names: ["Class1", "Class2", "Class3", "Class4"]
+
+  # Train / Validation / Test split
+  split:
+    train_ratio: 0.7
+    val_ratio: 0.15
+    test_ratio: 0.15
+    stratify: true  # stratify by class distribution
+    seed: 42
+
+  # CASDA synthetic data paths
+  casda:
+    full_dir: "data/augmented/casda_full"        # ~2,901 synthetic images (ControlNet v4, 3 gens/sample)
+    pruning_dir: "data/augmented/casda_pruning"    # top-K by suitability (threshold >= 0.63, ~P50)
+    suitability_threshold: 0.63
+    pruning_top_k: 2000
+
+# ----------------------------------------------------------------------------
+# 4 Dataset Groups (Control Groups)
+# ----------------------------------------------------------------------------
+dataset_groups:
+  baseline_raw:
+    name: "Baseline (Raw)"
+    description: "Severstal original dataset only, no augmentation"
+    use_original: true
+    augmentation: "none"
+    casda_data: null
+
+  baseline_trad:
+    name: "Baseline (Trad)"
+    description: "Original + traditional geometric augmentations"
+    use_original: true
+    augmentation: "traditional"
+    casda_data: null
+    traditional_augmentation:
+      horizontal_flip: 0.5
+      vertical_flip: 0.3
+      rotation_limit: 15
+      scale_range: [0.8, 1.2]
+      brightness_limit: 0.2
+      contrast_limit: 0.2
+
+  casda_full:
+    name: "CASDA-Full"
+    description: "Original + all ~2,901 CASDA synthetic images (3 gens × 967 samples)"
+    use_original: true
+    augmentation: "none"
+    casda_data: "full"
+
+  casda_pruning:
+    name: "CASDA-Pruning"
+    description: "Original + top CASDA images by suitability score (threshold >= 0.63, ~P50)"
+    use_original: true
+    augmentation: "none"
+    casda_data: "pruning"
+
+# ----------------------------------------------------------------------------
+# 3 Benchmark Models
+# ----------------------------------------------------------------------------
+models:
+  yolo_mfd:
+    name: "YOLO-MFD"
+    type: "detection"
+    description: "Multi-scale Edge Feature Enhancement for micro-defect detection"
+    backbone: "yolov8s"  # base architecture
+    custom_modules:
+      mefe: true  # Multi-scale Edge Feature Enhancement module
+    input_size: [640, 640]  # max side=640; rect=True auto-adjusts for 256x1600
+    training:
+      epochs: 300
+      batch_size: 16
+      optimizer: "AdamW"
+      learning_rate: 0.001
+      weight_decay: 0.0005
+      lr_scheduler: "cosine"
+      warmup_epochs: 10
+      early_stopping_patience: 30
+      conf_threshold: 0.25
+      iou_threshold: 0.5
+      use_amp: true  # Mixed Precision Training (T4 Tensor Core)
+
+  eb_yolov8:
+    name: "EB-YOLOv8"
+    type: "detection"
+    description: "BiFPN-based compound feature fusion for Severstal benchmark"
+    backbone: "yolov8s"
+    custom_modules:
+      bifpn: true  # Bi-directional Feature Pyramid Network
+      enhanced_backbone: true
+    input_size: [640, 640]  # max side=640; rect=True auto-adjusts for 256x1600
+    training:
+      epochs: 300
+      batch_size: 16
+      optimizer: "AdamW"
+      learning_rate: 0.001
+      weight_decay: 0.0005
+      lr_scheduler: "cosine"
+      warmup_epochs: 10
+      early_stopping_patience: 30
+      conf_threshold: 0.25
+      iou_threshold: 0.5
+      use_amp: true
+
+  deeplabv3plus:
+    name: "DeepLabV3+"
+    type: "segmentation"
+    description: "Standard segmentation baseline for Severstal analysis"
+    backbone: "resnet101"
+    pretrained: true
+    output_stride: 16
+    input_size: [256, 512]  # resized for segmentation
+    training:
+      epochs: 300
+      batch_size: 8
+      optimizer: "AdamW"
+      learning_rate: 0.0001
+      weight_decay: 0.0001
+      lr_scheduler: "poly"
+      poly_power: 0.9
+      warmup_epochs: 5
+      early_stopping_patience: 40
+      use_amp: true
+
+# ----------------------------------------------------------------------------
+# Evaluation Configuration
+# ----------------------------------------------------------------------------
+evaluation:
+  # Detection metrics
+  detection:
+    iou_thresholds: [0.5]  # mAP@0.5
+    conf_threshold: 0.25
+    compute_class_ap: true  # per-class AP
+    compute_pr_curve: true  # Precision-Recall curves
+
+  # Segmentation metrics
+  segmentation:
+    compute_dice: true
+    compute_iou: true
+    compute_class_dice: true  # per-class Dice score
+    threshold: 0.5
+
+  # FID Score (synthetic data quality)
+  fid:
+    compute: true
+    batch_size: 64
+    dims: 2048  # InceptionV3 feature dimension
+    per_class: true  # class-wise FID
+
+# ----------------------------------------------------------------------------
+# Results Reporting
+# ----------------------------------------------------------------------------
+reporting:
+  save_metrics_csv: true
+  save_pr_curves: true
+  save_confusion_matrix: true
+  generate_comparison_table: true
+  hypothesis_tests:
+    - name: "H1"
+      description: "CASDA > Traditional augmentation (mAP)"
+      compare: ["casda_full", "baseline_trad"]
+      metric: "mAP@0.5"
+    - name: "H2"
+      description: "Pruning > Full (efficiency)"
+      compare: ["casda_pruning", "casda_full"]
+      metric: "mAP@0.5"
+    - name: "H3"
+      description: "CASDA effect is architecture-independent"
+      compare: ["casda_pruning", "baseline_raw"]
+      metric: "mAP@0.5"
+      across_models: true
+    - name: "H4"
+      description: "CASDA improves minority classes (3, 4)"
+      compare: ["casda_pruning", "baseline_raw"]
+      metric: "class_ap"
+      focus_classes: [3, 4]
+    - name: "H5"
+      description: "CASDA images are physically plausible (FID)"
+      metric: "fid_score"

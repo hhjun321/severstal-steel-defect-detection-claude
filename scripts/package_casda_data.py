@@ -41,7 +41,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -50,7 +50,7 @@ import numpy as np
 def parse_class_id_from_filename(filename: str) -> int:
     """
     Extract 0-indexed class_id from filename.
-    
+
     Filename patterns:
       - 6b634bbe9.jpg_class1_region2_gen0.png  → class_id=0
       - 008d0f87b.jpg_class3_region2_gen0.png  → class_id=2
@@ -59,6 +59,43 @@ def parse_class_id_from_filename(filename: str) -> int:
     if match:
         return int(match.group(1)) - 1  # 1-indexed → 0-indexed
     raise ValueError(f"Cannot parse class_id from filename: {filename}")
+
+
+def parse_roi_key_from_filename(filename: str) -> Tuple[str, int, int]:
+    """
+    Extract (image_id, 1-indexed class_id, region_id) from generated filename.
+
+    Example:
+      '454d794dc.jpg_class4_region0_gen0.png' → ('454d794dc.jpg', 4, 0)
+
+    Returns:
+        (image_id_with_ext, class_id_1indexed, region_id)
+
+    Raises:
+        ValueError if filename does not match expected pattern.
+    """
+    m = re.match(r"(.+\.jpg)_class(\d+)_region(\d+)_gen\d+\.png$", filename)
+    if m:
+        return m.group(1), int(m.group(2)), int(m.group(3))
+    raise ValueError(f"Cannot parse ROI key from filename: {filename}")
+
+
+def build_roi_suitability_map(roi_metadata_csv: Path) -> Dict[Tuple[str, int, int], float]:
+    """
+    roi_metadata.csv에서 (image_id, 1indexed_class_id, region_id) → suitability_score 맵 생성.
+
+    roi_metadata.csv 컬럼: image_id, class_id(1-indexed), region_id, suitability_score, ...
+
+    Returns:
+        {(image_id, class_id_1indexed, region_id): suitability_score}
+    """
+    import pandas as pd
+    df = pd.read_csv(roi_metadata_csv)
+    mapping: Dict[Tuple[str, int, int], float] = {}
+    for _, row in df.iterrows():
+        key = (str(row['image_id']), int(row['class_id']), int(row['region_id']))
+        mapping[key] = float(row['suitability_score'])
+    return mapping
 
 
 def extract_mask_from_hint(hint_path: str, threshold: int = 127) -> Optional[np.ndarray]:
@@ -210,6 +247,7 @@ def package_data(
     hint_dir: Path,
     output_dir: Path,
     quality_json: Optional[Path] = None,
+    roi_metadata: Optional[Path] = None,
     suitability_threshold: float = 0.63,
     pruning_top_k: int = 2000,
     mask_threshold: int = 127,
@@ -221,13 +259,19 @@ def package_data(
     print(f"Loading summary: {summary_json}")
     with open(summary_json) as f:
         summary = json.load(f)
-    
+
     total_samples = summary.get("total_samples", 0)
     print(f"Total samples in summary: {total_samples}")
-    
+
     # Build lookup maps
     quality_map = build_quality_map(summary, quality_json_path=quality_json)
     sample_name_map = build_sample_name_to_result(summary)
+
+    # ROI suitability map (최우선 점수 소스)
+    roi_map: Dict[Tuple[str, int, int], float] = {}
+    if roi_metadata and roi_metadata.exists():
+        roi_map = build_roi_suitability_map(roi_metadata)
+        print(f"ROI suitability map loaded: {len(roi_map)} entries from {roi_metadata}")
     
     # Count real quality entries (exclude the fallback key)
     real_quality_count = len([k for k in quality_map if k != "__sample_name_fallback__"])
@@ -273,8 +317,16 @@ def package_data(
             skipped_class_parse += 1
             continue
         
-        # Get quality score (with sample-name fallback for multi-generation)
+        # suitability_score 결정 (우선순위: roi_map > quality_map > default)
         suitability_score = get_quality_score(quality_map, filename, default=default_score)
+        if roi_map:
+            try:
+                img_id, cls_1indexed, region_id = parse_roi_key_from_filename(filename)
+                roi_key = (img_id, cls_1indexed, region_id)
+                if roi_key in roi_map:
+                    suitability_score = roi_map[roi_key]
+            except ValueError:
+                pass  # 파일명 파싱 실패 시 quality_map 값 유지
         
         # Find hint image for mask extraction
         # Try from results[] first (has exact hint_path), then construct from sample_name
@@ -480,6 +532,15 @@ def main():
         help="Output directory (will create casda_full/ and casda_pruning/ inside)",
     )
     parser.add_argument(
+        "--roi-metadata",
+        type=str,
+        default=None,
+        help="roi_metadata.csv 경로. image_id / class_id / region_id / suitability_score "
+             "컬럼을 가진 CSV. 지정 시 생성 이미지 파일명에서 ROI 키를 파싱하여 "
+             "suitability_score를 전파한다 (quality_json보다 우선). "
+             "예: data/processed/roi_patches/roi_metadata.csv",
+    )
+    parser.add_argument(
         "--quality-json",
         type=str,
         default=None,
@@ -522,6 +583,7 @@ def main():
         hint_dir=Path(args.hint_dir),
         output_dir=Path(args.output_dir),
         quality_json=Path(args.quality_json) if args.quality_json else None,
+        roi_metadata=Path(args.roi_metadata) if args.roi_metadata else None,
         suitability_threshold=args.suitability_threshold,
         pruning_top_k=args.pruning_top_k,
         mask_threshold=args.mask_threshold,

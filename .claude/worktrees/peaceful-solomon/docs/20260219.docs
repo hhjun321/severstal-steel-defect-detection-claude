@@ -1,0 +1,409 @@
+20260219 작업 일지 - prepare_controlnet_data.py 실행 에러 수정
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+prepare_controlnet_data.py 실행 시 발생한 3건의 에러/경고를 분석하고 수정한다.
+
+  에러 목록:
+  (1) bb9bfedfd.jpg (Class 4): Defect too close to left edge, Defect too close to right edge
+  (2) dataset_validator.py:181: UserWarning: Glyph 65039 (VARIATION SELECTOR-16)
+      missing from font(s) DejaVu Sans Mono
+  (3) dataset_validator.py:350: UserWarning: Glyph 10060 (CROSS MARK)
+      missing from font(s) DejaVu Sans
+
+2. 원인 분석
+--------------------------------------------------------------------------------
+
+2-1. Edge Defect 경고 (bb9bfedfd.jpg)
+
+  발생 위치: src/utils/dataset_validator.py (visual_check_sample 메서드, line 261-266)
+
+  원인:
+  - DatasetValidator.visual_check_sample()은 결함(defect bbox)이 ROI 경계로부터
+    10% 마진 이내에 위치하면 경고를 출력함
+  - bb9bfedfd.jpg의 Class 4 결함은 ROI 폭 전체에 가깝게 분포하여
+    좌측/우측 경계 모두 10% 마진을 위반
+  - 이 경고는 DatasetValidator에서 출력만 하고, 실제 패키징 시점에서는
+    해당 샘플을 제외하지 않았음 (기존 로직의 맹점)
+
+  판단:
+  - ROI 경계에 결함이 밀착된 샘플은 hint 이미지에서 결함 영역이 잘리거나
+    배경 컨텍스트가 부족하여 ControlNet 학습 품질을 저하시킴
+  - 패키징 시점에서 자동 제외하는 것이 적절함
+
+2-2. Glyph 65039 (VARIATION SELECTOR-16) 경고
+
+  발생 위치: src/utils/dataset_validator.py line 181 (visualize_distributions)
+
+  원인:
+  - check_distribution()에서 생성한 경고 문자열에 이모지 "⚠️" 사용
+  - "⚠️"는 U+26A0 (WARNING SIGN) + U+FE0F (VARIATION SELECTOR-16) 조합
+  - 이 경고 문자열이 matplotlib plot text (line 177, fontfamily='monospace')에
+    렌더링될 때 DejaVu Sans Mono 폰트에 U+FE0F 글리프가 없어 경고 발생
+  - 영향받는 위치: line 67, 72, 77, 96의 warnings.append() 문자열
+    → line 172에서 plot에 렌더링
+
+2-3. Glyph 10060 (CROSS MARK) 경고
+
+  발생 위치: src/utils/dataset_validator.py line 350 (create_visual_inspection_report)
+
+  원인:
+  - line 331에서 검사 결과 상태 표시에 이모지 "❌" (U+274C, CROSS MARK) 사용
+  - matplotlib의 기본 폰트 DejaVu Sans에 해당 글리프가 없어 경고 발생
+  - 동일 코드에서 "✅" (U+2705, WHITE HEAVY CHECK MARK)도 사용 중
+
+3. 수정 내용
+--------------------------------------------------------------------------------
+
+3-1. Edge Defect 샘플 자동 제외
+
+  [변경 파일] src/preprocessing/controlnet_packager.py
+
+  (a) _edge_filter() 메서드 신규 추가 (line 44-109)
+    - DatasetValidator.visual_check_sample()과 동일한 edge proximity 검사 로직
+    - roi_bbox, defect_bbox를 비교하여 10% 마진 이내 결함 감지
+    - 좌/우/상/하 어느 방향이든 마진 위반 시 해당 샘플을 제외
+    - 제외된 샘플의 image_id, class_id, 위반 방향을 로그 출력
+    - edge_margin 파라미터로 마진 비율 조정 가능 (기본값 0.1 = 10%)
+    - roi_bbox/defect_bbox 컬럼이 없으면 필터를 건너뜀 (하위 호환)
+
+  (b) package_dataset()에 _edge_filter() 호출 추가 (line 493-494)
+    - 품질 필터(_quality_filter) 적용 이전에 edge 필터를 먼저 적용
+    - 실행 순서: 원본 ROI → edge 필터 → 품질 필터 → stratified sampling
+    - bb9bfedfd.jpg와 같은 edge 밀착 샘플이 자동으로 제외됨
+
+3-2. matplotlib 이모지 경고 수정
+
+  [변경 파일] src/utils/dataset_validator.py
+
+  matplotlib plot에 렌더링되는 모든 이모지 문자를 ASCII 텍스트 마커로 교체:
+
+  (a) check_distribution() 경고 문자열 (line 67, 72, 77, 96)
+    - "⚠️  Class imbalance..."  → "[WARN] Class imbalance..."
+    - "⚠️  Subtype imbalance..."  → "[WARN] Subtype imbalance..."
+    - "⚠️  Background imbalance..." → "[WARN] Background imbalance..."
+    - "⚠️  Missing ideal..."  → "[WARN] Missing ideal..."
+
+  (b) visualize_distributions() 상태 텍스트 (line 160-165)
+    - "✅ Dataset is well-balanced" → "[PASS] Dataset is well-balanced"
+    - "⚠️  Imbalance detected"   → "[WARN] Imbalance detected"
+
+  (c) create_visual_inspection_report() 타이틀 (line 331)
+    - "❌" → "[X]"
+    - "✅" → "[OK]"
+
+  (d) generate_full_report() 콘솔 출력 (line 398, 402)
+    - "⚠️  Warnings:"        → "[WARN] Warnings:"
+    - "✅ Distribution looks..." → "[PASS] Distribution looks..."
+
+  [변경 파일] scripts/prepare_controlnet_data.py
+
+  콘솔 출력의 이모지도 일관성을 위해 교체 (line 136, 144, 177):
+    - "⚠️  Validation warnings..." → "[WARN] Validation warnings..."
+    - "✅ Dataset validation..."  → "[PASS] Dataset validation..."
+    - "✅ ControlNet Training..."  → "[DONE] ControlNet Training..."
+
+4. 수정 효과
+--------------------------------------------------------------------------------
+
+  (1) Edge defect 샘플 자동 제외
+    - bb9bfedfd.jpg 등 경계 밀착 결함 샘플이 패키징에서 자동 제외됨
+    - 제외된 샘플 수와 상세 정보가 로그에 출력되어 추적 가능
+    - v3 데이터셋(500개 목표)에서 학습 품질 저하 요인이 사전 차단됨
+
+  (2) matplotlib Glyph 경고 해소
+    - Glyph 65039 (VARIATION SELECTOR-16) 경고 해소
+    - Glyph 10060 (CROSS MARK) 경고 해소
+    - Colab 환경의 DejaVu Sans/DejaVu Sans Mono 폰트와 호환됨
+    - 시각적 구분이 필요한 곳은 [PASS], [WARN], [X], [OK] 마커로 대체
+
+5. 변경 파일 목록
+--------------------------------------------------------------------------------
+
+  [수정]
+  - src/preprocessing/controlnet_packager.py
+    - _edge_filter() 메서드 신규 추가 (line 44-109)
+    - package_dataset()에 _edge_filter() 호출 추가 (line 493-494)
+
+  - src/utils/dataset_validator.py
+    - check_distribution(): 이모지 → ASCII 마커 (line 67, 72, 77, 96)
+    - visualize_distributions(): 이모지 → ASCII 마커 (line 160-165)
+    - create_visual_inspection_report(): 이모지 → ASCII 마커 (line 331)
+    - generate_full_report(): 이모지 → ASCII 마커 (line 398, 402)
+
+  - scripts/prepare_controlnet_data.py
+    - 콘솔 출력 이모지 → ASCII 마커 (line 136, 144, 177)
+
+  [신규]
+  - docs/20260219.docs (본 문서)
+
+10. test_results_v3 분석: grayscale hint 학습 후 생성 결과 검증
+--------------------------------------------------------------------------------
+
+10-1. 분석 배경
+
+  section 7에서 hint 이미지를 grayscale로 변환(R*0.5 + G*0.3 + B*0.2)한 뒤
+  ControlNet v3 모델을 재학습하였다. 본 절은 재학습 모델의 validation 결과인
+  outputs/test_results_v3를 분석하여, grayscale hint 변환이 RGB 색상 전이 문제를
+  해결했는지 평가한다.
+
+10-2. Validation Phase 결과 요약
+
+  | Phase                        | 결과  | 비고                              |
+  |------------------------------|-------|-----------------------------------|
+  | Phase 1 (기본 생성)          | FAIL  | 미실행 (false)                    |
+  | Phase 2 (파라미터 탐색)      | PASS  | 11개 파라미터 조합 테스트 완료    |
+  | Phase 3 (미학습 데이터)      | PASS  | 12/12 샘플 생성, avg_quality=0.57 |
+  | Phase 4 (리포트/시각화)      | PASS  | 학습 통계 및 Loss 곡선 생성 완료  |
+
+  Phase 1이 미실행인 이유는 validation_results.json에 false로 기록되어 있으며,
+  실행 오류 또는 의도적 스킵으로 추정됨.
+
+10-3. 학습 통계 분석
+
+  (a) 학습 규모
+
+    | 항목           | 값                                        |
+    |----------------|-------------------------------------------|
+    | 총 step        | 1,200 (로그 기록 225 entries, 10step 간격) |
+    | 총 epoch       | 100 (config) / 18 (stats에 기록된 값)     |
+    | batch size     | 1 (grad_accum=4, effective=4)             |
+    | LR 스케줄러    | constant_with_warmup (config 기준)        |
+    | 학습률         | 1e-5 (warmup 50 step)                     |
+    | mixed precision| fp16                                      |
+
+    참고: training_config.json에는 lr_scheduler="constant_with_warmup"으로 기록되어
+    있으나, train_controlnet.py 코드의 v3 기본값은 "cosine"으로 변경됨.
+    실제 학습에 적용된 스케줄러는 training_log.json의 lr 값으로 확인 가능:
+    - step 50 이후 lr이 1e-5로 고정 → constant_with_warmup이 적용된 것으로 확인됨.
+    - cosine 스케줄러였다면 step 증가에 따라 lr이 감소해야 함.
+
+  (b) Loss 추이
+
+    | 항목        | 값      | 비고                    |
+    |-------------|---------|-------------------------|
+    | Loss 평균   | 0.0470  |                         |
+    | Loss 중앙값 | 0.0438  |                         |
+    | Loss 표준편차| 0.0194  | 높은 분산               |
+    | Loss 최소   | 0.0051  | step 640 부근           |
+    | Loss 최대   | 0.1143  | step 20 (warmup 구간)   |
+    | 최종 Loss   | 0.0567  |                         |
+    | NaN 발생    | 0회     |                         |
+
+    Loss 곡선 분석:
+    - warmup 구간(step 0-50): 0.05 → 0.08 → 0.05 수준으로 급등 후 안정화
+    - step 50-600: loss 0.02-0.15 범위에서 큰 진동, 10-step MA 기준 0.06 → 0.04
+    - step 600-1200: 0.02-0.18 범위, MA 기준 0.04-0.05에서 횡보
+    - 전체적으로 수렴하지 않고 진동하는 패턴
+    - 특히 step 670(0.184), step 970(0.181) 등 간헐적 spike 발생
+
+    비수렴 원인 추정:
+    - 학습 데이터 부족 (500개 샘플 × 100 epoch = 50,000 반복이지만
+      effective batch=4이므로 실제 가중치 업데이트는 12,500회)
+    - constant_with_warmup 스케줄러가 후반부에도 lr=1e-5를 유지하여
+      fine-grained 수렴이 불가능 (cosine이었다면 후반 lr 감소로 안정화)
+    - 작은 데이터셋에서의 overfitting-underfitting 진동
+
+10-4. 생성 이미지 품질 분석 (Phase 3)
+
+  (a) 정량적 품질 점수
+
+    | 이미지 ID               | Class | Quality | Color  | Artifact | Blur  |
+    |-------------------------|-------|---------|--------|----------|-------|
+    | 09e15218c (class3_r1)   | 3     | 0.6236  | 0.8091 | 0.0000   | 1.000 |
+    | 374d9c63f (class4_r0)   | 4     | 0.6952  | 0.4470 | 0.7363   | 0.985 |
+    | 3fe32ff2f (class2_r1)   | 2     | 0.5965  | 0.7412 | 0.0000   | 1.000 |
+    | 5fa81f2b5 (class3_r0)   | 3     | 0.5436  | 0.6091 | 0.0000   | 1.000 |
+    | 68cc04a14 (class2_r0)   | 2     | 0.5378  | 0.5944 | 0.0000   | 1.000 |
+    | 8b9c035ec (class2_r0)   | 2     | 0.5063  | 0.5158 | 0.0000   | 1.000 |
+    | 8f8a23f39 (class1_r1)   | 1     | 0.5418  | 0.6046 | 0.0000   | 1.000 |
+    | 9d57d9095 (class1_r0)   | 1     | 0.5521  | 0.6302 | 0.0000   | 1.000 |
+    | c22accc84 (class1_r0)   | 1     | 0.6195  | 0.7987 | 0.0000   | 1.000 |
+    | e8fefd824 (class3_r0)   | 3     | 0.5474  | 0.6185 | 0.0000   | 1.000 |
+    | f41732c94 (class4_r1)   | 4     | 0.4632  | 0.4079 | 0.0000   | 1.000 |
+    | f4495532f (class4_r0)   | 4     | 0.6528  | 0.8821 | 0.0000   | 1.000 |
+    |-------------------------|-------|---------|--------|----------|-------|
+    | 평균                    | -     | 0.5733  | 0.6382 | 0.0614   | 0.999 |
+
+    품질 점수 가중치: color(0.40) + artifact(0.30) + blur(0.30)
+    합격 기준: avg_quality >= 0.5 → PASS (0.5733 >= 0.5)
+
+  (b) 메트릭별 분석
+
+    Color Consistency (avg: 0.6382):
+    - 가장 취약한 지표, 범위 0.41 ~ 0.88
+    - 최저: f41732c94 (class4) = 0.4079
+    - 최고: f4495532f (class4) = 0.8821
+    - 동일 class 4에서도 편차가 매우 큼 (0.41 vs 0.88)
+    - LAB 색공간에서 a,b 채널 편차가 크다 = 무채색이 아닌 색상 존재
+
+    Artifact Score (avg: 0.0614):
+    - 12개 중 11개가 0.0 (아티팩트 없음 판정)
+    - 374d9c63f만 0.7363 (높은 gradient 비율 = 경계 아티팩트 존재)
+    - gradient 기반 감지이므로 색상 아티팩트는 포착하지 못함
+
+    Blur Score (avg: 0.9987):
+    - 거의 만점, 모든 이미지가 선명
+    - 문제: "선명하게 잘못된 색상"이 생성되고 있음
+
+  (c) 클래스별 분석
+
+    | Class | 샘플 수 | avg Quality | avg Color |
+    |-------|---------|-------------|-----------|
+    | 1     | 3       | 0.5711      | 0.6778    |
+    | 2     | 3       | 0.5469      | 0.6171    |
+    | 3     | 3       | 0.5715      | 0.6789    |
+    | 4     | 3       | 0.6037      | 0.5790    |
+
+    - Class 4가 quality 최고이나 color 최저 → 구조적으로는 양호하나 색상이 불안정
+    - Class 1, 3이 color에서 상대적 우위
+
+10-5. 핵심 문제: grayscale hint에도 불구하고 RGB 컬러 출력 지속
+
+  (a) 문제 확인
+
+    생성 이미지를 직접 확인한 결과, 심각한 RGB 컬러 아티팩트가 관찰됨:
+
+    - Hint 이미지: 정상 grayscale (R==G==B, 모든 픽셀에서 3채널 동일)
+    - 원본 GT 이미지: 정상 grayscale (실제 철강 표면, 무채색)
+    - 생성 이미지: 강렬한 RGB 색상 출력
+      - 빨강/마젠타/검정 패치 (class4_region0)
+      - 파랑/초록/네온 색상 오염 (class3_region0 비교 이미지)
+      - 가장자리에 청록/노란 색상 잔존 (f4495532f)
+      - Phase 2 guidance_scale 변경(3.0~10.0)으로도 해결되지 않음
+
+    정량적 확인:
+    - 생성 이미지의 grayscale 비율(R==G==B인 픽셀): 11~48%, 평균 20~30%
+    - R, G, B 채널 평균값이 서로 크게 불일치
+    - 최대 채널 간 차이: 255 (극단적 색상 포화)
+
+  (b) 결론: grayscale hint 변환만으로는 RGB 출력 문제가 해결되지 않음
+
+    section 6-4에서 분석한 [문제 2](hint의 RGB 색상 shortcut 학습)는
+    grayscale hint로 차단되었으나, [문제 1](SD 1.5의 RGB 컬러 생성 본질)이
+    여전히 해결되지 않았음.
+
+10-6. RGB 컬러 출력의 근본 원인 분석
+
+  (1) SD 1.5 VAE의 3채널 독립 디코딩 (근본 원인)
+
+    Stable Diffusion v1.5의 VAE는 latent space에서 항상 3채널 RGB를 디코딩함.
+    ControlNet이 grayscale hint를 받더라도, UNet은 3채널 noise를 독립적으로
+    예측하며, 각 채널이 동일한 값으로 수렴할 제약이 없음.
+
+    학습 시 target 이미지가 grayscale(3채널 동일값)이더라도, VAE 인코딩-디코딩
+    과정에서 latent space의 각 채널 간 미세한 차이가 발생할 수 있고,
+    소량 학습에서는 이 차이를 정확히 보상하지 못함.
+
+  (2) Target 이미지 로딩 방식 (기여 원인)
+
+    train_controlnet.py line 208:
+      target_image = Image.open(target_path).convert("RGB")
+
+    원본 철강 이미지가 grayscale이더라도 .convert("RGB")로 3채널 확장됨.
+    이때 R==G==B이 보장되지만, VAE latent 인코딩 시 채널 간 미세한 수치 차이가
+    발생할 수 있음. 모델이 이 차이를 학습하면 생성 시 채널 분기가 증폭됨.
+
+  (3) 학습 부족 및 Loss 비수렴 (악화 원인)
+
+    1,200 step / constant_with_warmup에서 loss가 수렴하지 않고 진동:
+    - 10-step MA 기준 0.04~0.06 범위에서 횡보
+    - 간헐적 spike (step 670: 0.184, step 970: 0.181)
+    - 모델이 "grayscale 금속 표면" 분포를 충분히 학습하지 못한 상태
+
+  (4) controlnet_conditioning_scale=1.0 추론 (악화 원인)
+
+    test_controlnet.py 기본값: controlnet_conditioning_scale=1.0
+    run_validation_phases.py 기본값: controlnet_conditioning_scale=1.0
+
+    v3 권장값은 0.7이나, 실제 테스트가 1.0으로 실행됨.
+    scale=1.0이면 ControlNet이 SD의 자연 이미지 생성 능력을 완전히 덮어써서
+    미학습 패턴(neon/rainbow 색상)이 더 강하게 나타남.
+
+    Phase 2에서 guidance_scale(3.0~10.0)과 inference_steps(20~50)를
+    변경했으나, conditioning_scale은 모두 1.0으로 고정되어 비교 불가.
+
+10-7. Phase 2 파라미터 탐색 결과
+
+  (a) 테스트 파라미터
+
+    | 파라미터          | 테스트 값               |
+    |-------------------|-------------------------|
+    | guidance_scale    | 3.0, 5.0, 7.5, 10.0    |
+    | inference_steps   | 20, 30, 50              |
+    | seed              | 42, 123, 456, 789       |
+    | (고정) cond_scale | 1.0 (전체 동일)         |
+
+    대표 샘플: d84ad849e.jpg_class1_region1 (학습 데이터 첫 번째 hint)
+
+  (b) 관찰 결과
+
+    - guidance_scale 변경(3.0~10.0): 모든 값에서 RGB 컬러 아티팩트 동일 발생
+    - inference_steps 변경(20~50): 색상 문제에 유의미한 차이 없음
+    - seed 변경(42~789): 색상 패턴이 달라지나 RGB 컬러 자체는 지속
+
+    결론: guidance_scale과 inference_steps는 RGB 컬러 문제의 원인이 아님.
+    conditioning_scale=0.7로 테스트하지 못한 것이 미진한 점.
+
+10-8. 개선 방안
+
+  (a) 즉시 적용 가능한 수정 (추론 파이프라인)
+
+    [방안 A1] 생성 후 grayscale 후처리
+      - 생성 이미지를 즉시 grayscale 변환 후 3채널 복제
+      - test_controlnet.py의 generate_single() 출력에 적용:
+        image = output.images[0].convert("L").convert("RGB")
+      - 장점: 즉시 적용 가능, 코드 수정 1줄
+      - 단점: 모델이 올바르게 학습된 것은 아님, grayscale 범위가 제한될 수 있음
+
+    [방안 A2] controlnet_conditioning_scale=0.7로 재테스트
+      - test_controlnet.py와 run_validation_phases.py의 기본값을 0.7로 변경
+      - SD의 자연 이미지 생성 능력이 보존되어 neon 패턴 감소 기대
+      - v3 학습 시 권장된 값이나 실제 테스트에 미적용됨
+
+  (b) 재학습 시 적용 (근본 해결)
+
+    [방안 B1] Target 이미지 grayscale 강제 변환
+      - train_controlnet.py의 데이터 로딩에서 target을 grayscale로 변환:
+        gray = image.convert("L")
+        image = Image.merge("RGB", [gray, gray, gray])
+      - VAE latent space에서 3채널이 동일값을 갖게 하여 채널 분기 방지
+      - 학습 시 모델이 "동일 채널 출력"을 명시적으로 학습
+
+    [방안 B2] Grayscale 일관성 loss 추가
+      - 기존 MSE loss에 channel-consistency loss를 추가:
+        L_total = L_mse + lambda * L_gray
+        L_gray = MSE(pred[:,0] - pred[:,1]) + MSE(pred[:,1] - pred[:,2])
+      - lambda = 0.1~0.5 범위에서 실험 필요
+      - 3채널 출력이 동일하도록 명시적 제약
+
+    [방안 B3] 학습 하이퍼파라미터 개선
+      - LR 스케줄러: cosine 실제 적용 (config vs 코드 불일치 해소)
+      - controlnet_conditioning_scale=0.7 학습 시 적용
+      - SNR gamma=5.0 적용 (timestep별 loss 가중)
+      - epoch 수 300+ 증가 또는 early_stopping_patience=20 설정
+      - 데이터 augmentation: horizontal flip, brightness/contrast jitter
+
+  (c) 우선순위 권장
+
+    1순위: B1 (target grayscale 강제) + A2 (cond_scale=0.7 테스트)
+    2순위: B3 (하이퍼파라미터 개선) - cosine 스케줄러 실적용
+    3순위: A1 (grayscale 후처리) - 임시 해결책으로 병행
+    4순위: B2 (gray consistency loss) - 추가 실험 필요
+
+10-9. 분석 요약
+
+  grayscale hint 변환(section 7)은 hint의 RGB 색상이 생성 이미지에 직접
+  전이되는 "color-shortcut learning"은 차단하였으나, SD 1.5 모델 자체의
+  3채널 독립 생성 특성으로 인해 RGB 컬러 출력 문제가 지속됨.
+
+  핵심 원인은 3가지:
+  (1) SD 1.5 VAE의 3채널 독립 디코딩 (hint 변환으로 해결 불가)
+  (2) 학습 부족/비수렴 (1,200 step, constant_with_warmup)
+  (3) 추론 시 conditioning_scale=1.0 사용 (v3 권장 0.7 미적용)
+
+  다음 단계로 target grayscale 강제 변환(B1)과 conditioning_scale=0.7
+  재테스트(A2)를 우선 적용하고, 학습 하이퍼파라미터를 개선(B3)하여
+  v4 학습을 준비하는 것을 권장함.
+

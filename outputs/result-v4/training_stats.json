@@ -1,0 +1,13 @@
+{
+  "total_steps": 578,
+  "total_epochs": 24,
+  "loss_mean": 0.23714411166258104,
+  "loss_median": 0.2341960694640875,
+  "loss_std": 0.027785329012823705,
+  "loss_min": 0.17682084082625807,
+  "loss_min_step": 4280,
+  "loss_max": 0.43633865416049955,
+  "loss_max_step": 20,
+  "final_loss": 0.22450379319489003,
+  "nan_count": 0
+}

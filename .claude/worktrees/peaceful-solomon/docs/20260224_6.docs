@@ -1,0 +1,228 @@
+20260224 작업 일지 #6 - YOLO 데이터셋 사전 변환 독립 스크립트 (prepare_yolo_datasets.py)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+run_benchmark.py 실행 전에 YOLO 포맷 변환을 독립적으로 수행하는 스크립트를 신규 작성.
+--yolo-dir 캐시 시스템(작업 일지 #5)과 연동하여, Colab에서 Step 1(사전 변환) →
+Step 2(벤치마크 학습) 2단계 워크플로를 가능하게 한다.
+
+주요 이점:
+  - 변환만 별도 실행하여 오류 조기 발견
+  - 특정 그룹만 선택적 변환 가능 (--groups baseline)
+  - 변환 완료 후 여러 모델/에폭 조합을 변환 없이 반복 실행
+  - --force 옵션으로 기존 캐시 무시 및 강제 재변환
+
+
+2. 변경 파일
+================================================================================
+
+  | 파일                                   | 상태 | 라인수  | 변경 내용                                      |
+  |----------------------------------------|------|---------|------------------------------------------------|
+  | scripts/prepare_yolo_datasets.py       | 신규 | 359     | YOLO 데이터셋 사전 변환 독립 스크립트            |
+
+
+3. 주요 변경 내용
+================================================================================
+
+3.1 스크립트 구조 개요
+-----------------------
+독립 실행 가능한 CLI 스크립트로, run_benchmark.py의 데이터셋 변환 로직을 추출·확장.
+
+  구조:
+    L1-41    모듈 docstring (사용법, 출력 구조, 의존성)
+    L43-58   임포트 (argparse, pandas, yaml, 프로젝트 내부 모듈)
+    L60-72   상수 (GROUP_ALIASES, YOLO_GROUPS)
+    L75-97   resolve_groups() — 그룹 별칭 해석
+    L100-127 get_split_ids() — 분할 ID 로딩
+    L130-207 prepare_single_group() — 단일 그룹 변환
+    L210-355 main() — CLI 파싱, 설정 오버라이드, 변환 루프, 결과 요약
+
+
+3.2 resolve_groups() 함수 (L75-97)
+------------------------------------
+run_benchmark.py의 동일 함수와 같은 별칭 시스템 재사용.
+
+  지원 별칭:
+    baseline → baseline_raw
+    raw      → baseline_raw
+    trad     → baseline_trad
+    full     → casda_full
+    pruning  → casda_pruning
+    all      → 전체 그룹
+
+  미인식 그룹 입력 시 사용 가능 목록과 별칭 안내 후 sys.exit(1).
+
+
+3.3 get_split_ids() 함수 (L100-127)
+-------------------------------------
+변환 전 train/val/test 이미지 ID 분할을 1회만 수행.
+
+  동작 흐름:
+    1) config['dataset']['split_csv'] 경로 존재 시 → CSV 로드 (Split 컬럼 기준)
+    2) split_csv 미지정 또는 파일 없음 → get_image_ids_with_defects() + split_dataset()
+       동적 분할 수행 (seed 고정)
+
+  핵심: 분할 ID를 한 번 계산하여 모든 그룹에 공유 → 그룹 간 동일 분할 보장.
+
+
+3.4 prepare_single_group() 함수 (L130-207)
+--------------------------------------------
+단일 데이터셋 그룹의 YOLO 변환을 수행하는 핵심 함수.
+
+  인자:
+    group_key  — 'baseline_raw', 'casda_full' 등
+    config     — 전체 실험 설정 dict
+    output_dir — 상위 출력 디렉토리 (그룹 하위 디렉토리 자동 생성)
+    train/val/test_ids — 이미지 ID 리스트
+    force      — True면 기존 캐시 무시
+
+  동작 흐름:
+    1) force=False이면 validate_yolo_dataset()로 기존 캐시 확인 → 유효하면 건너뜀
+    2) config에서 image_dir, annotation_csv, CASDA 경로 해석
+    3) group_config['casda_data']에 따라 casda_dir, casda_mode 결정:
+       - None → baseline (원본만 사용)
+       - "full" → casda_full 디렉토리 사용
+       - "pruning" → casda_pruning 디렉토리 사용
+    4) prepare_yolo_dataset() 호출 → images/, labels/, dataset.yaml 생성
+    5) 소요 시간 로깅
+
+  CASDA 경로 해석 (L169-184):
+    변경 전 (run_benchmark.py 내부):
+        casda_dir는 UltralyticsTrainer가 내부적으로 해석
+
+    변경 후 (독립 스크립트):
+        casda_data = group_config.get('casda_data', None)
+        if casda_data == "full":
+            casda_dir = config['dataset']['casda']['full_dir']
+            casda_mode = "full"
+        elif casda_data == "pruning":
+            casda_dir = config['dataset']['casda']['pruning_dir']
+            casda_mode = "pruning"
+
+
+3.5 main() 함수 (L210-355) — CLI 파싱 및 오버라이드
+-----------------------------------------------------
+argparse 인자:
+
+  | 인자         | 필수 | 기본값                              | 설명                          |
+  |-------------|------|-------------------------------------|-------------------------------|
+  | --config    | ×    | configs/benchmark_experiment.yaml   | 실험 설정 YAML                |
+  | --output-dir| ○    | —                                   | YOLO 출력 디렉토리             |
+  | --data-dir  | ×    | None                                | image_dir 오버라이드           |
+  | --csv       | ×    | None                                | annotation_csv 오버라이드      |
+  | --casda-dir | ×    | None                                | CASDA 상위 디렉토리            |
+  | --split-csv | ×    | None                                | 분할 CSV 경로                  |
+  | --groups    | ×    | None (전체)                         | 변환 대상 그룹 (별칭 지원)     |
+  | --force     | ×    | False                               | 강제 재변환                    |
+  | --seed      | ×    | None                                | 랜덤 시드 오버라이드           |
+
+CLI 경로 오버라이드 동작 (L277-294):
+    --data-dir  → config['dataset']['image_dir'] 덮어쓰기
+    --csv       → config['dataset']['annotation_csv'] 덮어쓰기
+    --casda-dir → config['dataset']['casda']['full_dir']  = {casda-dir}/casda_full
+                  config['dataset']['casda']['pruning_dir'] = {casda-dir}/casda_pruning
+    --split-csv → config['dataset']['split_csv'] (절대 경로 변환)
+    --seed      → config['dataset']['split']['seed']
+
+변환 루프 (L322-338):
+    group_keys를 순회하며 prepare_single_group() 호출.
+    예외 발생 시 traceback 출력 후 다음 그룹 계속 진행 (한 그룹 실패가 전체 중단 안 함).
+
+결과 요약 (L342-355):
+    전체 소요 시간, 그룹별 OK/FAIL 상태, --yolo-dir 사용법 안내 출력.
+    실패 그룹이 1개 이상이면 exit code 1.
+
+
+4. 사용 흐름
+================================================================================
+
+4.1 Colab 2단계 워크플로 (권장)
+---------------------------------
+  Step 1: 사전 변환 (Colab 로컬 디스크에 저장, 빠른 I/O)
+    python /content/severstal-steel-defect-detection/scripts/prepare_yolo_datasets.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --casda-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \
+        --split-csv /content/drive/MyDrive/data/Severstal/casda/splits/split_70_15_15_seed42.csv \
+        --output-dir /content/yolo_datasets \
+        --groups all
+
+  Step 2: 벤치마크 실행 (--yolo-dir 참조)
+    python /content/severstal-steel-defect-detection/scripts/run_benchmark.py \
+        --config /content/severstal-steel-defect-detection/configs/benchmark_experiment.yaml \
+        --data-dir /content/drive/MyDrive/data/Severstal/train_images \
+        --csv /content/drive/MyDrive/data/Severstal/train.csv \
+        --casda-dir /content/drive/MyDrive/data/Severstal/data/augmented_v4_dataset \
+        --split-csv /content/drive/MyDrive/data/Severstal/casda/splits/split_70_15_15_seed42.csv \
+        --yolo-dir /content/yolo_datasets \
+        --output-dir /content/drive/MyDrive/data/Severstal/casda/benchmark_results \
+        --models yolo_mfd --groups baseline --epochs 10
+
+4.2 선택적 그룹 변환
+-----------------------
+  # baseline만 변환
+  python scripts/prepare_yolo_datasets.py --output-dir /content/yolo_datasets --groups baseline
+
+  # CASDA 그룹만 추가 변환 (baseline은 캐시 히트로 건너뜀)
+  python scripts/prepare_yolo_datasets.py --output-dir /content/yolo_datasets --groups full pruning
+
+4.3 강제 재변환
+-----------------
+  python scripts/prepare_yolo_datasets.py --output-dir /content/yolo_datasets --groups baseline --force
+
+  → 기존 baseline_raw/ 디렉토리의 유효성과 무관하게 다시 변환
+
+
+5. 디렉토리 구조
+================================================================================
+
+  /content/yolo_datasets/              ← --output-dir
+    baseline_raw/
+      images/
+        train/   (4666 images)
+        val/     (1000 images)
+        test/    (1000 images)
+      labels/
+        train/   (4666 .txt files)
+        val/     (1000 .txt files)
+        test/    (1000 .txt files)
+      dataset.yaml
+    baseline_trad/
+      images/
+        train/   (4666 + augmented)
+        ...
+      dataset.yaml
+    casda_full/
+      images/
+        train/   (4666 + CASDA synthetic)
+        ...
+      dataset.yaml
+    casda_pruning/
+      images/
+        train/   (4666 + pruned CASDA)
+        ...
+      dataset.yaml
+
+
+6. run_benchmark.py와의 관계
+================================================================================
+
+  | 항목                | prepare_yolo_datasets.py      | run_benchmark.py + --yolo-dir    |
+  |---------------------|-------------------------------|----------------------------------|
+  | 역할                | 변환만 수행                    | 학습 + 평가                       |
+  | YOLO 변환           | 직접 호출                      | UltralyticsTrainer 내부에서 위임  |
+  | 캐시 검증           | validate_yolo_dataset()        | validate_yolo_dataset()          |
+  | 출력 위치           | --output-dir/{group}/          | --yolo-dir/{group}/ (동일)       |
+  | 단독 실행           | ○                             | ○                                |
+  | 결합 사용           | Step 1 → Step 2               | --yolo-dir 없이도 자체 변환      |
+
+  핵심: 두 스크립트 모두 같은 디렉토리 구조와 validate_yolo_dataset()을 공유하므로,
+  prepare_yolo_datasets.py가 생성한 데이터를 run_benchmark.py가 그대로 참조 가능.
+
+
+7. 구문 검증
+================================================================================
+  python -c "import ast; ast.parse(open('scripts/prepare_yolo_datasets.py', encoding='utf-8').read())"
+  → Syntax OK

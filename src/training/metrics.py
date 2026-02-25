@@ -500,14 +500,16 @@ class BenchmarkReporter:
     def save_comparison_csv(self):
         """
         Save comparison table as CSV matching the experiment.md format:
-        
-        | Model | Dataset | mAP@0.5 | Dice | Class1 AP | ... | Class4 AP |
+
+        | Model | Dataset | mAP@0.5 | Dice | Class1_Score | ... | Class4_Score |
+
+        Class{i}_Score = per-class AP (detection) 또는 per-class Dice (segmentation).
         """
         path = self.output_dir / "benchmark_comparison.csv"
-        
+
         fieldnames = [
             'Model', 'Dataset', 'mAP@0.5', 'Dice',
-            'Class1_AP', 'Class2_AP', 'Class3_AP', 'Class4_AP',
+            'Class1_Score', 'Class2_Score', 'Class3_Score', 'Class4_Score',
         ]
 
         with open(path, 'w', newline='') as f:
@@ -522,11 +524,16 @@ class BenchmarkReporter:
                     'mAP@0.5': f"{metrics.get('mAP@0.5', 0.0):.4f}",
                     'Dice': f"{metrics.get('dice_mean', 0.0):.4f}",
                 }
-                # Per-class AP
-                class_ap = metrics.get('class_ap', {})
+                # Per-class 메트릭: detection → class_ap, segmentation → class_dice
+                is_segmentation = 'dice_mean' in metrics and 'mAP@0.5' not in metrics
+                per_class = (
+                    metrics.get('class_dice', {})
+                    if is_segmentation
+                    else metrics.get('class_ap', {})
+                )
                 for i in range(1, 5):
                     key = f"Class{i}"
-                    row[f"Class{i}_AP"] = f"{class_ap.get(key, 0.0):.4f}"
+                    row[f"Class{i}_Score"] = f"{per_class.get(key, 0.0):.4f}"
 
                 writer.writerow(row)
 
@@ -555,7 +562,7 @@ class BenchmarkReporter:
 
         for result in self.results:
             m = result['metrics']
-            cap = m.get('class_ap', {})
+            cap = m.get('class_ap', {}) or m.get('class_dice', {})
             print(f"{result['model']:<15} {result['dataset']:<20} "
                   f"{m.get('mAP@0.5', 0.0):>8.4f} {m.get('dice_mean', 0.0):>8.4f} "
                   f"{cap.get('Class1', 0.0):>8.4f} {cap.get('Class2', 0.0):>8.4f} "

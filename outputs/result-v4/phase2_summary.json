@@ -1,0 +1,191 @@
+{
+  "guidance_scales_tested": [
+    3.0,
+    5.0,
+    7.5,
+    10.0
+  ],
+  "inference_steps_tested": [
+    20,
+    30,
+    50
+  ],
+  "seeds_tested": [
+    42,
+    123,
+    456,
+    789
+  ],
+  "results": [
+    {
+      "param": "guidance_scale",
+      "value": 3.0,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_gs3.0",
+      "quality": {
+        "avg_quality_score": 0.6301,
+        "avg_color_score": 0.6323,
+        "avg_artifact_score": 0.8992,
+        "avg_blur_score": 0.9347,
+        "avg_ssim_score": 0.0469,
+        "avg_lpips_score": 0.556,
+        "num_evaluated": 4,
+        "quality_passed": true
+      }
+    },
+    {
+      "param": "guidance_scale",
+      "value": 5.0,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_gs5.0",
+      "quality": {
+        "avg_quality_score": 0.6242,
+        "avg_color_score": 0.6298,
+        "avg_artifact_score": 0.8872,
+        "avg_blur_score": 0.9172,
+        "avg_ssim_score": 0.049,
+        "avg_lpips_score": 0.5532,
+        "num_evaluated": 4,
+        "quality_passed": true
+      }
+    },
+    {
+      "param": "guidance_scale",
+      "value": 7.5,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_gs7.5",
+      "quality": {
+        "avg_quality_score": 0.6151,
+        "avg_color_score": 0.6266,
+        "avg_artifact_score": 0.868,
+        "avg_blur_score": 0.8904,
+        "avg_ssim_score": 0.0518,
+        "avg_lpips_score": 0.5484,
+        "num_evaluated": 4,
+        "quality_passed": true
+      }
+    },
+    {
+      "param": "guidance_scale",
+      "value": 10.0,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_gs10.0",
+      "quality": {
+        "avg_quality_score": 0.6078,
+        "avg_color_score": 0.625,
+        "avg_artifact_score": 0.8469,
+        "avg_blur_score": 0.8722,
+        "avg_ssim_score": 0.0551,
+        "avg_lpips_score": 0.5453,
+        "num_evaluated": 4,
+        "quality_passed": true
+      }
+    },
+    {
+      "param": "num_inference_steps",
+      "value": 20,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_steps20",
+      "quality": {
+        "avg_quality_score": 0.6153,
+        "avg_color_score": 0.6264,
+        "avg_artifact_score": 0.8689,
+        "avg_blur_score": 0.8902,
+        "avg_ssim_score": 0.0517,
+        "avg_lpips_score": 0.5481,
+        "num_evaluated": 4,
+        "quality_passed": true
+      }
+    },
+    {
+      "param": "num_inference_steps",
+      "value": 30,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_steps30",
+      "quality": {
+        "avg_quality_score": 0.6151,
+        "avg_color_score": 0.6266,
+        "avg_artifact_score": 0.868,
+        "avg_blur_score": 0.8904,
+        "avg_ssim_score": 0.0518,
+        "avg_lpips_score": 0.5484,
+        "num_evaluated": 4,
+        "quality_passed": true
+      }
+    },
+    {
+      "param": "num_inference_steps",
+      "value": 50,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_steps50",
+      "quality": {
+        "avg_quality_score": 0.6152,
+        "avg_color_score": 0.6267,
+        "avg_artifact_score": 0.868,
+        "avg_blur_score": 0.8906,
+        "avg_ssim_score": 0.0519,
+        "avg_lpips_score": 0.5484,
+        "num_evaluated": 4,
+        "quality_passed": true
+      }
+    },
+    {
+      "param": "seed",
+      "value": 42,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_seed42",
+      "quality": {
+        "avg_quality_score": 0.6416,
+        "avg_color_score": 0.65,
+        "avg_artifact_score": 0.8204,
+        "avg_blur_score": 1.0,
+        "avg_ssim_score": 0.0666,
+        "avg_lpips_score": 0.5162,
+        "num_evaluated": 1,
+        "quality_passed": true
+      }
+    },
+    {
+      "param": "seed",
+      "value": 123,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_seed123",
+      "quality": {
+        "avg_quality_score": 0.632,
+        "avg_color_score": 0.65,
+        "avg_artifact_score": 0.89,
+        "avg_blur_score": 0.9325,
+        "avg_ssim_score": 0.0576,
+        "avg_lpips_score": 0.5741,
+        "num_evaluated": 1,
+        "quality_passed": true
+      }
+    },
+    {
+      "param": "seed",
+      "value": 456,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_seed456",
+      "quality": {
+        "avg_quality_score": 0.634,
+        "avg_color_score": 0.6638,
+        "avg_artifact_score": 0.8021,
+        "avg_blur_score": 1.0,
+        "avg_ssim_score": 0.02,
+        "avg_lpips_score": 0.5236,
+        "num_evaluated": 1,
+        "quality_passed": true
+      }
+    },
+    {
+      "param": "seed",
+      "value": 789,
+      "output_dir": "/content/drive/MyDrive/data/Severstal/test_results_v4/phase2_seed789",
+      "quality": {
+        "avg_quality_score": 0.637,
+        "avg_color_score": 0.65,
+        "avg_artifact_score": 0.8021,
+        "avg_blur_score": 0.9936,
+        "avg_ssim_score": 0.108,
+        "avg_lpips_score": 0.5554,
+        "num_evaluated": 1,
+        "quality_passed": true
+      }
+    }
+  ],
+  "best_combination": {
+    "param": "seed",
+    "value": 42,
+    "quality_score": 0.6416
+  }
+}
