@@ -71,6 +71,20 @@ def main():
         help='Skip hint image generation (only create prompts and jsonl)'
     )
     parser.add_argument(
+        '--hint_mode',
+        type=str,
+        choices=['canny', 'grayscale'],
+        default='canny',
+        help=(
+            "Hint image format for ControlNet conditioning.\n"
+            "  canny     (v5, default): Canny edges of the defect mask boundary.\n"
+            "            Compatible with sd-controlnet-canny pretrained weights.\n"
+            "  grayscale (v4, legacy):  Weighted R*0.5+G*0.3+B*0.2 grayscale.\n"
+            "            INCOMPATIBLE with sd-controlnet-canny — causes the model\n"
+            "            to ignore hints (guidance_scale ↑ → quality ↓)."
+        )
+    )
+    parser.add_argument(
         '--max_samples',
         type=int,
         default=None,
@@ -160,7 +174,9 @@ def main():
         prompt_generator=prompt_generator,
         prompt_style=args.prompt_style
     )
-    
+
+    print(f"  Hint mode: {args.hint_mode}")
+
     # Package dataset
     print("\n[Step 4/4] Packaging dataset for ControlNet training...")
     packaged_dir = packager.package_dataset(
@@ -169,7 +185,8 @@ def main():
         train_csv=train_csv,
         output_dir=output_dir,
         create_hints=not args.skip_hints,
-        max_samples=args.max_samples
+        max_samples=args.max_samples,
+        hint_mode=args.hint_mode,
     )
     
     # Print final summary
@@ -178,12 +195,14 @@ def main():
     print("="*80)
     print(f"\nOutput directory: {packaged_dir}")
     print(f"\nGenerated files:")
-    print(f"  - train.jsonl: Training data index")
+    print(f"  - train.jsonl: Training data index (source≠target, v5 format)")
     print(f"  - metadata.json: Complete dataset metadata")
     print(f"  - packaged_roi_metadata.csv: Updated ROI metadata with prompts")
-    
+
     if not args.skip_hints:
-        print(f"  - hints/: Multi-channel hint images")
+        print(f"  - hints/: {args.hint_mode} hint images")
+        if args.hint_mode == 'canny':
+            print(f"  - clean_sources/: Inpainted images (defect removed) for source")
     
     if not args.skip_validation:
         print(f"  - validation/: Validation reports and visualizations")

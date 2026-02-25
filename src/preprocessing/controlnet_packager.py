@@ -327,43 +327,93 @@ class ControlNetDatasetPackager:
             result = result.drop(columns=['_diversity_key'])
         return result
     
-    def package_single_roi(self, roi_data: Dict, 
+    def _create_clean_source(self, roi_image: np.ndarray,
+                             roi_mask: np.ndarray) -> np.ndarray:
+        """
+        Create clean source image by inpainting the defect region (v5).
+
+        Uses OpenCV TELEA inpainting to fill defect pixels with surrounding
+        background texture.  The result is used as the ControlNet ``source``
+        image so that training teaches the model to ADD defects, not
+        reconstruct the same image (the v4 source==target bug).
+
+        Args:
+            roi_image: Original ROI image with defect (H, W, 3), RGB.
+            roi_mask: Binary defect mask (H, W), values 0 or 1.
+
+        Returns:
+            Inpainted image (H, W, 3), RGB, defect region filled with
+            background texture.
+        """
+        mask_uint8 = (roi_mask > 0).astype(np.uint8) * 255
+        # Dilate mask slightly so inpainting covers defect boundaries cleanly
+        kernel = np.ones((3, 3), np.uint8)
+        dilated_mask = cv2.dilate(mask_uint8, kernel, iterations=2)
+
+        roi_bgr = cv2.cvtColor(roi_image, cv2.COLOR_RGB2BGR)
+        clean_bgr = cv2.inpaint(roi_bgr, dilated_mask,
+                                inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+        return cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2RGB)
+
+    def package_single_roi(self, roi_data: Dict,
                           roi_image: np.ndarray,
                           roi_mask: np.ndarray,
-                          output_dir: Path) -> Dict:
+                          output_dir: Path,
+                          hint_mode: str = 'canny') -> Dict:
         """
-        Package a single ROI with hint image and metadata.
-        
+        Package a single ROI with hint image, clean source, and metadata.
+
+        v5 changes vs v4:
+          - hint_mode='canny': Canny edges of defect boundary (compatible
+            with sd-controlnet-canny pretrained weights).
+          - clean source: defect inpainted with TELEA; stored as
+            ``clean_source_path`` so that train.jsonl can set
+            source=clean, target=original (teaching the model to ADD defects).
+
         Args:
             roi_data: ROI metadata dictionary
-            roi_image: ROI image array (H, W, 3)
+            roi_image: ROI image array (H, W, 3), RGB
             roi_mask: ROI mask array (H, W)
             output_dir: Output directory
-            
+            hint_mode: 'canny' (v5) or 'grayscale' (v4 legacy)
+
         Returns:
-            Updated roi_data with hint_path and prompt
+            Updated roi_data with hint_path, clean_source_path, and prompt
         """
+        image_id = roi_data['image_id']
+        class_id = roi_data['class_id']
+        region_id = roi_data['region_id']
+
         # Generate hint image
         hint_image = self.hint_generator.generate_hint_image(
             roi_image=roi_image,
             roi_mask=roi_mask,
             defect_metrics=roi_data,
             background_type=roi_data.get('background_type', 'smooth'),
-            stability_score=roi_data.get('stability_score', 0.5)
+            stability_score=roi_data.get('stability_score', 0.5),
+            hint_mode=hint_mode,
         )
-        
+
         # Save hint image
         hint_dir = output_dir / 'hints'
         hint_dir.mkdir(parents=True, exist_ok=True)
-        
-        image_id = roi_data['image_id']
-        class_id = roi_data['class_id']
-        region_id = roi_data['region_id']
+
         hint_filename = f"{image_id}_class{class_id}_region{region_id}_hint.png"
         hint_path = hint_dir / hint_filename
-        
+
         self.hint_generator.save_hint_image(hint_image, hint_path)
-        
+
+        # Create and save clean source (inpainted, defect removed) — v5
+        clean_src_dir = output_dir / 'clean_sources'
+        clean_src_dir.mkdir(parents=True, exist_ok=True)
+
+        clean_src_filename = f"{image_id}_class{class_id}_region{region_id}_clean.png"
+        clean_src_path = clean_src_dir / clean_src_filename
+
+        clean_image = self._create_clean_source(roi_image, roi_mask)
+        clean_bgr = cv2.cvtColor(clean_image, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(clean_src_path), clean_bgr)
+
         # Generate prompt
         prompt = self.prompt_generator.generate_prompt(
             defect_subtype=roi_data.get('defect_subtype', 'general'),
@@ -373,32 +423,38 @@ class ControlNetDatasetPackager:
             defect_metrics=roi_data,
             suitability_score=roi_data.get('suitability_score', 0.5)
         )
-        
+
         negative_prompt = self.prompt_generator.generate_negative_prompt()
-        
+
         # Update roi_data
         roi_data['hint_path'] = str(hint_path)
+        roi_data['clean_source_path'] = str(clean_src_path)
         roi_data['prompt'] = prompt
         roi_data['negative_prompt'] = negative_prompt
-        
+
         return roi_data
     
-    def create_train_jsonl(self, roi_metadata: List[Dict], 
+    def create_train_jsonl(self, roi_metadata: List[Dict],
                           output_path: Path,
                           relative_paths: bool = True,
                           base_dir: Optional[Path] = None):
         """
         Create train.jsonl file for ControlNet training.
-        
-        Format per line:
+
+        v5 format (source ≠ target):
         {
-            "source": "path/to/roi_image.png",
-            "target": "path/to/roi_image.png",  # Same as source for this task
-            "prompt": "a linear scratch on vertical striped metal surface...",
-            "hint": "path/to/hint_image.png",
-            "negative_prompt": "blurry, low quality..."
+            "source": "clean_sources/…_clean.png",   # inpainted (defect removed)
+            "target": "roi_patches/images/….png",    # original with defect
+            "prompt": "a linear scratch on …",
+            "hint":   "hints/…_hint.png",            # Canny edges
+            "negative_prompt": "blurry, …"
         }
-        
+
+        ``source`` is the inpainted clean background produced by
+        ``_create_clean_source()``.  If ``clean_source_path`` is missing
+        in roi_data (e.g. hints-only run), ``source`` falls back to
+        ``roi_image_path`` to preserve backward compatibility.
+
         Args:
             roi_metadata: List of ROI metadata dictionaries
             output_path: Path to save train.jsonl
@@ -406,34 +462,46 @@ class ControlNetDatasetPackager:
             base_dir: Base directory for relative paths
         """
         jsonl_lines = []
-        
+
         for roi_data in roi_metadata:
-            # Get paths
-            source_path = roi_data.get('roi_image_path', '')
+            # target = original ROI image with defect
+            target_path = roi_data.get('roi_image_path', '')
+            # source = inpainted clean background (v5); fall back to target if absent
+            source_path = roi_data.get('clean_source_path', target_path)
             hint_path = roi_data.get('hint_path', '')
-            
+
             if relative_paths and base_dir:
-                try:
-                    source_path = Path(source_path).relative_to(base_dir)
-                    hint_path = Path(hint_path).relative_to(base_dir)
-                except ValueError:
-                    pass  # Keep absolute if relative conversion fails
-            
+                for attr_name, path_val in [
+                    ('target_path', target_path),
+                    ('source_path', source_path),
+                    ('hint_path', hint_path),
+                ]:
+                    try:
+                        resolved = str(Path(path_val).relative_to(base_dir))
+                    except ValueError:
+                        resolved = path_val
+                    if attr_name == 'target_path':
+                        target_path = resolved
+                    elif attr_name == 'source_path':
+                        source_path = resolved
+                    else:
+                        hint_path = resolved
+
             entry = {
-                "source": str(source_path),
-                "target": str(source_path),  # For defect generation, target = source
+                "source": str(source_path),   # clean background (inpainted)
+                "target": str(target_path),   # original with defect
                 "prompt": roi_data.get('prompt', ''),
                 "hint": str(hint_path),
-                "negative_prompt": roi_data.get('negative_prompt', '')
+                "negative_prompt": roi_data.get('negative_prompt', ''),
             }
-            
+
             jsonl_lines.append(entry)
-        
+
         # Write JSONL file
         with open(output_path, 'w') as f:
             for entry in jsonl_lines:
                 f.write(json.dumps(entry) + '\n')
-        
+
         print(f"Created train.jsonl with {len(jsonl_lines)} entries at: {output_path}")
     
     def create_metadata_json(self, roi_metadata: List[Dict], 
@@ -472,10 +540,11 @@ class ControlNetDatasetPackager:
                        quality_filter: bool = True,
                        min_area: int = 100,
                        min_stability: float = 0.3,
-                       min_matching: float = 0.5) -> Path:
+                       min_matching: float = 0.5,
+                       hint_mode: str = 'canny') -> Path:
         """
         Package complete dataset for ControlNet training.
-        
+
         Args:
             roi_metadata_df: DataFrame with ROI metadata from ROI extraction
             train_images_dir: Directory with original training images
@@ -488,7 +557,8 @@ class ControlNetDatasetPackager:
             min_area: 최소 결함 영역 (px, 기본: 100)
             min_stability: 최소 stability_score (기본: 0.3)
             min_matching: 최소 matching_score (기본: 0.5)
-            
+            hint_mode: 'canny' (v5, default) or 'grayscale' (v4 legacy).
+
         Returns:
             Path to output directory
         """
@@ -559,7 +629,8 @@ class ControlNetDatasetPackager:
                     roi_data=roi_data,
                     roi_image=roi_image_rgb,
                     roi_mask=roi_mask,
-                    output_dir=output_dir
+                    output_dir=output_dir,
+                    hint_mode=hint_mode,
                 )
             else:
                 # Just generate prompts

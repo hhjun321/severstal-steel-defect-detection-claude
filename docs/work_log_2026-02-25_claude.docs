@@ -1,0 +1,363 @@
+# 작업 일지 — 2026-02-25 (Claude 세션)
+
+## 목적
+
+`docs/work_log_2026-02-25_claude.md` 및 `outputs/result-v4/` 결과를 바탕으로
+ControlNet v4의 근본 원인을 분석하고, v5 개선 사항을 코드에 반영한다.
+
+---
+
+## 수정 파일 요약
+
+| 파일 | 우선순위 | 수정 내용 |
+|------|----------|-----------|
+| `src/preprocessing/hint_generator.py` | Critical | Canny 힌트 생성기 추가 (v5) |
+| `src/preprocessing/controlnet_packager.py` | Critical | source≠target 수정 (TELEA 인페인팅) |
+| `controlnet_training/training_config.json` | Major | v5 학습 설정 반영 |
+| `scripts/prepare_controlnet_data.py` | Major | `--hint_mode` 인자 추가 |
+| `scripts/extract_rois.py` | Major | v5 재작성: 256×256 타일 기반 ROI 추출 |
+| `scripts/train_controlnet.py` | 참고 | 코드 미수정; v5 CLI 인자 정리 |
+| `scripts/test_controlnet.py` | 참고 | 코드 미수정; v5 CLI 인자 정리 |
+
+---
+
+## 상세 수정 내역
+
+### 1. `src/preprocessing/hint_generator.py`
+
+**문제**
+v4에서 사용한 커스텀 그레이스케일 힌트(R*0.5 + G*0.3 + B*0.2)는
+`sd-controlnet-canny` 사전학습 가중치와 포맷이 불일치하여 모델이 힌트를
+무시하는 현상 발생. Phase 2 결과에서 `guidance_scale ↑ → quality_score ↓` 역상관
+패턴이 이를 증명 (conditioning을 약하게 쓸수록 오히려 품질이 좋음).
+
+**수정 내용**
+- 모듈 docstring에 두 모드(canny/grayscale)의 차이점 및 비호환성 명시
+- `generate_canny_hint()` 메서드 신규 추가 (v5):
+  ```python
+  def generate_canny_hint(self, roi_mask, low_threshold=50,
+                          high_threshold=150, dilate_iterations=1):
+      mask_uint8 = (roi_mask > 0).astype(np.uint8) * 255
+      edges = cv2.Canny(mask_uint8, low_threshold, high_threshold)
+      if dilate_iterations > 0:
+          kernel = np.ones((3, 3), np.uint8)
+          edges = cv2.dilate(edges, kernel, iterations=dilate_iterations)
+      return np.stack([edges, edges, edges], axis=2)
+  ```
+  - 출력: R==G==B 흰 엣지/검정 배경 3채널 이미지
+  - `sd-controlnet-canny` 사전학습 포맷과 완전 일치
+- `generate_hint_image()` 디스패처에 `hint_mode` 파라미터 추가:
+  - `hint_mode='canny'` → `generate_canny_hint()` 호출
+  - `hint_mode='grayscale'` → 기존 v4 레거시 경로
+
+**효과**
+모델이 Canny 힌트를 실제로 conditioning 신호로 활용하게 됨.
+guidance_scale을 높일수록 결함 경계가 뚜렷하게 생성 예상.
+
+---
+
+### 2. `src/preprocessing/controlnet_packager.py`
+
+**문제 (Critical)**
+v4 `train.jsonl` 직접 확인 결과: `source`와 `target`이 동일한 파일 경로.
+```json
+{"source": "roi_patches/images/X.png", "target": "roi_patches/images/X.png", ...}
+```
+모델이 학습한 것: "hint → 특정 ROI 패치 복원"
+추론 시(txt2img): source 잠재 벡터 없음 → 생성 이미지가 참조와 공간적으로 무관
+→ **SSIM ≈ 0.0269 의 직접적 원인**
+
+**수정 내용 — `_create_clean_source()` 추가**
+- OpenCV TELEA 인페인팅으로 결함 영역을 배경 텍스처로 채운 clean 이미지 생성:
+  ```python
+  def _create_clean_source(self, roi_image, roi_mask):
+      mask_uint8 = (roi_mask > 0).astype(np.uint8) * 255
+      kernel = np.ones((3, 3), np.uint8)
+      dilated_mask = cv2.dilate(mask_uint8, kernel, iterations=2)
+      roi_bgr = cv2.cvtColor(roi_image, cv2.COLOR_RGB2BGR)
+      clean_bgr = cv2.inpaint(roi_bgr, dilated_mask,
+                              inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+      return cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2RGB)
+  ```
+
+**수정 내용 — `package_single_roi()` 업데이트**
+- `hint_mode='canny'` 파라미터 추가 (기본값)
+- clean source 이미지를 `clean_sources/` 서브디렉토리에 저장
+- `roi_data['clean_source_path']` 키에 경로 기록
+
+**수정 내용 — `create_train_jsonl()` source≠target 수정**
+```python
+# v5: source = 결함 제거 배경, target = 결함 있는 원본
+target_path = roi_data.get('roi_image_path', '')
+source_path = roi_data.get('clean_source_path', target_path)
+entry = {
+    "source": str(source_path),   # 인페인팅된 clean 배경
+    "target": str(target_path),   # 결함이 있는 원본 이미지
+    ...
+}
+```
+- `clean_source_path`가 없는 경우(--skip_hints 실행 등) `roi_image_path`로 폴백
+
+**수정 내용 — `package_dataset()` 업데이트**
+- `hint_mode='canny'` 파라미터 추가 및 `package_single_roi()`에 전달
+
+**효과**
+모델이 학습하는 매핑: "clean 배경 + hint → 결함 추가"
+추론 시 clean 배경 타일을 source로 제공하면 올바른 위치에 결함 생성.
+
+---
+
+### 3. `controlnet_training/training_config.json`
+
+**문제**
+v4 설정의 3가지 문제:
+1. `force_grayscale_target: true` — 생성 이미지는 흑백, SSIM 비교는 컬러 → 구조적 SSIM 저하
+2. `augment: false` — 데이터 부족 환경에서 overfitting 위험
+3. `early_stopping_patience: 5` (train loss 기반, `validation_steps: 0`) — epoch 22에서 조기 종료
+
+**수정 내용 (v5)**
+```json
+{
+  "data_dir": "/content/drive/MyDrive/data/Severstal/controlnet_dataset_v5",
+  "output_dir": "/content/drive/MyDrive/data/Severstal/controlnet_training_v5",
+  "num_train_epochs": 50,
+  "force_grayscale_target": false,
+  "gray_loss_lambda": 0.0,
+  "augment": true,
+  "early_stopping_patience": 0,
+  ...
+}
+```
+
+| 항목 | v4 | v5 |
+|------|-----|-----|
+| `force_grayscale_target` | `true` | `false` |
+| `gray_loss_lambda` | — | `0.0` |
+| `augment` | `false` | `true` |
+| `early_stopping_patience` | `5` | `0` (비활성화) |
+| `num_train_epochs` | `30` | `50` |
+| `data_dir` | `controlnet_dataset_v4` | `controlnet_dataset_v5` |
+| `output_dir` | `controlnet_training_v4` | `controlnet_training_v5` |
+
+---
+
+### 4. `scripts/prepare_controlnet_data.py`
+
+**수정 내용**
+- `--hint_mode` 인자 추가 (choices: `canny`/`grayscale`, 기본값: `canny`):
+  ```
+  --hint_mode canny     (v5, 기본값): sd-controlnet-canny 호환 Canny 엣지
+  --hint_mode grayscale (v4, 레거시): R*0.5+G*0.3+B*0.2 그레이스케일 (비호환)
+  ```
+- `Hint mode: {args.hint_mode}` 출력 추가
+- `packager.package_dataset()` 호출에 `hint_mode=args.hint_mode` 전달
+- 출력 요약에 `clean_sources/` 디렉토리 안내 추가
+
+**사용법** (req_20260225_1.txt Step 2 기준)
+```bash
+python scripts/prepare_controlnet_data.py \
+  --roi_metadata /content/drive/MyDrive/data/Severstal/roi_patches_v5.1/roi_metadata.csv \
+  --train_images /content/drive/MyDrive/data/Severstal/train_images \
+  --train_csv    /content/drive/MyDrive/data/Severstal/train.csv \
+  --output_dir   /content/drive/MyDrive/data/Severstal/controlnet_dataset_v5.1 \
+  --hint_mode    canny \
+  --prompt_style detailed \
+  --max_samples  2000 \
+  --validation_samples 16
+```
+
+| 인자 | v5 값 | 비고 |
+|------|-------|------|
+| `--hint_mode` | `canny` | v5 신규; sd-controlnet-canny 호환 |
+| `--max_samples` | `2000` | 클래스 균등 stratified 샘플링 |
+| `--validation_samples` | `16` | 시각 검증용 샘플 수 |
+| `--prompt_style` | `detailed` | 결함 유형+배경 상세 프롬프트 |
+
+---
+
+### 6. `scripts/train_controlnet.py` (v5 실행 인자)
+
+**미수정 파일** — 코드 변경 없음. v5에서는 CLI 인자로 v5 동작을 제어.
+
+**사용법** (req_20260225_1.txt Step 3 기준 + v5 플래그 추가)
+```bash
+python scripts/train_controlnet.py \
+  --data_dir    /content/drive/MyDrive/data/Severstal/controlnet_dataset_v5.1 \
+  --output_dir  /content/drive/MyDrive/data/Severstal/controlnet_training_v5.1 \
+  --pretrained_model_name_or_path  runwayml/stable-diffusion-v1-5 \
+  --controlnet_model_name_or_path  lllyasviel/sd-controlnet-canny \
+  --resolution 512 \
+  --train_batch_size 1 \
+  --gradient_accumulation_steps 4 \
+  --gradient_checkpointing \
+  --mixed_precision fp16 \
+  --num_train_epochs 100 \
+  --learning_rate 1e-5 \
+  --lr_scheduler cosine \
+  --lr_warmup_steps 50 \
+  --controlnet_conditioning_scale 1.0 \
+  --snr_gamma 5.0 \
+  --no_force_grayscale_target \
+  --gray_loss_lambda 0.0 \
+  --augment \
+  --early_stopping_patience 20 \
+  --validation_steps 200 \
+  --logging_steps 10 \
+  --checkpointing_steps 500 \
+  --checkpoints_total_limit 3 \
+  --save_fp16 \
+  --skip_save_pipeline \
+  --seed 42
+```
+
+| 인자 | v5 값 | v4 대비 변경 | 비고 |
+|------|-------|------------|------|
+| `--no_force_grayscale_target` | (flag) | v4: 기본 `true` → v5: 해제 | 컬러 유지; SSIM 불일치 방지 |
+| `--gray_loss_lambda` | `0.0` | v4: `0.1` | 그레이스케일 loss 비활성화 |
+| `--augment` | (flag) | v4: 없음 | flip + brightness/contrast jitter |
+| `--early_stopping_patience` | `20` | v4: `5` | 조기종료 기준 완화 |
+| `--validation_steps` | `200` | v4: `0` | validation 기반 early stopping 가능 |
+| `--controlnet_conditioning_scale` | `1.0` | v4: `0.7` | Canny 힌트가 올바르므로 scale 복원 |
+
+---
+
+### 7. `scripts/test_controlnet.py` (v5 실행 인자)
+
+**미수정 파일** — 코드 변경 없음. 학습 완료 후 생성 품질 검증 스크립트.
+
+**사용법** (req_20260225_1.txt Step 4 기준)
+```bash
+python scripts/test_controlnet.py \
+  --model_path  /content/drive/MyDrive/data/Severstal/controlnet_training_v5.1/best_model \
+  --jsonl_path  /content/drive/MyDrive/data/Severstal/controlnet_dataset_v5.1/train.jsonl \
+  --image_root  /content/drive/MyDrive/data/Severstal/controlnet_dataset_v5.1 \
+  --output_dir  /content/drive/MyDrive/data/Severstal/test_results_v5.1 \
+  --resolution  512 \
+  --controlnet_conditioning_scale 0.7 \
+  --guidance_scale 7.5 \
+  --num_inference_steps 30 \
+  --num_images_per_sample 1 \
+  --no_grayscale_postprocess \
+  --seed 42
+```
+
+| 인자 | v5 값 | 비고 |
+|------|-------|------|
+| `--model_path` | `…/best_model` | early stopping 최적 체크포인트 |
+| `--jsonl_path` | `…/train.jsonl` | source(clean) + hint 경로 포함 |
+| `--image_root` | `…/controlnet_dataset_v5.1` | 상대경로 해석 기준 |
+| `--controlnet_conditioning_scale` | `0.7` | 추론 시 적용 (학습 1.0과 다를 수 있음) |
+| `--no_grayscale_postprocess` | (flag) | v5: 컬러 타겟이므로 후처리 불필요 |
+| `--guidance_scale` | `7.5` | v4 Phase 2 최적값(3.0) 대비 증가 — Canny 힌트 활용 기대 |
+
+---
+
+### 5. `scripts/extract_rois.py` (v5 재작성)
+
+**배경**
+v4의 두 번째 근본 원인: ROI 패치 크기 13–63px을 512×512로 업스케일 → 10–40× 확대
+→ 흐릿한 그레이스케일 블롭이 학습 표적이 됨 → SSIM ≈ 0
+
+v4 `extract_rois.py`는 복잡한 `ROIExtractor` / `BackgroundAnalyzer` 체인을 사용하였으나,
+v5에서는 파라미터·구조를 새롭게 재작성하여 타일 기반 추출로 교체.
+(req_20260225_1.txt Step 1에서 `extract_rois.py`를 사용하므로 스크립트 명 유지)
+
+**v5 접근법**
+Severstal 이미지(1600×256px)에서 결함을 중심으로 하는 **256×256 타일**을 추출.
+최대 업스케일 배율: 2× (512×512 학습 시). 배경 컨텍스트를 충분히 포함.
+
+**구현 내용**
+- `find_regions()`: `cv2.connectedComponents`로 결함 연결 요소 탐지
+- `compute_shape_metrics()`: linearity, solidity, extent, aspect_ratio, defect_subtype 계산
+- `compute_tile_window()`: 결함 중심 기반 256px 수평 창 계산 (경계 클리핑 처리)
+- `extract_tiles_from_image()`: 단일 이미지에서 모든 클래스의 타일 추출 및 저장
+- 출력 포맷: `prepare_controlnet_data.py`가 직접 소비할 수 있는 `roi_metadata.csv`
+
+**타일 창 계산 알고리즘**
+```python
+cx = (defect_x1 + defect_x2) // 2
+tx1 = cx - 128
+tx2 = tx1 + 256
+# 경계 처리
+if tx1 < 0:    tx1, tx2 = 0, 256
+if tx2 > 1600: tx1, tx2 = 1344, 1600
+```
+
+**출력 디렉토리 구조**
+```
+<output_dir>/          # 예: roi_patches_v5.1/
+  images/              # 256×256 타일 이미지 (PNG)
+  masks/               # 256×256 단일 region 마스크 (PNG)
+  roi_metadata.csv     # prepare_controlnet_data.py 호환 메타데이터
+  statistics.txt       # 추출 통계
+```
+
+**metadata CSV 컬럼** (기존 roi_metadata.csv 포맷 유지)
+- image_id, class_id, region_id
+- roi_bbox (타일 창 좌표), defect_bbox (원본 이미지 좌표)
+- area, linearity, solidity, extent, aspect_ratio, defect_subtype
+- background_type='steel_surface', suitability_score (면적 기반 추정)
+- matching_score=0.7, continuity_score=0.5, stability_score=0.5
+- recommendation='acceptable'
+- roi_image_path, roi_mask_path
+
+**사용법** (req_20260225_1.txt Step 1 기준)
+```bash
+python scripts/extract_rois.py \
+    --train_csv /content/drive/MyDrive/data/Severstal/train.csv \
+    --image_dir /content/drive/MyDrive/data/Severstal/train_images \
+    --output_dir /content/drive/MyDrive/data/Severstal/roi_patches_v5.1
+```
+
+---
+
+## v5 전체 파이프라인
+
+```
+train.csv + train_images/
+        ↓
+[Step 1] extract_rois.py              ← v5 재작성 (256×256 타일 기반)
+        ↓ roi_patches_v5.1/roi_metadata.csv
+[Step 2] prepare_controlnet_data.py --hint_mode canny
+        ↓ controlnet_dataset_v5.1/
+          ├── hints/          (Canny 엣지)
+          ├── clean_sources/  (TELEA 인페인팅)
+          ├── roi_patches/    (원본 타일 = target)
+          └── train.jsonl     (source≠target)
+        ↓
+[Step 3] train_controlnet.py (training_config.json v5)
+        ↓
+[Step 4] test_controlnet.py (추론 및 품질 검증)
+```
+
+---
+
+## v4 → v5 개선 대조표
+
+| 항목 | v4 (문제) | v5 (수정) |
+|------|-----------|-----------|
+| `source` / `target` | 동일 파일 (SSIM≈0) | source=인페인팅 배경, target=결함 원본 |
+| 힌트 포맷 | R*0.5+G*0.3+B*0.2 (비호환) | Canny 엣지 (sd-controlnet-canny 호환) |
+| `force_grayscale_target` | `true` (SSIM 측정 불일치) | `false` |
+| 입력 단위 | ROI 패치 13–63px (10–40× 업스케일) | 256×256 타일 (최대 2× 업스케일) |
+| `early_stopping` | patience=5 (epoch 22 조기 종료) | 비활성화 (50 epoch 완주) |
+| `augment` | `false` | `true` (flip, brightness, contrast) |
+
+---
+
+## 미완성 항목 (차기 작업)
+
+- **`img2img` 추론** — `generate_augmented_data.py` 또는 Colab 추론 스크립트에서
+  clean 배경 타일을 초기 이미지로 사용하는 `StableDiffusionControlNetImg2ImgPipeline`
+  적용. 현재는 `txt2img`(순수 노이즈 시작) 방식 사용 중.
+- **배경 분류 개선** — `extract_rois.py`에서 배경 유형을 'steel_surface'로
+  통일 처리 중. `BackgroundAnalyzer`를 연동하면 'vertical_stripe' 등 세분화 가능.
+
+---
+
+## 참고 파일
+
+- `docs/work_log_2026-02-25_claude.md` — 이전 세션 작업 일지 (CASDA 버그 수정 + v4 원인 분석)
+- `docs/20260225_2.docs` — v4 근본 원인 최종 진단 문서
+- `outputs/result-v4/validation_report_phase4.txt` — SSIM=0.0269, quality=0.6254 확인
+- `outputs/control-dataset-v4/train.jsonl` — source==target 버그 직접 확인
