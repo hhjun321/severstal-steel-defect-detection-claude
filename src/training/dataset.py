@@ -5,7 +5,7 @@ Provides PyTorch Dataset classes for both detection and segmentation tasks,
 supporting 4 dataset groups:
   - Baseline (Raw): Original Severstal only
   - Baseline (Trad): Original + traditional augmentations
-  - CASDA-Full: Original + all ~2,901 synthetic images (ControlNet v4)
+  - CASDA-Full: Original + all 5,000 CASDA synthetic images
   - CASDA-Pruning: Original + top 2,000 CASDA images by suitability score
 """
 
@@ -299,6 +299,7 @@ class CASDASyntheticDataset(Dataset):
         num_classes: int = 4,
         suitability_threshold: Optional[float] = None,
         max_samples: Optional[int] = None,
+        stratified: bool = False,
         transform=None,
     ):
         self.data_dir = Path(data_dir)
@@ -306,6 +307,7 @@ class CASDASyntheticDataset(Dataset):
         self.input_size = input_size
         self.num_classes = num_classes
         self.transform = transform
+        self.stratified = stratified
 
         # Load metadata
         self.samples = self._load_metadata(suitability_threshold, max_samples)
@@ -345,35 +347,81 @@ class CASDASyntheticDataset(Dataset):
                 all_samples.append({
                     'image_path': str(img_path),
                     'class_id': class_id,
-                    'suitability_score': 1.0,
+                    'suitability_score': 0.0,  # v5.4 fix: 기본값 0 (알 수 없는 품질)
                 })
 
-        # Filter by suitability (with top-K fallback)
-        if suitability_threshold is not None and max_samples is not None:
-            filtered = [
-                s for s in all_samples
-                if s.get('suitability_score', 0.0) >= suitability_threshold
-            ]
-            if len(filtered) >= max_samples:
-                # threshold 조건 충족 → 상위 max_samples 선택
-                filtered.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
-                all_samples = filtered[:max_samples]
-            else:
-                # 점수 미산정 또는 threshold 미달 → score 기준 상위 max_samples (fallback)
-                all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
-                all_samples = all_samples[:max_samples]
-        elif suitability_threshold is not None:
+        # Filter by suitability (기본값 0: 점수 없는 샘플 제외)
+        if suitability_threshold is not None:
             all_samples = [
                 s for s in all_samples
                 if s.get('suitability_score', 0.0) >= suitability_threshold
             ]
-            all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
-        else:
-            all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
-            if max_samples is not None:
+
+        # Sort by suitability (descending) and limit
+        all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+
+        if max_samples is not None:
+            if self.stratified:
+                all_samples = self._stratified_top_k(all_samples, max_samples)
+            else:
                 all_samples = all_samples[:max_samples]
 
         return all_samples
+
+    @staticmethod
+    def _stratified_top_k(samples: List[Dict], k: int) -> List[Dict]:
+        """
+        클래스별 비례 배분으로 상위 k개 샘플을 선택한다.
+
+        각 클래스에서 suitability_score 상위 순으로 (클래스 비율 × k)개를
+        선택하여 클래스 불균형을 유지한 pruning을 수행한다.
+
+        Args:
+            samples: suitability_score 기준 내림차순 정렬된 샘플 목록
+            k: 선택할 총 샘플 수
+
+        Returns:
+            계층화된 상위 k개 샘플 목록
+        """
+        if len(samples) <= k:
+            return samples
+
+        # 클래스별 그룹화
+        class_groups: Dict[int, List[Dict]] = {}
+        for s in samples:
+            cid = s.get('class_id', 0)
+            class_groups.setdefault(cid, []).append(s)
+
+        total = len(samples)
+        selected = []
+
+        # 비례 배분 (최소 1개 보장)
+        remaining = k
+        allocations = {}
+        for cid, group in class_groups.items():
+            alloc = max(1, int(round(len(group) / total * k)))
+            allocations[cid] = min(alloc, len(group))
+
+        # 총 할당이 k를 초과하면 가장 큰 그룹에서 감소
+        while sum(allocations.values()) > k:
+            largest_cid = max(allocations, key=allocations.get)
+            allocations[largest_cid] -= 1
+
+        # 총 할당이 k 미만이면 가장 큰 그룹에서 증가
+        while sum(allocations.values()) < k:
+            for cid in sorted(allocations, key=lambda c: len(class_groups[c]), reverse=True):
+                if allocations[cid] < len(class_groups[cid]):
+                    allocations[cid] += 1
+                    if sum(allocations.values()) >= k:
+                        break
+
+        # 각 클래스에서 상위 N개 선택 (이미 score 순 정렬됨)
+        for cid, group in class_groups.items():
+            n = allocations.get(cid, 0)
+            group.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+            selected.extend(group[:n])
+
+        return selected
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -465,6 +513,11 @@ class CASDASyntheticDataset(Dataset):
                 mask_path = str(self.data_dir / mask_path)
             m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             if m is not None:
+                # Defensive resize: CASDA masks may be 256×256 (ROI patch size)
+                # while generated images are 512×512 (ControlNet resolution)
+                if m.shape[:2] != (orig_h, orig_w):
+                    m = cv2.resize(m, (orig_w, orig_h),
+                                   interpolation=cv2.INTER_NEAREST)
                 cls_id = sample.get('class_id', 0)
                 mask[cls_id] = (m > 127).astype(np.uint8)
 
@@ -590,6 +643,15 @@ def build_transforms(
                 p=0.5,
             ),
         ])
+        # Scale augmentation (if scale_range defined in YAML)
+        scale_range = trad_config.get('scale_range', None)
+        if scale_range and isinstance(scale_range, (list, tuple)) and len(scale_range) == 2:
+            transforms_list.append(
+                A.RandomScale(
+                    scale_limit=(scale_range[0] - 1.0, scale_range[1] - 1.0),
+                    p=0.5,
+                )
+            )
 
     # Normalize and convert to tensor
     transforms_list.extend([
@@ -707,6 +769,12 @@ def create_data_loaders(
     casda_data = group_config.get('casda_data', None)
     if casda_data is not None:
         casda_config = ds_config.get('casda', {})
+        # ratio 그룹의 _casda_max_samples 지원
+        group_max_samples = group_config.get('_casda_max_samples', None)
+        # pruning 설정 (그룹별 casda_pruning 섹션 우선)
+        group_pruning = group_config.get('casda_pruning', {})
+        use_stratified = group_pruning.get('stratified', False)
+
         if casda_data == "full":
             raw_casda = casda_config.get('full_dir', 'data/augmented/casda_full')
             casda_dir = raw_casda if os.path.isabs(raw_casda) else str(project_root / raw_casda)
@@ -715,6 +783,7 @@ def create_data_loaders(
                 mode=model_type,
                 input_size=input_size,
                 num_classes=ds_config.get('num_classes', 4),
+                max_samples=group_max_samples,  # ratio 제한 (None이면 전체)
                 transform=train_transform,
             )
         elif casda_data == "pruning":
@@ -726,7 +795,30 @@ def create_data_loaders(
                 input_size=input_size,
                 num_classes=ds_config.get('num_classes', 4),
                 suitability_threshold=casda_config.get('suitability_threshold', 0.63),
-                max_samples=casda_config.get('pruning_top_k', 2000),
+                max_samples=group_max_samples or casda_config.get('pruning_top_k', 2000),
+                stratified=use_stratified,
+                transform=train_transform,
+            )
+        elif casda_data == "composed":
+            # v5.4: Poisson Blending 합성 이미지 (casda_composed 디렉토리)
+            raw_casda = casda_config.get('composed_dir', 'data/augmented/casda_composed')
+            casda_dir = raw_casda if os.path.isabs(raw_casda) else str(project_root / raw_casda)
+            # pruning이 활성화되어 있으면 threshold + top-k 적용
+            pruning_enabled = group_pruning.get('enabled', False)
+            threshold = group_pruning.get('suitability_threshold',
+                                          casda_config.get('suitability_threshold', 0.63)) \
+                        if pruning_enabled else None
+            max_s = group_pruning.get('top_k',
+                                      casda_config.get('pruning_top_k', 2000)) \
+                    if pruning_enabled else group_max_samples
+            casda_dataset = CASDASyntheticDataset(
+                data_dir=casda_dir,
+                mode=model_type,
+                input_size=input_size,
+                num_classes=ds_config.get('num_classes', 4),
+                suitability_threshold=threshold,
+                max_samples=max_s,
+                stratified=use_stratified and pruning_enabled,
                 transform=train_transform,
             )
         else:

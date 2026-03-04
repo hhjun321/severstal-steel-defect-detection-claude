@@ -16,6 +16,16 @@ Dataset Groups:
   - casda_pruning (alias: pruning)        : Original + top CASDA images by suitability
   - all                                   : Run all groups
 
+CASDA Inject/Clean Strategy:
+  For CASDA groups (casda_full, casda_pruning), instead of creating separate YOLO
+  directories, the script:
+  1. Injects CASDA images/labels into baseline_raw/images/train/ (prefix: casda_*)
+  2. Trains all models on the augmented baseline_raw
+  3. Cleans CASDA files (removes casda_* prefix files) to restore baseline_raw
+  This avoids duplicating baseline_raw (saves disk space and I/O time).
+  Detection models use the injected baseline_raw; segmentation models use
+  ConcatDataset internally (no inject needed, uses --casda-dir directly).
+
 Usage:
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml
   python scripts/run_benchmark.py --config configs/benchmark_experiment.yaml --models yolo_mfd --groups baseline
@@ -30,6 +40,7 @@ import os
 import sys
 import argparse
 import logging
+import shutil
 import time
 import json
 import yaml
@@ -79,6 +90,9 @@ GROUP_ALIASES = {
     "traditional": "baseline_trad",
     "full":      "casda_full",
     "pruning":   "casda_pruning",
+    # v5.4: Poisson Blending composed
+    "composed":          "casda_composed",
+    "composed_pruning":  "casda_composed_pruning",
     # Special
     "all":       "__ALL__",
 }
@@ -218,6 +232,104 @@ def create_segmentation_model(model_key: str, model_config: dict, num_classes: i
 
 
 # ============================================================================
+# CASDA Inject / Clean  — baseline_raw 에 직접 주입/삭제
+# ============================================================================
+CASDA_PREFIX = "casda_"
+
+
+def inject_casda_to_baseline(
+    baseline_dir: str,
+    casda_dir: str,
+    prefix: str = CASDA_PREFIX,
+    max_samples: Optional[int] = None,
+    suitability_threshold: Optional[float] = None,
+) -> int:
+    """
+    CASDA 합성 이미지/라벨을 baseline_raw YOLO 데이터셋의 train/에 주입한다.
+
+    이미지: symlink (실패 시 copy) → {baseline_dir}/images/train/{prefix}NNNNN_{name}
+    라벨:  metadata.json의 bboxes를 YOLO .txt로 직접 작성
+
+    metadata.json에 bbox_format="yolo" + bboxes 가 있으면 cv2 I/O 제로.
+    없으면 mask_path → contour → bbox 변환 (레거시 호환).
+
+    Args:
+        baseline_dir: baseline_raw YOLO 데이터셋 경로 (images/train/, labels/train/ 포함)
+        casda_dir: CASDA 패키징 디렉토리 (images/, masks/, metadata.json)
+        prefix: 주입 파일 접두사 (clean 시 이 prefix로 삭제)
+        max_samples: 주입할 최대 합성 이미지 수 (None이면 전체)
+        suitability_threshold: 최소 suitability 점수 (None이면 필터링 없음)
+
+    Returns:
+        주입된 이미지 수
+    """
+    from src.training.dataset_yolo import _add_casda_to_training
+
+    baseline_path = Path(baseline_dir)
+    images_train = baseline_path / "images" / "train"
+    labels_train = baseline_path / "labels" / "train"
+
+    if not images_train.exists() or not labels_train.exists():
+        logging.error(f"baseline train dirs not found: {images_train}, {labels_train}")
+        return 0
+
+    # max_samples 또는 suitability_threshold가 있으면 pruning 모드로 필터링
+    casda_mode = "full"
+    casda_config = {}
+    if max_samples is not None or suitability_threshold is not None:
+        casda_mode = "pruning"
+        casda_config = {
+            'pruning_top_k': max_samples or 99999,
+            'suitability_threshold': suitability_threshold or 0.0,
+        }
+
+    count = _add_casda_to_training(
+        casda_dir=casda_dir,
+        casda_mode=casda_mode,
+        casda_config=casda_config,
+        images_train_dir=images_train,
+        labels_train_dir=labels_train,
+        num_classes=4,
+    )
+
+    logging.info(f"  Injected {count} CASDA images into {images_train}")
+    return count
+
+
+def clean_casda_from_baseline(
+    baseline_dir: str,
+    prefix: str = CASDA_PREFIX,
+) -> int:
+    """
+    baseline_raw YOLO 데이터셋에서 CASDA prefix 파일을 모두 삭제한다.
+
+    images/train/casda_* 와 labels/train/casda_* 를 삭제.
+    baseline 원본 파일은 prefix가 다르므로 절대 삭제되지 않음.
+
+    Args:
+        baseline_dir: baseline_raw YOLO 데이터셋 경로
+        prefix: 삭제할 파일 접두사
+
+    Returns:
+        삭제된 파일 수 (이미지 + 라벨 합계)
+    """
+    baseline_path = Path(baseline_dir)
+    removed = 0
+
+    for subdir in ["images/train", "labels/train"]:
+        target_dir = baseline_path / subdir
+        if not target_dir.exists():
+            continue
+        for f in target_dir.iterdir():
+            if f.name.startswith(prefix):
+                f.unlink(missing_ok=True)
+                removed += 1
+
+    logging.info(f"  Cleaned {removed} CASDA files from {baseline_path}")
+    return removed
+
+
+# ============================================================================
 # Single Experiment Run
 # ============================================================================
 
@@ -229,22 +341,33 @@ def run_single_experiment(
     device: str = 'cuda',
     resume: bool = False,
     yolo_dir: Optional[str] = None,
+    output_group_key: Optional[str] = None,
 ) -> dict:
     """
     Run a single training experiment.
     
     Routes to UltralyticsTrainer for detection models (YOLO-MFD, EB-YOLOv8)
     and BenchmarkTrainer for segmentation models (DeepLabV3+).
+    
+    Args:
+        output_group_key: If set, used for output directory naming and metadata
+            instead of dataset_group. This allows CASDA inject mode to train on
+            baseline_raw (with injected files) but label the output as casda_full
+            or casda_pruning.
     """
+    # output_group_key: actual group name for dirs/metadata (e.g. "casda_full")
+    # dataset_group: effective group used for training (e.g. "baseline_raw" after inject)
+    actual_group_key = output_group_key or dataset_group
+    
     model_config = config['models'][model_key]
     model_name = model_config['name']
     model_type = model_config['type']  # "detection" or "segmentation"
-    group_name = config['dataset_groups'][dataset_group]['name']
-    group_config = config['dataset_groups'][dataset_group]
+    group_name = config['dataset_groups'][actual_group_key]['name']
+    group_config = config['dataset_groups'][actual_group_key]
     num_classes = config['dataset']['num_classes']
 
-    # Create output directory
-    run_dir = experiment_dir / f"{model_key}_{dataset_group}"
+    # Create output directory — use actual_group_key for unique naming
+    run_dir = experiment_dir / f"{model_key}_{actual_group_key}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Resume: check if this run is already completed ----
@@ -264,6 +387,8 @@ def run_single_experiment(
     logging.info(f"\n{'#'*70}")
     logging.info(f"# Experiment: {model_name} + {group_name}")
     logging.info(f"# Type: {model_type}")
+    if output_group_key and output_group_key != dataset_group:
+        logging.info(f"# Training on: {dataset_group} (inject mode)")
     logging.info(f"{'#'*70}")
 
     # Get split IDs
@@ -333,7 +458,7 @@ def run_single_experiment(
         resume_checkpoint = None
         if resume:
             checkpoint_dir = run_dir / "checkpoints"
-            latest_path = checkpoint_dir / f"{model_key}_{dataset_group}_latest.pth"
+            latest_path = checkpoint_dir / f"{model_key}_{actual_group_key}_latest.pth"
             if latest_path.exists():
                 resume_checkpoint = str(latest_path)
                 logging.info(f"Resuming from: {resume_checkpoint}")
@@ -341,7 +466,7 @@ def run_single_experiment(
         training_config = {**model_config['training'], 'num_classes': num_classes}
         seg_trainer = BenchmarkTrainer(
             model=model,
-            model_name=f"{model_key}_{dataset_group}",
+            model_name=f"{model_key}_{actual_group_key}",
             model_type=model_type,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -361,7 +486,9 @@ def run_single_experiment(
         'model_key': model_key,
         'model_type': model_type,
         'dataset_group': group_name,
-        'dataset_group_key': dataset_group,
+        'dataset_group_key': actual_group_key,
+        'training_dataset_group': dataset_group,
+        'inject_mode': output_group_key is not None and output_group_key != dataset_group,
         'test_metrics': test_metrics,
         'best_epoch': history.get('best_epoch', 0),
         'best_metric': history.get('best_metric', 0.0),
@@ -608,6 +735,12 @@ Examples:
                              '그룹별 하위 디렉토리(예: baseline_raw/)에 '
                              'images/, labels/, dataset.yaml이 있으면 변환을 건너뜀. '
                              '없으면 이 디렉토리에 변환 결과를 저장하여 다음 실행 시 재사용')
+    parser.add_argument('--casda-ratio', type=float, nargs='+', default=None,
+                        help='CASDA 합성 데이터 주입 비율 (0.0~1.0). '
+                             '지정 시 casda_full 데이터에서 비율에 맞는 수량만 선택. '
+                             '복수 비율 지정 가능: --casda-ratio 0.1 0.2 0.3. '
+                             '원본 train 수 대비 비율로 max_samples 자동 계산. '
+                             '예: 0.1 → 원본 4666장의 10% ≈ 518장 합성 추가')
     args = parser.parse_args()
 
     # Load config
@@ -634,6 +767,9 @@ Examples:
                 tag = " [CASDA full]"
             elif casda == "pruning":
                 tag = " [CASDA pruning]"
+            elif casda == "composed":
+                pruning_on = grp.get('casda_pruning', {}).get('enabled', False)
+                tag = " [CASDA composed + pruning]" if pruning_on else " [CASDA composed]"
             elif grp.get('augmentation') == 'traditional':
                 tag = " [traditional aug]"
             else:
@@ -667,7 +803,8 @@ Examples:
             config['dataset']['casda'] = {}
         config['dataset']['casda']['full_dir'] = os.path.join(casda_base, 'casda_full')
         config['dataset']['casda']['pruning_dir'] = os.path.join(casda_base, 'casda_pruning')
-        print(f"[INFO] casda paths overridden: {casda_base}/casda_full, {casda_base}/casda_pruning")
+        config['dataset']['casda']['composed_dir'] = os.path.join(casda_base, 'casda_composed')
+        print(f"[INFO] casda paths overridden: {casda_base}/casda_full, {casda_base}/casda_pruning, {casda_base}/casda_composed")
 
     # Override split CSV if specified
     if args.split_csv:
@@ -733,10 +870,56 @@ Examples:
     available_groups = list(config['dataset_groups'].keys())
     group_keys = resolve_groups(args.groups, available_groups)
 
+    # ====== --casda-ratio: 동적 ratio 그룹 생성 ======
+    # --casda-ratio 0.1 0.2 0.3 → casda_ratio_10, casda_ratio_20, casda_ratio_30 그룹 자동 생성
+    # --groups 미지정 + --casda-ratio 지정 시: ratio 그룹만 실행
+    # --groups 지정 + --casda-ratio 지정 시: 기존 그룹 + ratio 그룹 병행
+    casda_ratio_map = {}  # group_key → (ratio, max_samples)
+    if args.casda_ratio:
+        # --groups가 없으면 ratio 그룹만 실행하도록 기존 그룹 비우기
+        if args.groups is None:
+            group_keys = []
+
+        # 원본 train 수 계산 (split IDs로부터)
+        train_ids_for_ratio, _, _ = get_split_ids(config)
+        num_train_original = len(train_ids_for_ratio)
+        logging.info(f"Original training set size: {num_train_original}")
+
+        for ratio in args.casda_ratio:
+            if not (0.0 < ratio < 1.0):
+                logging.error(f"Invalid casda-ratio: {ratio} (must be 0.0 < ratio < 1.0)")
+                continue
+
+            # ratio = synthetic / (original + synthetic)
+            # synthetic = original * ratio / (1 - ratio)
+            max_samples = int(num_train_original * ratio / (1.0 - ratio))
+            ratio_pct = int(ratio * 100)
+            ratio_key = f"casda_ratio_{ratio_pct}"
+
+            # 동적 dataset group 등록
+            config['dataset_groups'][ratio_key] = {
+                'name': f"CASDA-Ratio-{ratio_pct}%",
+                'description': f"Original + {max_samples} CASDA images ({ratio_pct}% synthetic ratio)",
+                'use_original': True,
+                'augmentation': 'none',
+                'casda_data': 'full',  # casda_full 디렉토리에서 상위 N개 선택
+                '_casda_max_samples': max_samples,
+                '_casda_ratio': ratio,
+            }
+            casda_ratio_map[ratio_key] = (ratio, max_samples)
+
+            if ratio_key not in group_keys:
+                group_keys.append(ratio_key)
+
+            logging.info(f"  Created ratio group: {ratio_key} "
+                         f"(ratio={ratio:.0%}, max_samples={max_samples})")
+
     logging.info(f"Models: {model_keys}")
     logging.info(f"Dataset groups: {group_keys}")
     if args.groups:
         logging.info(f"  (resolved from CLI: {args.groups})")
+    if args.casda_ratio:
+        logging.info(f"  (casda-ratio groups added: {list(casda_ratio_map.keys())})")
     logging.info(f"Total experiments: {len(model_keys) * len(group_keys)}")
 
     # Log training pipeline info
@@ -748,8 +931,9 @@ Examples:
     reporter = BenchmarkReporter(str(experiment_dir))
 
     # ====== FID Evaluation ======
-    casda_groups = {'casda_full', 'casda_pruning'}
-    has_casda = any(g in casda_groups for g in group_keys)
+    casda_groups_for_fid = {'casda_full', 'casda_pruning', 'casda_composed', 'casda_composed_pruning'}
+    casda_groups_for_fid.update(casda_ratio_map.keys())
+    has_casda = any(g in casda_groups_for_fid for g in group_keys)
 
     if args.fid_only or (has_casda and config.get('evaluation', {}).get('fid', {}).get('compute', True)):
         fid_results = run_fid_evaluation(config, experiment_dir, device)
@@ -761,26 +945,112 @@ Examples:
         return
 
     # ====== Run Experiments ======
+    # Loop structure: group (outer) x model (inner)
+    # For CASDA groups: inject → train all models → clean
+    # This avoids duplicating the baseline_raw directory entirely.
     total_runs = len(model_keys) * len(group_keys)
     run_idx = 0
     start_time = time.time()
 
-    for model_key in model_keys:
-        for group_key in group_keys:
+    CASDA_GROUPS = {"casda_full", "casda_pruning", "casda_composed", "casda_composed_pruning"}
+    CASDA_GROUP_TO_SUBDIR = {
+        "casda_full": "casda_full",
+        "casda_pruning": "casda_pruning",
+        "casda_composed": "casda_composed",
+        "casda_composed_pruning": "casda_composed",  # pruning은 같은 디렉토리에서 필터링
+    }
+
+    # ratio 그룹도 CASDA 그룹으로 취급 (casda_full 디렉토리 사용)
+    for rk in casda_ratio_map:
+        CASDA_GROUPS.add(rk)
+        CASDA_GROUP_TO_SUBDIR[rk] = "casda_full"  # ratio 그룹은 casda_full에서 선택
+
+    # Resolve baseline_raw YOLO directory
+    baseline_yolo_dir = None
+    if args.yolo_dir:
+        baseline_yolo_dir = str(Path(args.yolo_dir) / "baseline_raw")
+        if not (Path(baseline_yolo_dir) / "images" / "train").exists():
+            logging.warning(f"baseline_raw YOLO dir not found at {baseline_yolo_dir}, "
+                            f"inject/clean will be skipped for CASDA groups")
+            baseline_yolo_dir = None
+
+    for group_key in group_keys:
+        is_casda = group_key in CASDA_GROUPS
+        casda_injected = False
+
+        # --- Inject CASDA if needed ---
+        if is_casda and baseline_yolo_dir:
+            casda_subdir = CASDA_GROUP_TO_SUBDIR[group_key]
+            casda_data_dir = None
+
+            # Resolve CASDA data directory from config
+            if args.casda_dir:
+                casda_data_dir = os.path.join(args.casda_dir, casda_subdir)
+            else:
+                casda_cfg = config.get('dataset', {}).get('casda', {})
+                if casda_subdir == "casda_full":
+                    casda_data_dir = casda_cfg.get('full_dir', '')
+                elif casda_subdir == "casda_pruning":
+                    casda_data_dir = casda_cfg.get('pruning_dir', '')
+                elif casda_subdir == "casda_composed":
+                    casda_data_dir = casda_cfg.get('composed_dir', '')
+                else:
+                    casda_data_dir = casda_cfg.get('full_dir', '')
+
+            if casda_data_dir and os.path.exists(casda_data_dir):
+                # ratio 그룹이면 max_samples 제한 적용
+                ratio_max_samples = None
+                if group_key in casda_ratio_map:
+                    _, ratio_max_samples = casda_ratio_map[group_key]
+
+                logging.info(f"\n{'='*70}")
+                logging.info(f"INJECT: {group_key} → baseline_raw")
+                logging.info(f"  Source: {casda_data_dir}")
+                logging.info(f"  Target: {baseline_yolo_dir}")
+                if ratio_max_samples is not None:
+                    logging.info(f"  Max samples: {ratio_max_samples} (ratio-limited)")
+                logging.info(f"{'='*70}")
+
+                inject_count = inject_casda_to_baseline(
+                    baseline_dir=baseline_yolo_dir,
+                    casda_dir=casda_data_dir,
+                    max_samples=ratio_max_samples,
+                )
+                casda_injected = True
+                logging.info(f"  → {inject_count} images injected")
+            else:
+                logging.error(f"CASDA data dir not found: {casda_data_dir}")
+                logging.error(f"  Skipping all models for group: {group_key}")
+                run_idx += len(model_keys)
+                continue
+
+        for model_key in model_keys:
             run_idx += 1
             logging.info(f"\n{'='*70}")
             logging.info(f"Run {run_idx}/{total_runs}: {model_key} + {group_key}")
             logging.info(f"{'='*70}")
 
             try:
+                # For CASDA groups with detection models:
+                # Use baseline_raw (which now contains injected CASDA) as dataset_group
+                # For segmentation models: use the actual group_key
+                # (create_data_loaders handles CASDA via ConcatDataset internally)
+                effective_group = group_key
+                effective_yolo_dir = args.yolo_dir
+                if is_casda and model_key in ULTRALYTICS_MODELS and casda_injected:
+                    effective_group = "baseline_raw"
+                    effective_yolo_dir = args.yolo_dir
+
                 test_metrics = run_single_experiment(
                     model_key=model_key,
-                    dataset_group=group_key,
+                    dataset_group=effective_group,
                     config=config,
                     experiment_dir=experiment_dir,
                     device=device,
                     resume=args.resume,
-                    yolo_dir=args.yolo_dir,
+                    yolo_dir=effective_yolo_dir,
+                    # Pass the actual group key for output directory naming
+                    output_group_key=group_key,
                 )
 
                 model_name = config['models'][model_key]['name']
@@ -792,6 +1062,14 @@ Examples:
                 import traceback
                 logging.error(traceback.format_exc())
                 continue
+
+        # --- Clean CASDA after all models are done ---
+        if casda_injected and baseline_yolo_dir:
+            logging.info(f"\n{'='*70}")
+            logging.info(f"CLEAN: Removing {group_key} files from baseline_raw")
+            logging.info(f"{'='*70}")
+            removed = clean_casda_from_baseline(baseline_dir=baseline_yolo_dir)
+            logging.info(f"  → {removed} files removed")
 
     total_time = time.time() - start_time
     logging.info(f"\nAll experiments completed in {total_time:.1f}s ({total_time/3600:.1f}h)")

@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-Package ControlNet v4 output into CASDA benchmark format.
+Package ControlNet v4/v5.1 output into CASDA benchmark format.
 
 Converts:
-  - augmented_images_v4/generated/*.png  (generated images)
-  - augmented_images_v4/generation_summary.json  (metadata + quality scores)
-  - controlnet_dataset_v4/hints/*_hint.png  (hint images → Red channel = mask)
+  - augmented_images/generated/*.png  (generated images)
+  - augmented_images/generation_summary.json  (metadata + quality scores)
+  - controlnet_dataset/hints/*_hint.png  (hint images → Red channel = mask)
 
 Into:
   - casda_full/images/*.png
   - casda_full/masks/*.png
-  - casda_full/metadata.json
+  - casda_full/metadata.json   (includes pre-computed YOLO bboxes)
   - casda_pruning/images/*.png   (filtered by suitability threshold + top_k)
   - casda_pruning/masks/*.png
-  - casda_pruning/metadata.json
+  - casda_pruning/metadata.json  (includes pre-computed YOLO bboxes)
+
+metadata.json bbox fields (v5.1+):
+  - bboxes: [[cx, cy, w, h], ...]  (normalized YOLO format, 0~1)
+  - labels: [class_id, ...]        (0-indexed, per-bbox)
+  - bbox_format: "yolo"            (format indicator)
+  - image_width, image_height      (mask/image pixel dimensions)
 
 Usage (Colab example):
   python scripts/package_casda_data.py \
@@ -41,7 +47,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -50,7 +56,7 @@ import numpy as np
 def parse_class_id_from_filename(filename: str) -> int:
     """
     Extract 0-indexed class_id from filename.
-
+    
     Filename patterns:
       - 6b634bbe9.jpg_class1_region2_gen0.png  → class_id=0
       - 008d0f87b.jpg_class3_region2_gen0.png  → class_id=2
@@ -59,43 +65,6 @@ def parse_class_id_from_filename(filename: str) -> int:
     if match:
         return int(match.group(1)) - 1  # 1-indexed → 0-indexed
     raise ValueError(f"Cannot parse class_id from filename: {filename}")
-
-
-def parse_roi_key_from_filename(filename: str) -> Tuple[str, int, int]:
-    """
-    Extract (image_id, 1-indexed class_id, region_id) from generated filename.
-
-    Example:
-      '454d794dc.jpg_class4_region0_gen0.png' → ('454d794dc.jpg', 4, 0)
-
-    Returns:
-        (image_id_with_ext, class_id_1indexed, region_id)
-
-    Raises:
-        ValueError if filename does not match expected pattern.
-    """
-    m = re.match(r"(.+\.jpg)_class(\d+)_region(\d+)_gen\d+\.png$", filename)
-    if m:
-        return m.group(1), int(m.group(2)), int(m.group(3))
-    raise ValueError(f"Cannot parse ROI key from filename: {filename}")
-
-
-def build_roi_suitability_map(roi_metadata_csv: Path) -> Dict[Tuple[str, int, int], float]:
-    """
-    roi_metadata.csv에서 (image_id, 1indexed_class_id, region_id) → suitability_score 맵 생성.
-
-    roi_metadata.csv 컬럼: image_id, class_id(1-indexed), region_id, suitability_score, ...
-
-    Returns:
-        {(image_id, class_id_1indexed, region_id): suitability_score}
-    """
-    import pandas as pd
-    df = pd.read_csv(roi_metadata_csv)
-    mapping: Dict[Tuple[str, int, int], float] = {}
-    for _, row in df.iterrows():
-        key = (str(row['image_id']), int(row['class_id']), int(row['region_id']))
-        mapping[key] = float(row['suitability_score'])
-    return mapping
 
 
 def extract_mask_from_hint(hint_path: str, threshold: int = 127) -> Optional[np.ndarray]:
@@ -247,7 +216,6 @@ def package_data(
     hint_dir: Path,
     output_dir: Path,
     quality_json: Optional[Path] = None,
-    roi_metadata: Optional[Path] = None,
     suitability_threshold: float = 0.63,
     pruning_top_k: int = 2000,
     mask_threshold: int = 127,
@@ -259,19 +227,13 @@ def package_data(
     print(f"Loading summary: {summary_json}")
     with open(summary_json) as f:
         summary = json.load(f)
-
+    
     total_samples = summary.get("total_samples", 0)
     print(f"Total samples in summary: {total_samples}")
-
+    
     # Build lookup maps
     quality_map = build_quality_map(summary, quality_json_path=quality_json)
     sample_name_map = build_sample_name_to_result(summary)
-
-    # ROI suitability map (최우선 점수 소스)
-    roi_map: Dict[Tuple[str, int, int], float] = {}
-    if roi_metadata and roi_metadata.exists():
-        roi_map = build_roi_suitability_map(roi_metadata)
-        print(f"ROI suitability map loaded: {len(roi_map)} entries from {roi_metadata}")
     
     # Count real quality entries (exclude the fallback key)
     real_quality_count = len([k for k in quality_map if k != "__sample_name_fallback__"])
@@ -317,16 +279,8 @@ def package_data(
             skipped_class_parse += 1
             continue
         
-        # suitability_score 결정 (우선순위: roi_map > quality_map > default)
+        # Get quality score (with sample-name fallback for multi-generation)
         suitability_score = get_quality_score(quality_map, filename, default=default_score)
-        if roi_map:
-            try:
-                img_id, cls_1indexed, region_id = parse_roi_key_from_filename(filename)
-                roi_key = (img_id, cls_1indexed, region_id)
-                if roi_key in roi_map:
-                    suitability_score = roi_map[roi_key]
-            except ValueError:
-                pass  # 파일명 파싱 실패 시 quality_map 값 유지
         
         # Find hint image for mask extraction
         # Try from results[] first (has exact hint_path), then construct from sample_name
@@ -373,6 +327,29 @@ def package_data(
             if defect_pixels == 0:
                 skipped_no_mask += 1
         
+        # Pre-compute YOLO-format bboxes from mask contours
+        # This eliminates cv2.imread at inject/training time
+        yolo_bboxes = []
+        yolo_labels = []
+        if mask is not None and np.count_nonzero(mask) > 0:
+            h_mask, w_mask = mask.shape[:2]
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            for cnt in contours:
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if bw * bh >= 16:  # same threshold as downstream consumers
+                    # Normalized YOLO format: cx, cy, w, h (0~1)
+                    cx = (bx + bw / 2.0) / w_mask
+                    cy = (by + bh / 2.0) / h_mask
+                    nw = bw / w_mask
+                    nh = bh / h_mask
+                    yolo_bboxes.append([
+                        round(cx, 6), round(cy, 6),
+                        round(nw, 6), round(nh, 6),
+                    ])
+                    yolo_labels.append(class_id)
+        
         entry = {
             "image_path": f"images/{filename}",
             "class_id": class_id,
@@ -380,6 +357,14 @@ def package_data(
         }
         if mask_rel_path_str:
             entry["mask_path"] = mask_rel_path_str
+        if yolo_bboxes:
+            entry["bboxes"] = yolo_bboxes
+            entry["labels"] = yolo_labels
+            entry["bbox_format"] = "yolo"
+        if mask is not None:
+            h_mask, w_mask = mask.shape[:2]
+            entry["image_width"] = w_mask
+            entry["image_height"] = h_mask
         
         all_metadata.append(entry)
     
@@ -396,6 +381,8 @@ def package_data(
     print(f"  Skipped (class parse error): {skipped_class_parse}")
     print(f"  Skipped (no hint found): {skipped_no_hint}")
     print(f"  Masks with zero defect pixels: {skipped_no_mask}")
+    print(f"  With YOLO bboxes: {sum(1 for m in all_metadata if 'bboxes' in m)}")
+    print(f"  Total bboxes: {sum(len(m.get('bboxes', [])) for m in all_metadata)}")
     print(f"  Output: {full_dir}")
     
     # Class distribution
@@ -411,13 +398,78 @@ def package_data(
         print(f"  Quality scores: min={min(scores):.4f}, max={max(scores):.4f}, "
               f"mean={sum(scores)/len(scores):.4f}")
     
-    # Build casda_pruning: filter by threshold, sort descending, take top_k
-    pruned = [
+    # Build casda_pruning: filter by threshold, then stratified top_k selection
+    # v5.2: class-aware multi-generation으로 인해 단순 score 정렬 시
+    # 동일 sample의 multi-gen 이미지가 같은 score를 공유하여
+    # 특정 클래스(예: Class2 10x)가 pruning set을 지배할 수 있음.
+    # → 클래스별 비례 할당으로 균형 유지.
+    
+    # Step 1: threshold 필터
+    above_threshold = [
         e for e in all_metadata
         if e.get("suitability_score", 0) >= suitability_threshold
     ]
-    pruned.sort(key=lambda x: x["suitability_score"], reverse=True)
-    pruned = pruned[:pruning_top_k]
+    above_threshold_count = len(above_threshold)
+    
+    # Step 2: 클래스별 비례 할당 (stratified pruning)
+    class_quotas = {}  # populated only when stratified pruning is triggered
+    if above_threshold and pruning_top_k < len(above_threshold):
+        # 클래스별 그룹화
+        class_groups = {}
+        for e in above_threshold:
+            cid = e["class_id"]
+            class_groups.setdefault(cid, []).append(e)
+        
+        # 각 그룹을 score 내림차순 정렬
+        for cid in class_groups:
+            class_groups[cid].sort(
+                key=lambda x: x["suitability_score"], reverse=True
+            )
+        
+        # casda_full의 클래스 비율에 맞춰 pruning 할당량 계산
+        total_above = len(above_threshold)
+        pruned = []
+        class_quotas = {}
+        
+        for cid in sorted(class_groups.keys()):
+            # 비례 할당: (클래스 비율 × top_k), 최소 1개 보장
+            ratio = len(class_groups[cid]) / total_above
+            quota = max(1, round(ratio * pruning_top_k))
+            # 실제 가용량 초과 방지
+            quota = min(quota, len(class_groups[cid]))
+            class_quotas[cid] = quota
+        
+        # 할당량 합이 top_k를 초과하면 비례 조정
+        total_quota = sum(class_quotas.values())
+        if total_quota > pruning_top_k:
+            # 가장 큰 클래스부터 축소
+            excess = total_quota - pruning_top_k
+            for cid in sorted(class_quotas, key=lambda c: class_quotas[c], reverse=True):
+                reduce = min(excess, class_quotas[cid] - 1)
+                class_quotas[cid] -= reduce
+                excess -= reduce
+                if excess <= 0:
+                    break
+        
+        # 클래스별로 상위 quota개 선택
+        for cid in sorted(class_groups.keys()):
+            quota = class_quotas[cid]
+            pruned.extend(class_groups[cid][:quota])
+        
+        # 잔여 슬롯이 있으면 남은 이미지에서 score 순으로 채움
+        current_count = len(pruned)
+        if current_count < pruning_top_k:
+            already_selected = set(id(e) for e in pruned)
+            remaining = [
+                e for e in above_threshold if id(e) not in already_selected
+            ]
+            remaining.sort(key=lambda x: x["suitability_score"], reverse=True)
+            pruned.extend(remaining[:pruning_top_k - current_count])
+        
+        print(f"  Stratified pruning quotas: {dict(sorted(class_quotas.items()))}")
+    else:
+        # threshold 후 top_k 이하이면 전부 포함
+        pruned = above_threshold
     
     # Copy pruned images and masks
     for entry in pruned:
@@ -442,7 +494,7 @@ def package_data(
     print(f"CASDA-Pruning packaging complete:")
     print(f"  Threshold: >= {suitability_threshold}")
     print(f"  Top-K: {pruning_top_k}")
-    print(f"  After threshold filter: {len([e for e in all_metadata if e.get('suitability_score', 0) >= suitability_threshold])}")
+    print(f"  After threshold filter: {above_threshold_count}")
     print(f"  Final count (after top_k): {len(pruned)}")
     
     if pruned:
@@ -479,7 +531,9 @@ def package_data(
         "casda_pruning": {
             "suitability_threshold": suitability_threshold,
             "pruning_top_k": pruning_top_k,
+            "above_threshold_count": above_threshold_count,
             "total_images": len(pruned),
+            "stratified_quotas": dict(sorted(class_quotas.items())) if class_quotas else None,
             "class_distribution": dict(sorted(
                 {e["class_id"]: 0 for e in pruned}.items()
             )),  # will be overwritten below
@@ -532,15 +586,6 @@ def main():
         help="Output directory (will create casda_full/ and casda_pruning/ inside)",
     )
     parser.add_argument(
-        "--roi-metadata",
-        type=str,
-        default=None,
-        help="roi_metadata.csv 경로. image_id / class_id / region_id / suitability_score "
-             "컬럼을 가진 CSV. 지정 시 생성 이미지 파일명에서 ROI 키를 파싱하여 "
-             "suitability_score를 전파한다 (quality_json보다 우선). "
-             "예: data/processed/roi_patches/roi_metadata.csv",
-    )
-    parser.add_argument(
         "--quality-json",
         type=str,
         default=None,
@@ -583,7 +628,6 @@ def main():
         hint_dir=Path(args.hint_dir),
         output_dir=Path(args.output_dir),
         quality_json=Path(args.quality_json) if args.quality_json else None,
-        roi_metadata=Path(args.roi_metadata) if args.roi_metadata else None,
         suitability_threshold=args.suitability_threshold,
         pruning_top_k=args.pruning_top_k,
         mask_threshold=args.mask_threshold,

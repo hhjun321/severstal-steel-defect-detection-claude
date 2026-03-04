@@ -90,6 +90,19 @@ class UltralyticsTrainer:
         self.input_size = model_config.get('input_size', [640, 640])
         self.num_classes = dataset_config.get('num_classes', 4)
 
+    @staticmethod
+    def _compute_scale_range(scale_range) -> float:
+        """
+        Convert YAML scale_range [min, max] to Ultralytics scale parameter.
+        
+        Ultralytics 'scale' is a symmetric deviation from 1.0.
+        Example: scale_range=[0.8, 1.2] → scale=0.2 (±20%)
+                 scale_range=[0.9, 1.1] → scale=0.1 (±10%)
+        """
+        if isinstance(scale_range, (list, tuple)) and len(scale_range) == 2:
+            return max(abs(1.0 - scale_range[0]), abs(scale_range[1] - 1.0))
+        return 0.2  # default ±20%
+
     def _resolve_path(self, raw_path: str) -> str:
         """Resolve path: return as-is if absolute, else relative to project root."""
         if os.path.isabs(raw_path):
@@ -134,6 +147,10 @@ class UltralyticsTrainer:
         if casda_data is not None:
             casda_cfg = self.dataset_config.get('casda', {})
             casda_config_dict = casda_cfg
+            # 그룹별 pruning 설정을 casda_config_dict에 병합
+            group_pruning = self.group_config.get('casda_pruning', {})
+            if group_pruning.get('enabled', False):
+                casda_config_dict = {**casda_cfg, **group_pruning}
             if casda_data == "full":
                 raw_dir = casda_cfg.get('full_dir', 'data/augmented/casda_full')
                 casda_dir = self._resolve_path(raw_dir)
@@ -142,6 +159,15 @@ class UltralyticsTrainer:
                 raw_dir = casda_cfg.get('pruning_dir', 'data/augmented/casda_pruning')
                 casda_dir = self._resolve_path(raw_dir)
                 casda_mode = "pruning"
+            elif casda_data == "composed":
+                # v5.4: Poisson Blending 합성 이미지
+                raw_dir = casda_cfg.get('composed_dir', 'data/augmented/casda_composed')
+                casda_dir = self._resolve_path(raw_dir)
+                # pruning이 활성화되어 있으면 pruning 모드로, 아니면 full 모드
+                if group_pruning.get('enabled', False):
+                    casda_mode = "pruning"
+                else:
+                    casda_mode = "full"
 
         # Determine output directory for converted dataset
         # If yolo_dir specified (but invalid/empty), save there for future reuse
@@ -358,6 +384,30 @@ class UltralyticsTrainer:
             rect=True,  # rectangular batching for Severstal 256x1600 (1:6.25 aspect ratio)
             val=True,
         )
+
+        # ---- Apply augmentation settings based on dataset group config ----
+        # baseline_trad: map YAML traditional_augmentation to Ultralytics params
+        # baseline_raw: use Ultralytics defaults (no override)
+        # CASDA groups: use Ultralytics defaults (no override)
+        augmentation = self.group_config.get('augmentation', 'none')
+        if augmentation == 'traditional':
+            trad_config = self.group_config.get('traditional_augmentation', {})
+            # Map YAML params to Ultralytics augmentation hyperparameters
+            train_kwargs.update(dict(
+                fliplr=trad_config.get('horizontal_flip', 0.5),
+                flipud=trad_config.get('vertical_flip', 0.3),
+                degrees=trad_config.get('rotation_limit', 15.0),
+                scale=self._compute_scale_range(trad_config.get('scale_range', [0.8, 1.2])),
+                hsv_v=trad_config.get('brightness_limit', 0.2),
+                # Disable non-traditional augmentations to isolate effect
+                mosaic=0.0,
+                mixup=0.0,
+                copy_paste=0.0,
+            ))
+            logger.info(f"Traditional augmentation applied: "
+                        f"fliplr={train_kwargs['fliplr']}, flipud={train_kwargs['flipud']}, "
+                        f"degrees={train_kwargs['degrees']}, scale={train_kwargs['scale']}, "
+                        f"hsv_v={train_kwargs['hsv_v']}, mosaic=0, mixup=0, copy_paste=0")
 
         if resume_path:
             # For resume, load from last.pt and continue

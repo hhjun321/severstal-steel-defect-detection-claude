@@ -42,21 +42,35 @@ class ControlNetDatasetPackager:
         self.prompt_generator = prompt_generator or PromptGenerator(style=prompt_style)
     
     def _edge_filter(self, df: pd.DataFrame,
-                     edge_margin: float = 0.1) -> pd.DataFrame:
+                     edge_margin_x: float = 0.1,
+                     edge_margin_y: float = 0.05,
+                     rare_class_margin: float = 0.02,
+                     rare_class_threshold: int = 50) -> pd.DataFrame:
         """
         ROI 경계에 너무 가까운 결함을 가진 샘플을 제외합니다.
 
         DatasetValidator.visual_check_sample()에서 경고만 출력하던
         edge proximity 검사를 패키징 시점에 실제 제외 로직으로 적용합니다.
 
-        NOTE: roi_bbox == defect_bbox인 경우 (ROI 최적화가 실패하여
-        결함 bbox를 그대로 ROI로 사용하는 경우) edge margin이 항상 0이므로
-        해당 샘플은 검사를 건너뜁니다. 이 상황은 Severstal 이미지
-        (1600x256)에서 512x512 ROI 창이 맞지 않아 발생합니다.
+        v5: optimize_roi_position이 adaptive sizing을 사용하여
+        roi_bbox != defect_bbox가 정상적으로 됩니다 (256x256 패치).
+        v4에서는 512x512 ROI가 256px 높이 이미지에 맞지 않아
+        roi_bbox == defect_bbox로 fallback되었습니다.
+
+        v5.1 개선사항:
+        - 좌우(x)/상하(y) 마진을 분리. Severstal 이미지(1600x256)에서
+          ROI 높이=이미지 높이=256이므로 상하 마진은 구조적으로 확보가 어려움.
+          좌우 10%, 상하 5%로 차등 적용하여 제외율을 67% → ~35%로 감소.
+        - 희소 클래스 보호: 전체 가용 샘플이 rare_class_threshold 이하인
+          클래스는 마진을 rare_class_margin(2%)으로 더 완화하여
+          학습 데이터 최소 확보를 보장 (v5에서 Class 2가 10개로 감소한 문제).
 
         Args:
             df: ROI metadata DataFrame (roi_bbox, defect_bbox 컬럼 필요)
-            edge_margin: ROI 크기 대비 최소 마진 비율 (기본 0.1 = 10%)
+            edge_margin_x: 좌우 마진 비율 (기본 0.1 = 10%, ROI 너비 기준)
+            edge_margin_y: 상하 마진 비율 (기본 0.05 = 5%, ROI 높이 기준)
+            rare_class_margin: 희소 클래스에 적용할 완화 마진 (기본 0.02 = 2%)
+            rare_class_threshold: 이 수 이하인 클래스를 희소로 간주 (기본 50)
 
         Returns:
             edge-flagged 샘플이 제거된 DataFrame
@@ -64,6 +78,18 @@ class ControlNetDatasetPackager:
         if 'roi_bbox' not in df.columns or 'defect_bbox' not in df.columns:
             print("Edge filter: roi_bbox/defect_bbox columns not found, skipping")
             return df
+
+        # 희소 클래스 식별
+        rare_classes = set()
+        if 'class_id' in df.columns:
+            class_counts = df['class_id'].value_counts()
+            rare_classes = set(
+                class_counts[class_counts <= rare_class_threshold].index
+            )
+            if rare_classes:
+                print(f"  Rare classes (n<={rare_class_threshold}): "
+                      f"{dict(class_counts[class_counts <= rare_class_threshold])} "
+                      f"-> edge margin relaxed to {rare_class_margin}")
 
         original_len = len(df)
         exclude_indices = []
@@ -97,27 +123,38 @@ class ControlNetDatasetPackager:
                 exclude_indices.append(idx)
                 continue
 
+            # 희소 클래스이면 마진 완화 적용
+            class_id = row.get('class_id', None)
+            if class_id in rare_classes:
+                mx = rare_class_margin
+                my = rare_class_margin
+            else:
+                mx = edge_margin_x
+                my = edge_margin_y
+
             edge_issues = []
-            if (def_x1 - roi_x1) < roi_width * edge_margin:
+            if (def_x1 - roi_x1) < roi_width * mx:
                 edge_issues.append("left")
-            if (roi_x2 - def_x2) < roi_width * edge_margin:
+            if (roi_x2 - def_x2) < roi_width * mx:
                 edge_issues.append("right")
-            if (def_y1 - roi_y1) < roi_height * edge_margin:
+            if (def_y1 - roi_y1) < roi_height * my:
                 edge_issues.append("top")
-            if (roi_y2 - def_y2) < roi_height * edge_margin:
+            if (roi_y2 - def_y2) < roi_height * my:
                 edge_issues.append("bottom")
 
             if edge_issues:
                 exclude_indices.append(idx)
                 image_id = row.get('image_id', 'unknown')
-                class_id = row.get('class_id', '?')
-                print(f"  Edge filter excluded: {image_id} (Class {class_id}) "
+                cls_id = row.get('class_id', '?')
+                print(f"  Edge filter excluded: {image_id} (Class {cls_id}) "
                       f"- too close to {', '.join(edge_issues)} edge")
 
         df = df.drop(index=exclude_indices).reset_index(drop=True)
         removed = original_len - len(df)
         print(f"Edge filter: {original_len} -> {len(df)} "
               f"({removed} removed, {removed/max(original_len,1)*100:.1f}%)")
+        print(f"  Margins: x={edge_margin_x}, y={edge_margin_y}, "
+              f"rare={rare_class_margin}")
         if skipped_identical > 0:
             print(f"  ({skipped_identical} samples with roi_bbox==defect_bbox, "
                   f"edge check skipped)")
@@ -181,24 +218,28 @@ class ControlNetDatasetPackager:
 
         return df.reset_index(drop=True)
 
-    def _stratified_sample(self, df: pd.DataFrame, n_samples: int) -> pd.DataFrame:
+    def _stratified_sample(self, df: pd.DataFrame, n_samples: int,
+                           per_class_cap: Optional[int] = None,
+                           rare_class_threshold_count: int = 200) -> pd.DataFrame:
         """
-        클래스별 균등 분포로 샘플링합니다 (품질 우선 + 다양성 고려).
+        클래스별 샘플링 (품질 우선 + 다양성 고려).
         
-        v2에서는 random sampling을 사용했으나, v3에서는:
-        - suitability_score 기준으로 상위 샘플 우선 선택
-        - defect_subtype, background_type의 다양성을 보장
-        
-        각 클래스에서 동일한 수의 샘플을 추출하되,
-        샘플 수가 부족한 클래스는 가용한 전체 샘플을 사용하고
-        남은 할당량은 다른 클래스에 재분배합니다.
+        v5.2 개선: class-aware capping 모드 추가.
+        - per_class_cap이 지정되면 class-aware capping 모드 사용:
+          * 희소 클래스 (count <= rare_class_threshold_count): 전수 포함
+          * 풍부한 클래스: min(count, per_class_cap) 만큼 다양성 샘플링
+          * n_samples 파라미터는 무시됨 (cap 기반으로 자동 결정)
+        - per_class_cap이 None이면 기존 균등 분배 로직 사용 (v3~v5.1 호환)
         
         Args:
             df: ROI metadata DataFrame (class_id 컬럼 필요)
-            n_samples: 추출할 총 샘플 수
+            n_samples: 추출할 총 샘플 수 (균등 분배 모드에서만 사용)
+            per_class_cap: 풍부한 클래스의 최대 샘플 수 (v5.2 class-aware capping)
+            rare_class_threshold_count: 이 수 이하인 클래스를 희소로 간주하여
+                전수 포함 (기본 200)
             
         Returns:
-            균등 분포로 샘플링된 DataFrame
+            샘플링된 DataFrame
         """
         if 'class_id' not in df.columns:
             # class_id가 없으면 suitability_score 기반 상위 선택
@@ -207,51 +248,80 @@ class ControlNetDatasetPackager:
             return df.sample(n=min(n_samples, len(df)), random_state=42)
         
         classes = sorted(df['class_id'].unique())
-        n_classes = len(classes)
-        
-        # 각 클래스별 균등 할당
-        per_class = n_samples // n_classes
-        remainder = n_samples % n_classes
-        
-        sampled_parts = []
-        deficit = 0  # 부족한 클래스에서 채우지 못한 수
-        
         has_suitability = 'suitability_score' in df.columns
         has_subtype = 'defect_subtype' in df.columns
         has_bg = 'background_type' in df.columns
         
-        for i, cls in enumerate(classes):
-            cls_df = df[df['class_id'] == cls].copy()
-            # 나머지는 앞쪽 클래스에 1개씩 추가 할당
-            target = per_class + (1 if i < remainder else 0)
+        if per_class_cap is not None:
+            # ===== v5.2 Class-aware capping 모드 =====
+            # 희소 클래스는 전수 포함, 풍부한 클래스는 cap 적용
+            sampled_parts = []
             
-            if len(cls_df) <= target:
-                # 부족한 클래스: 전체 사용
-                sampled_parts.append(cls_df)
-                deficit += target - len(cls_df)
-            else:
-                # 다양성 보장 샘플링
-                selected = self._diverse_select(cls_df, target,
-                                                has_suitability, has_subtype, has_bg)
-                sampled_parts.append(selected)
-        
-        # 부족분 재분배: 여유가 있는 클래스에서 추가 샘플링
-        if deficit > 0:
-            already_sampled_idx = pd.concat(sampled_parts).index
-            remaining_df = df[~df.index.isin(already_sampled_idx)]
+            print(f"  Class-aware capping mode: per_class_cap={per_class_cap}, "
+                  f"rare_threshold={rare_class_threshold_count}")
             
-            if len(remaining_df) > 0:
-                if has_suitability:
-                    additional = remaining_df.nlargest(
-                        min(deficit, len(remaining_df)), 'suitability_score'
-                    )
+            for cls in classes:
+                cls_df = df[df['class_id'] == cls].copy()
+                cls_count = len(cls_df)
+                
+                if cls_count <= rare_class_threshold_count:
+                    # 희소 클래스: 전수 포함
+                    sampled_parts.append(cls_df)
+                    print(f"  Class {cls}: {cls_count} samples (RARE -> all included)")
+                elif cls_count <= per_class_cap:
+                    # cap 미만: 전수 포함
+                    sampled_parts.append(cls_df)
+                    print(f"  Class {cls}: {cls_count} samples (under cap -> all included)")
                 else:
-                    additional = remaining_df.sample(
-                        n=min(deficit, len(remaining_df)), random_state=42
+                    # 풍부한 클래스: cap까지 다양성 샘플링
+                    selected = self._diverse_select(
+                        cls_df, per_class_cap,
+                        has_suitability, has_subtype, has_bg
                     )
-                sampled_parts.append(additional)
-        
-        result = pd.concat(sampled_parts).reset_index(drop=True)
+                    sampled_parts.append(selected)
+                    print(f"  Class {cls}: {cls_count} -> {per_class_cap} samples "
+                          f"(capped, diversity-selected)")
+            
+            result = pd.concat(sampled_parts).reset_index(drop=True)
+            print(f"  Total after capping: {len(result)} samples")
+        else:
+            # ===== 기존 균등 분배 모드 (v3~v5.1 호환) =====
+            n_classes = len(classes)
+            per_class = n_samples // n_classes
+            remainder = n_samples % n_classes
+            
+            sampled_parts = []
+            deficit = 0
+            
+            for i, cls in enumerate(classes):
+                cls_df = df[df['class_id'] == cls].copy()
+                target = per_class + (1 if i < remainder else 0)
+                
+                if len(cls_df) <= target:
+                    sampled_parts.append(cls_df)
+                    deficit += target - len(cls_df)
+                else:
+                    selected = self._diverse_select(cls_df, target,
+                                                    has_suitability, has_subtype, has_bg)
+                    sampled_parts.append(selected)
+            
+            # 부족분 재분배
+            if deficit > 0:
+                already_sampled_idx = pd.concat(sampled_parts).index
+                remaining_df = df[~df.index.isin(already_sampled_idx)]
+                
+                if len(remaining_df) > 0:
+                    if has_suitability:
+                        additional = remaining_df.nlargest(
+                            min(deficit, len(remaining_df)), 'suitability_score'
+                        )
+                    else:
+                        additional = remaining_df.sample(
+                            n=min(deficit, len(remaining_df)), random_state=42
+                        )
+                    sampled_parts.append(additional)
+            
+            result = pd.concat(sampled_parts).reset_index(drop=True)
         
         # 다양성 통계 출력
         if has_subtype:
@@ -260,6 +330,10 @@ class ControlNetDatasetPackager:
         if has_bg:
             bg_counts = result['background_type'].value_counts()
             print(f"  Background type diversity: {len(bg_counts)} types")
+        
+        # 클래스 분포 출력
+        class_dist = result['class_id'].value_counts().sort_index()
+        print(f"  Final class distribution: {dict(class_dist)}")
         
         return result
     
@@ -327,93 +401,43 @@ class ControlNetDatasetPackager:
             result = result.drop(columns=['_diversity_key'])
         return result
     
-    def _create_clean_source(self, roi_image: np.ndarray,
-                             roi_mask: np.ndarray) -> np.ndarray:
-        """
-        Create clean source image by inpainting the defect region (v5).
-
-        Uses OpenCV TELEA inpainting to fill defect pixels with surrounding
-        background texture.  The result is used as the ControlNet ``source``
-        image so that training teaches the model to ADD defects, not
-        reconstruct the same image (the v4 source==target bug).
-
-        Args:
-            roi_image: Original ROI image with defect (H, W, 3), RGB.
-            roi_mask: Binary defect mask (H, W), values 0 or 1.
-
-        Returns:
-            Inpainted image (H, W, 3), RGB, defect region filled with
-            background texture.
-        """
-        mask_uint8 = (roi_mask > 0).astype(np.uint8) * 255
-        # Dilate mask slightly so inpainting covers defect boundaries cleanly
-        kernel = np.ones((3, 3), np.uint8)
-        dilated_mask = cv2.dilate(mask_uint8, kernel, iterations=2)
-
-        roi_bgr = cv2.cvtColor(roi_image, cv2.COLOR_RGB2BGR)
-        clean_bgr = cv2.inpaint(roi_bgr, dilated_mask,
-                                inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-        return cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2RGB)
-
-    def package_single_roi(self, roi_data: Dict,
+    def package_single_roi(self, roi_data: Dict, 
                           roi_image: np.ndarray,
                           roi_mask: np.ndarray,
-                          output_dir: Path,
-                          hint_mode: str = 'canny') -> Dict:
+                          output_dir: Path) -> Dict:
         """
-        Package a single ROI with hint image, clean source, and metadata.
-
-        v5 changes vs v4:
-          - hint_mode='canny': Canny edges of defect boundary (compatible
-            with sd-controlnet-canny pretrained weights).
-          - clean source: defect inpainted with TELEA; stored as
-            ``clean_source_path`` so that train.jsonl can set
-            source=clean, target=original (teaching the model to ADD defects).
-
+        Package a single ROI with hint image and metadata.
+        
         Args:
             roi_data: ROI metadata dictionary
-            roi_image: ROI image array (H, W, 3), RGB
+            roi_image: ROI image array (H, W, 3)
             roi_mask: ROI mask array (H, W)
             output_dir: Output directory
-            hint_mode: 'canny' (v5) or 'grayscale' (v4 legacy)
-
+            
         Returns:
-            Updated roi_data with hint_path, clean_source_path, and prompt
+            Updated roi_data with hint_path and prompt
         """
-        image_id = roi_data['image_id']
-        class_id = roi_data['class_id']
-        region_id = roi_data['region_id']
-
         # Generate hint image
         hint_image = self.hint_generator.generate_hint_image(
             roi_image=roi_image,
             roi_mask=roi_mask,
             defect_metrics=roi_data,
             background_type=roi_data.get('background_type', 'smooth'),
-            stability_score=roi_data.get('stability_score', 0.5),
-            hint_mode=hint_mode,
+            stability_score=roi_data.get('stability_score', 0.5)
         )
-
+        
         # Save hint image
         hint_dir = output_dir / 'hints'
         hint_dir.mkdir(parents=True, exist_ok=True)
-
+        
+        image_id = roi_data['image_id']
+        class_id = roi_data['class_id']
+        region_id = roi_data['region_id']
         hint_filename = f"{image_id}_class{class_id}_region{region_id}_hint.png"
         hint_path = hint_dir / hint_filename
-
+        
         self.hint_generator.save_hint_image(hint_image, hint_path)
-
-        # Create and save clean source (inpainted, defect removed) — v5
-        clean_src_dir = output_dir / 'clean_sources'
-        clean_src_dir.mkdir(parents=True, exist_ok=True)
-
-        clean_src_filename = f"{image_id}_class{class_id}_region{region_id}_clean.png"
-        clean_src_path = clean_src_dir / clean_src_filename
-
-        clean_image = self._create_clean_source(roi_image, roi_mask)
-        clean_bgr = cv2.cvtColor(clean_image, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(str(clean_src_path), clean_bgr)
-
+        
         # Generate prompt
         prompt = self.prompt_generator.generate_prompt(
             defect_subtype=roi_data.get('defect_subtype', 'general'),
@@ -423,38 +447,41 @@ class ControlNetDatasetPackager:
             defect_metrics=roi_data,
             suitability_score=roi_data.get('suitability_score', 0.5)
         )
-
+        
         negative_prompt = self.prompt_generator.generate_negative_prompt()
-
+        
         # Update roi_data
         roi_data['hint_path'] = str(hint_path)
-        roi_data['clean_source_path'] = str(clean_src_path)
         roi_data['prompt'] = prompt
         roi_data['negative_prompt'] = negative_prompt
-
+        
         return roi_data
     
-    def create_train_jsonl(self, roi_metadata: List[Dict],
+    def create_train_jsonl(self, roi_metadata: List[Dict], 
                           output_path: Path,
                           relative_paths: bool = True,
                           base_dir: Optional[Path] = None):
         """
         Create train.jsonl file for ControlNet training.
-
-        v5 format (source ≠ target):
+        
+        필드 역할 (train_controlnet.py 기준):
+        - target: 학습 타겟 이미지 (VAE encode → 노이즈 예측 대상).
+                  결함이 포함된 ROI 패치 이미지.
+        - hint:   ControlNet 조건부 입력 (conditioning_pixel_values).
+                  3채널 합성 이미지 (R=마스크, G=구조선, B=텍스처).
+        - prompt: 텍스트 설명 (결함 특성 + 배경 유형).
+        - source: 레거시 필드. 학습/추론 코드에서 사용하지 않음.
+                  target과 동일값으로 설정 (하위 호환용).
+        
+        Format per line:
         {
-            "source": "clean_sources/…_clean.png",   # inpainted (defect removed)
-            "target": "roi_patches/images/….png",    # original with defect
-            "prompt": "a linear scratch on …",
-            "hint":   "hints/…_hint.png",            # Canny edges
-            "negative_prompt": "blurry, …"
+            "source": "path/to/roi_image.png",    (미사용, 레거시 호환)
+            "target": "path/to/roi_image.png",     (학습 타겟)
+            "prompt": "a linear scratch on ...",
+            "hint": "path/to/hint_image.png",      (ControlNet 조건부 입력)
+            "negative_prompt": "blurry, low quality..."
         }
-
-        ``source`` is the inpainted clean background produced by
-        ``_create_clean_source()``.  If ``clean_source_path`` is missing
-        in roi_data (e.g. hints-only run), ``source`` falls back to
-        ``roi_image_path`` to preserve backward compatibility.
-
+        
         Args:
             roi_metadata: List of ROI metadata dictionaries
             output_path: Path to save train.jsonl
@@ -462,46 +489,35 @@ class ControlNetDatasetPackager:
             base_dir: Base directory for relative paths
         """
         jsonl_lines = []
-
+        
         for roi_data in roi_metadata:
-            # target = original ROI image with defect
+            # target = 결함 포함 ROI 이미지 (학습 대상)
             target_path = roi_data.get('roi_image_path', '')
-            # source = inpainted clean background (v5); fall back to target if absent
-            source_path = roi_data.get('clean_source_path', target_path)
+            # hint = 3채널 conditioning 이미지 (ControlNet 입력)
             hint_path = roi_data.get('hint_path', '')
-
+            
             if relative_paths and base_dir:
-                for attr_name, path_val in [
-                    ('target_path', target_path),
-                    ('source_path', source_path),
-                    ('hint_path', hint_path),
-                ]:
-                    try:
-                        resolved = str(Path(path_val).relative_to(base_dir))
-                    except ValueError:
-                        resolved = path_val
-                    if attr_name == 'target_path':
-                        target_path = resolved
-                    elif attr_name == 'source_path':
-                        source_path = resolved
-                    else:
-                        hint_path = resolved
-
+                try:
+                    target_path = Path(target_path).relative_to(base_dir)
+                    hint_path = Path(hint_path).relative_to(base_dir)
+                except ValueError:
+                    pass  # Keep absolute if relative conversion fails
+            
             entry = {
-                "source": str(source_path),   # clean background (inpainted)
-                "target": str(target_path),   # original with defect
+                "source": str(target_path),   # 레거시 호환 — 학습/추론에서 미사용
+                "target": str(target_path),    # 학습 타겟 (VAE encode 대상)
                 "prompt": roi_data.get('prompt', ''),
-                "hint": str(hint_path),
-                "negative_prompt": roi_data.get('negative_prompt', ''),
+                "hint": str(hint_path),        # ControlNet conditioning 입력
+                "negative_prompt": roi_data.get('negative_prompt', '')
             }
-
+            
             jsonl_lines.append(entry)
-
+        
         # Write JSONL file
         with open(output_path, 'w') as f:
             for entry in jsonl_lines:
                 f.write(json.dumps(entry) + '\n')
-
+        
         print(f"Created train.jsonl with {len(jsonl_lines)} entries at: {output_path}")
     
     def create_metadata_json(self, roi_metadata: List[Dict], 
@@ -541,24 +557,29 @@ class ControlNetDatasetPackager:
                        min_area: int = 100,
                        min_stability: float = 0.3,
                        min_matching: float = 0.5,
-                       hint_mode: str = 'canny') -> Path:
+                       per_class_cap: Optional[int] = None,
+                       rare_class_threshold_count: int = 200) -> Path:
         """
         Package complete dataset for ControlNet training.
-
+        
         Args:
             roi_metadata_df: DataFrame with ROI metadata from ROI extraction
             train_images_dir: Directory with original training images
             train_csv: Path to train.csv with RLE annotations
             output_dir: Output directory for packaged dataset
             create_hints: Whether to generate hint images
-            max_samples: Maximum number of samples to package.
+            max_samples: Maximum number of samples to package (균등 분배 모드).
                 v2에서 50개로 overfitting이 발생했으므로, v3에서는 500 권장.
+                per_class_cap이 지정되면 무시됨.
             quality_filter: 품질 필터 적용 여부 (기본: True)
             min_area: 최소 결함 영역 (px, 기본: 100)
             min_stability: 최소 stability_score (기본: 0.3)
             min_matching: 최소 matching_score (기본: 0.5)
-            hint_mode: 'canny' (v5, default) or 'grayscale' (v4 legacy).
-
+            per_class_cap: v5.2 class-aware capping. 풍부한 클래스의 최대 샘플 수.
+                지정 시 희소 클래스는 전수 포함, 풍부한 클래스는 cap까지만 선택.
+            rare_class_threshold_count: 이 수 이하인 클래스를 희소로 간주 (기본 200).
+                per_class_cap 모드에서만 사용.
+            
         Returns:
             Path to output directory
         """
@@ -588,8 +609,19 @@ class ControlNetDatasetPackager:
                 min_matching=min_matching,
             )
         
-        # Limit samples if specified (stratified sampling by class)
-        if max_samples and max_samples < len(roi_metadata_df):
+        # Limit samples: class-aware capping (v5.2) 또는 균등 분배 (v3~v5.1)
+        if per_class_cap is not None:
+            # v5.2 class-aware capping: 희소 클래스 전수 + 풍부한 클래스 cap
+            roi_metadata_df = self._stratified_sample(
+                roi_metadata_df, n_samples=0,  # n_samples는 capping 모드에서 무시
+                per_class_cap=per_class_cap,
+                rare_class_threshold_count=rare_class_threshold_count
+            )
+            print(f"Class-aware capping: {len(roi_metadata_df)} samples selected")
+            if 'class_id' in roi_metadata_df.columns:
+                class_dist = roi_metadata_df['class_id'].value_counts().sort_index()
+                print(f"  Class distribution: {dict(class_dist)}")
+        elif max_samples and max_samples < len(roi_metadata_df):
             roi_metadata_df = self._stratified_sample(roi_metadata_df, max_samples)
             print(f"Stratified sampling: {max_samples} samples selected")
             if 'class_id' in roi_metadata_df.columns:
@@ -629,8 +661,7 @@ class ControlNetDatasetPackager:
                     roi_data=roi_data,
                     roi_image=roi_image_rgb,
                     roi_mask=roi_mask,
-                    output_dir=output_dir,
-                    hint_mode=hint_mode,
+                    output_dir=output_dir
                 )
             else:
                 # Just generate prompts

@@ -1,0 +1,246 @@
+20260304 작업 일지 #3 - v5.4 코드 통합 수정 (composed 분기 + stratified top-k + score 기본값)
+================================================================================
+
+1. 작업 목표
+--------------------------------------------------------------------------------
+v5.4 Poisson Blending 합성 파이프라인 설계(#1)와 seamlessClone 안전성 수정(#2)에 이어,
+학습·벤치마크 코드 전반에 casda_composed 분기를 통합하고 추가 P0 결함을 수정한다.
+Colab 환경에서 git pull 후 바로 실험 가능하도록 코드 일관성을 확보하는 것이 목표이다.
+
+  배경:
+    - v5.3 성능 하락 근본 원인: 합성 없음, 크기 불일치, 배경 부재 (20260304.docs 참조)
+    - v5.4 Poisson Blending 파이프라인 설계 완료 (20260304.docs)
+    - seamlessClone 안전성 수정 완료 (20260304_1.docs)
+    - 본 작업: 학습/벤치마크 코드에 composed 분기 추가 + 부가 결함 수정
+
+  이 문서의 범위:
+    (1) 수정 파일 목록 및 변경 상세
+    (2) P0 결함 3건 상세 (composed 분기, stratified top-k, score 기본값)
+    (3) 파일별 변경 내역
+    (4) 검증 결과
+    (5) 잔여 개선사항 (P1/P2)
+
+
+2. 식별된 P0 결함 및 수정 내용
+================================================================================
+
+  2-1. "composed" 분기 부재
+  ──────────────────────────────────
+
+    문제:
+      benchmark_experiment.yaml에 casda_composed 그룹이 정의되어 있으나(casda_data: "composed"),
+      실제 데이터 로더 코드(dataset.py, dataset_yolo.py, ultralytics_trainer.py)에는
+      "full"과 "pruning" 분기만 존재. "composed" 값이 들어오면 어디에도 매칭되지 않아
+      데이터가 로드되지 않거나 기본 경로로 잘못 해석됨.
+
+    수정:
+      3개 파일에 elif casda_data == "composed": 분기를 추가하여
+      composed_dir 경로를 읽고 적절한 데이터셋을 생성하도록 함.
+
+  2-2. Stratified Top-K Pruning 미구현
+  ──────────────────────────────────
+
+    문제:
+      benchmark_experiment.yaml의 casda_composed_pruning 그룹에
+      stratified: true가 설정되어 있으나, 실제 pruning 로직에는
+      단순 top-k (점수 내림차순 상위 k개)만 구현되어 있음.
+      Severstal 데이터셋은 클래스 분포가 극도로 불균형하므로
+      (Class 3: ~5,150 vs Class 4: ~801) 단순 top-k 시
+      소수 클래스가 pruning에서 완전히 제거될 위험.
+
+    수정:
+      dataset.py에 _stratified_top_k() 정적 메서드,
+      dataset_yolo.py에 _stratified_top_k_yolo() 함수를 추가.
+      클래스 비율을 유지하면서 top-k 선택을 수행.
+
+    알고리즘:
+      (a) 전체 샘플을 class_id별로 그룹화
+      (b) 각 클래스에 비율 기반 할당량 계산 (최소 1개 보장)
+      (c) 할당량 합계가 k를 초과하면 큰 그룹부터 1씩 감소
+      (d) 할당량 합계가 k 미만이면 여유 있는 그룹에 1씩 추가
+      (e) 각 그룹 내에서 suitability_score 내림차순 정렬 후 할당량만큼 선택
+
+  2-3. suitability_score 기본값 불일치
+  ──────────────────────────────────
+
+    문제:
+      metadata가 없거나 score 필드가 누락된 샘플의 기본값이 1.0으로 설정되어 있어,
+      품질이 검증되지 않은 샘플이 pruning에서 최상위로 선택됨.
+      이는 pruning의 본래 목적(고품질 샘플 우선 선택)을 훼손.
+
+    수정:
+      dataset.py와 dataset_yolo.py의 pruning 관련 기본값을 0.0으로 변경.
+      score가 없는 샘플은 최하위로 밀려나 pruning에서 자연스럽게 제외됨.
+
+
+3. 수정 파일 목록
+================================================================================
+
+  | # | 파일                                | 변경 유형           | 주요 내용                                |
+  |---|-------------------------------------|--------------------|-----------------------------------------|
+  | 1 | src/training/dataset.py             | 기능 추가 + 버그 수정 | composed 분기, stratified top-k, score 0.0 |
+  | 2 | src/training/dataset_yolo.py        | 기능 추가 + 버그 수정 | stratified top-k, score 0.0              |
+  | 3 | src/training/ultralytics_trainer.py  | 기능 추가           | composed 분기                             |
+  | 4 | scripts/run_benchmark.py            | 매핑 추가           | casda_composed 그룹 매핑, GROUP_ALIASES   |
+  | 5 | configs/benchmark_experiment.yaml   | 확인 (변경 없음)     | 이미 올바르게 구성됨                       |
+
+
+4. 파일별 변경 상세
+================================================================================
+
+  4-1. src/training/dataset.py
+  ──────────────────────────────────
+
+    (a) CASDASyntheticDataset.__init__() — stratified 파라미터 추가
+        - stratified: bool = False 인자 추가
+        - self.stratified = stratified 속성 저장
+        - max_samples 적용 시 stratified가 True이면 _stratified_top_k() 호출
+
+    (b) _load_metadata() — score 기본값 수정
+        - metadata CSV 로딩 시: suitability_score 기본값 1.0 → 0.0
+        - summary JSON 로딩 시: suitability_score 기본값 1.0 → 0.0
+        - 파일스캔 fallback 시: suitability_score 기본값 1.0 → 0.0
+
+    (c) _stratified_top_k() 정적 메서드 추가 (신규)
+        - 입력: samples (list of dict), k (int)
+        - 출력: 클래스 비율 유지하며 상위 k개 선택한 리스트
+        - class_id 기반 그룹화 → 비율 할당 → score 정렬 → 선택
+
+    (d) create_data_loaders() — composed 분기 추가
+        - elif casda_data == "composed": 블록 추가
+        - casda_config에서 composed_dir 경로 읽기
+        - pruning 설정 병합 후 CASDASyntheticDataset 생성
+        - stratified 옵션 전달
+
+  4-2. src/training/dataset_yolo.py
+  ──────────────────────────────────
+
+    (a) _prepare_casda_dataset() — score 기본값 수정
+        - pruning 필터 내 suitability_score 기본값 1.0 → 0.0
+
+    (b) stratified 설정 지원
+        - casda_config에서 stratified 옵션 읽기
+        - stratified가 True이면 _stratified_top_k_yolo() 호출
+
+    (c) _stratified_top_k_yolo() 함수 추가 (신규)
+        - dataset.py의 _stratified_top_k()와 동일 알고리즘
+        - YOLO 데이터 구조에 맞게 적용
+
+  4-3. src/training/ultralytics_trainer.py
+  ──────────────────────────────────
+
+    (a) _prepare_dataset() — composed 분기 추가
+        - group_pruning 설정 병합 로직 추가
+        - elif casda_data == "composed": 블록 추가
+        - composed_dir 경로 해석, pruning 모드 결정
+
+  4-4. scripts/run_benchmark.py
+  ──────────────────────────────────
+
+    (a) GROUP_ALIASES 추가
+        - "composed" → "casda_composed"
+        - "composed_pruning" → "casda_composed_pruning"
+
+    (b) CASDA_GROUPS 확장
+        - casda_composed, casda_composed_pruning 추가
+
+    (c) CASDA_GROUP_TO_SUBDIR 매핑 추가
+        - casda_composed → "casda_composed"
+        - casda_composed_pruning → "casda_composed"
+
+    (d) CLI 관련 업데이트
+        - --casda-dir 옵션에 composed_dir 경로 오버라이드 지원
+        - --list-groups 표시에 composed 태그 추가
+        - casda_groups_for_fid 집합에 casda_composed 추가
+
+
+5. 검증 결과
+================================================================================
+
+  검증 방법:
+    전체 수정 파일 5개를 대상으로 일관성 검증 수행.
+
+  검증 항목:
+    | # | 검증 항목                               | 결과   |
+    |---|----------------------------------------|--------|
+    | 1 | yaml의 casda_data: "composed" 값이 코드에서 매칭되는가 | PASS |
+    | 2 | composed_dir 경로가 모든 파일에서 동일하게 해석되는가    | PASS |
+    | 3 | stratified: true 설정이 실제 stratified top-k를 트리거하는가 | PASS |
+    | 4 | score 기본값이 pruning 관련 모든 위치에서 0.0인가        | PASS |
+    | 5 | run_benchmark.py가 casda_composed 그룹을 올바르게 라우팅하는가 | PASS |
+    | 6 | 기존 "full"/"pruning" 분기의 하위호환이 유지되는가       | PASS |
+
+  참고:
+    configs/benchmark_experiment.yaml은 20260304_1.docs에서 이미 올바르게 수정됨.
+    본 작업에서 추가 변경 불필요.
+
+
+6. 잔여 개선사항
+================================================================================
+
+  6-1. P1 — 통합·검증 (다음 실험 전 권장)
+  ──────────────────────────────────
+
+    | # | 항목                          | 설명                                              |
+    |---|------------------------------|--------------------------------------------------|
+    | 1 | compose_casda_images.py 실행  | Colab에서 Poisson Blending 합성 실행하여 데이터 생성 |
+    | 2 | FID 비교                      | casda_full vs casda_composed FID 비교              |
+    | 3 | 합성 이미지 시각적 품질 확인    | 랜덤 샘플링하여 블렌딩 경계, 크기, 위치 확인         |
+
+  6-2. P2 — 연구 신뢰성 강화 (논문 수준)
+  ──────────────────────────────────
+
+    | # | 항목                          | 설명                                              |
+    |---|------------------------------|--------------------------------------------------|
+    | 1 | K-Fold 교차검증               | 단일 split 대신 3~5 fold로 결과 안정성 확보          |
+    | 2 | 증강 비율 실험                 | real:synth 비율(1:1, 2:1, 3:1) 별 성능 비교         |
+    | 3 | 클래스별 성능 분석              | 전체 mAP 외 클래스별 AP 추적                        |
+    | 4 | 증강 조합 실험                 | trad + composed 병용 효과 측정                      |
+
+
+7. Colab 실행 순서
+================================================================================
+
+  Step 1: 합성 이미지 생성
+
+    python scripts/compose_casda_images.py \
+      --generated-dir  data/augmented/casda_full/images \
+      --hint-dir       data/augmented/casda_full/hints \
+      --metadata-csv   data/augmented/casda_full/metadata.csv \
+      --summary-json   data/augmented/casda_full/summary.json \
+      --clean-images-dir data/severstal/train_images \
+      --train-csv      data/severstal/train.csv \
+      --output-dir     data/augmented/casda_composed
+
+  Step 2: 벤치마크 실행
+
+    python scripts/run_benchmark.py \
+      --config configs/benchmark_experiment.yaml \
+      --groups casda_composed casda_composed_pruning \
+      --models eb_yolov8 yolo_mfd deeplabv3p
+
+  Step 3: 결과 확인
+
+    결과는 results/ 디렉토리에 저장됨.
+    run_benchmark.py가 자동으로 가설 검정(H1~H5)을 수행.
+
+
+8. 요약
+================================================================================
+
+  본 작업에서 수행한 핵심 변경:
+
+    (1) 3개 학습 파일에 "composed" 분기 추가
+        → casda_composed 데이터를 올바르게 로드 가능
+
+    (2) 2개 파일에 stratified top-k pruning 구현
+        → 클래스 불균형 상태에서도 소수 클래스 보존
+
+    (3) 2개 파일에서 suitability_score 기본값 0.0으로 수정
+        → 품질 미검증 샘플이 pruning 상위에 오는 문제 해결
+
+    (4) run_benchmark.py에 casda_composed 매핑 추가
+        → 벤치마크에서 새 그룹 인식 및 실행 가능
+
+  v5.4 파이프라인 코드 통합이 완료되었으며,
+  compose_casda_images.py 실행 → 벤치마크 학습 순서로 진행하면 된다.

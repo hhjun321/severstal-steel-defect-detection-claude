@@ -301,6 +301,14 @@ def _add_casda_to_training(
       - annotations.csv
       - Fallback: scan images/ for .png files, infer class from filename
     
+    Bbox format support:
+      - bbox_format="yolo": bboxes are [cx, cy, w, h] normalized (0~1).
+        Written directly — no cv2.imread needed. (v5.1+ metadata)
+      - bbox_format="xyxy" (or absent): bboxes are [x1, y1, x2, y2] pixel coords.
+        Requires cv2.imread once per image for normalization.
+      - mask_path fallback: derive bbox from mask contours via cv2.
+      - No bbox, no mask: full-image bbox fallback.
+    
     Returns:
         Number of synthetic images added
     """
@@ -344,21 +352,16 @@ def _add_casda_to_training(
     if casda_mode == "pruning":
         threshold = casda_config.get('suitability_threshold', 0.63)
         top_k = casda_config.get('pruning_top_k', 2000)
-        filtered = [
+        stratified = casda_config.get('stratified', False)
+        # v5.4 fix: 기본값 0 (알 수 없는 품질의 샘플이 최상위에 올라오지 않도록)
+        all_samples = [
             s for s in all_samples
             if s.get('suitability_score', 0.0) >= threshold
         ]
-        if len(filtered) >= top_k:
-            # threshold 조건을 충족하는 샘플이 충분 → 상위 top_k 선택
-            filtered.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
-            all_samples = filtered[:top_k]
+        all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+        if stratified:
+            all_samples = _stratified_top_k_yolo(all_samples, top_k)
         else:
-            # 점수 미산정 또는 threshold 미달 → score 기준 상위 top_k (fallback)
-            logger.warning(
-                f"Pruning: only {len(filtered)} samples pass threshold {threshold} "
-                f"(need {top_k}). Falling back to top-{top_k} by score."
-            )
-            all_samples.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
             all_samples = all_samples[:top_k]
 
     count = 0
@@ -389,22 +392,26 @@ def _add_casda_to_training(
         cls_id = sample.get('class_id', 0)
         bboxes = sample.get('bboxes', [])
         labels = sample.get('labels', [])
+        bbox_format = sample.get('bbox_format', 'xyxy')
 
         with open(dst_lbl, 'w') as f:
-            if bboxes and labels:
-                # Use provided bboxes (assumed xyxy pixel coords)
+            if bboxes and labels and bbox_format == 'yolo':
+                # v5.1+: pre-computed YOLO normalized bboxes — write directly
                 for bbox, lbl in zip(bboxes, labels):
-                    # Read image dimensions for normalization
-                    img = cv2.imread(img_path)
-                    if img is None:
-                        continue
-                    h, w = img.shape[:2]
-                    x1, y1, x2, y2 = bbox
-                    cx = ((x1 + x2) / 2.0) / w
-                    cy = ((y1 + y2) / 2.0) / h
-                    bw = (x2 - x1) / w
-                    bh = (y2 - y1) / h
+                    cx, cy, bw, bh = bbox
                     f.write(f"{lbl} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+            elif bboxes and labels:
+                # Legacy: xyxy pixel coords — read image once for normalization
+                img = cv2.imread(img_path)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    for bbox, lbl in zip(bboxes, labels):
+                        x1, y1, x2, y2 = bbox
+                        cx = ((x1 + x2) / 2.0) / w
+                        cy = ((y1 + y2) / 2.0) / h
+                        bw = (x2 - x1) / w
+                        bh = (y2 - y1) / h
+                        f.write(f"{lbl} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
             elif 'mask_path' in sample:
                 # Derive bbox from mask
                 mask_path = sample['mask_path']
@@ -431,3 +438,49 @@ def _add_casda_to_training(
         count += 1
 
     return count
+
+
+def _stratified_top_k_yolo(samples: list, k: int) -> list:
+    """
+    클래스별 비례 배분으로 상위 k개 샘플을 선택한다 (YOLO dataset용).
+
+    각 클래스에서 suitability_score 상위 순으로 (클래스 비율 × k)개를
+    선택하여 클래스 불균형을 유지한 pruning을 수행한다.
+    """
+    if len(samples) <= k:
+        return samples
+
+    # 클래스별 그룹화
+    class_groups = {}
+    for s in samples:
+        cid = s.get('class_id', 0)
+        class_groups.setdefault(cid, []).append(s)
+
+    total = len(samples)
+    allocations = {}
+
+    # 비례 배분 (최소 1개 보장)
+    for cid, group in class_groups.items():
+        alloc = max(1, int(round(len(group) / total * k)))
+        allocations[cid] = min(alloc, len(group))
+
+    # 총 할당이 k를 초과하면 가장 큰 그룹에서 감소
+    while sum(allocations.values()) > k:
+        largest_cid = max(allocations, key=allocations.get)
+        allocations[largest_cid] -= 1
+
+    # 총 할당이 k 미만이면 가장 큰 그룹에서 증가
+    while sum(allocations.values()) < k:
+        for cid in sorted(allocations, key=lambda c: len(class_groups[c]), reverse=True):
+            if allocations[cid] < len(class_groups[cid]):
+                allocations[cid] += 1
+                if sum(allocations.values()) >= k:
+                    break
+
+    selected = []
+    for cid, group in class_groups.items():
+        n = allocations.get(cid, 0)
+        group.sort(key=lambda x: x.get('suitability_score', 0.0), reverse=True)
+        selected.extend(group[:n])
+
+    return selected
